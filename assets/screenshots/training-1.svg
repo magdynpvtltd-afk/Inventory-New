@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <rect width="800" height="500" fill="#f4f5f7"/>
+
+    <!-- Sidebar -->
+    <rect x="0" y="0" width="180" height="500" fill="#0f172a"/>
+    <rect x="16" y="20" width="24" height="24" rx="4" fill="#dc2626"/>
+    <text x="48" y="38" fill="#ffffff" font-size="14" font-weight="600">MagDyn</text>
+
+    <!-- Sidebar nav items -->
+    <rect x="8" y="64"  width="164" height="32" rx="6" fill="#1e3a8a"/>
+    <text x="20" y="84"  fill="#ffffff" font-size="12">⊞  Dashboard</text>
+    <text x="20" y="116" fill="#94a3b8" font-size="12">👥  Users</text>
+    <text x="20" y="148" fill="#94a3b8" font-size="12">🛡  Roles &amp; Permissions</text>
+    <text x="20" y="180" fill="#94a3b8" font-size="12">📖  Training</text>
+    <text x="20" y="212" fill="#94a3b8" font-size="12">🔔  Notifications</text>
+
+    <!-- Page header -->
+    <text x="208" y="42" fill="#1a1f2e" font-size="20" font-weight="600">Dashboard</text>
+    <text x="208" y="62" fill="#6b7280" font-size="12">Welcome, System Administrator. Hold Alt to reveal shortcuts.</text>
+
+    <!-- Stat cards -->
+    <g>
+        <rect x="208" y="86" width="138" height="86" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="220" y="108" fill="#6b7280" font-size="11">ACTIVE USERS</text>
+        <text x="220" y="140" fill="#1a1f2e" font-size="28" font-weight="600">24</text>
+        <text x="220" y="158" fill="#6b7280" font-size="11">Across all roles</text>
+    </g>
+    <g>
+        <rect x="356" y="86" width="138" height="86" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="368" y="108" fill="#1d4ed8" font-size="11">ROLES</text>
+        <text x="368" y="140" fill="#1a1f2e" font-size="28" font-weight="600">3</text>
+        <text x="368" y="158" fill="#6b7280" font-size="11">Defined</text>
+    </g>
+    <g>
+        <rect x="504" y="86" width="138" height="86" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="516" y="108" fill="#047857" font-size="11">COURSES</text>
+        <text x="516" y="140" fill="#1a1f2e" font-size="28" font-weight="600">7</text>
+        <text x="516" y="158" fill="#6b7280" font-size="11">Visible</text>
+    </g>
+    <g>
+        <rect x="652" y="86" width="138" height="86" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="664" y="108" fill="#b45309" font-size="11">COMPLETED</text>
+        <text x="664" y="140" fill="#1a1f2e" font-size="28" font-weight="600">4</text>
+        <text x="664" y="158" fill="#6b7280" font-size="11">Out of 7</text>
+    </g>
+
+    <!-- Recent activity card -->
+    <rect x="208" y="190" width="582" height="288" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+    <text x="220" y="216" fill="#1a1f2e" font-size="14" font-weight="600">Recent activity</text>
+    <line x1="208" y1="232" x2="790" y2="232" stroke="#e3e5ea"/>
+
+    <text x="220" y="252" fill="#6b7280" font-size="10" font-weight="600">WHEN</text>
+    <text x="320" y="252" fill="#6b7280" font-size="10" font-weight="600">ACTOR</text>
+    <text x="440" y="252" fill="#6b7280" font-size="10" font-weight="600">ACTION</text>
+    <text x="560" y="252" fill="#6b7280" font-size="10" font-weight="600">DETAILS</text>
+
+    <text x="220" y="278" fill="#1a1f2e" font-size="11">15 May 2026 14:08</text>
+    <text x="320" y="278" fill="#1a1f2e" font-size="11">admin</text>
+    <text x="440" y="278" fill="#1a1f2e" font-size="11" font-family="ui-monospace, Menlo">impersonate.start</text>
+    <text x="560" y="278" fill="#6b7280" font-size="11">viewing as viewer</text>
+
+    <text x="220" y="302" fill="#1a1f2e" font-size="11">15 May 2026 13:55</text>
+    <text x="320" y="302" fill="#1a1f2e" font-size="11">admin</text>
+    <text x="440" y="302" fill="#1a1f2e" font-size="11" font-family="ui-monospace, Menlo">role.update</text>
+    <text x="560" y="302" fill="#6b7280" font-size="11">Manager — perms +2</text>
+
+    <text x="220" y="326" fill="#1a1f2e" font-size="11">15 May 2026 13:31</text>
+    <text x="320" y="326" fill="#1a1f2e" font-size="11">viewer</text>
+    <text x="440" y="326" fill="#1a1f2e" font-size="11" font-family="ui-monospace, Menlo">training.complete</text>
+    <text x="560" y="326" fill="#6b7280" font-size="11">Welcome to MagDyn</text>
+</svg>

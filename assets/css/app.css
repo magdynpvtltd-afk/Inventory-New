@@ -1,0 +1,3569 @@
+/* ============================================================
+   MagDyn — App-level overrides for the base design system
+   Created: 20260515_060024_IST
+
+   Reference CSS variables from magdyn-base.css. No new colours
+   except where one of the role-specific brand colours is needed.
+   ============================================================ */
+
+/* ---- Brand sizing (uses .brand-mark from magdyn-base.css for the sidebar) ---- */
+/* Sidebar logo lives inside .brand-mark which already enforces 38x38. Nothing
+   extra needed here unless we want a tighter variant: */
+.sidebar .brand-mark { background: #ffffff; padding: 4px; }
+
+/* The MagDyn logo is red; honour that on the login screen accent. */
+.login-brand .brand-title { color: #dc2626; }
+.login-brand img { width: 84px; height: auto; margin-bottom: 12px; }
+
+/* ---- Keyboard-shortcut affordance ---- */
+/* By default the <u> underscoring shortcut chars is subtle.
+   When the user holds Alt, every shortcut becomes visually
+   prominent across the page. The .main scope keeps these rules
+   off the dark sidebar, which has its own treatment below. */
+.alt-active .main [data-shortcut] u,
+.alt-active .main [data-shortcut] {
+    color: var(--primary);
+}
+.alt-active .main [data-shortcut] u {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    font-weight: 700;
+    background: var(--primary-light);
+    padding: 0 2px;
+    border-radius: 3px;
+}
+.alt-active .main [data-shortcut].btn {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+}
+
+/* Sidebar (dark) gets its own Alt treatment so text stays legible */
+.alt-active .sidebar [data-shortcut] u,
+.alt-active .nav-item u {
+    color: #ffffff;
+    background: var(--sidebar-bg-active);
+    padding: 0 3px;
+    border-radius: 3px;
+    font-weight: 700;
+}
+
+/* In normal state the <u> is restrained to keep the UI calm */
+.btn u, .nav-item u, .tab u { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---- Two-character shortcut chord hint ---- */
+/* Items with a 2-char shortcut display the second character as a small
+   superscript after the underlined first char. Always visible (subtle);
+   pops on chord-active. */
+.shortcut-hint {
+    display: inline-block;
+    margin-left: 1px;
+    font-size: 0.65em;
+    vertical-align: super;
+    opacity: 0.55;
+    font-weight: 600;
+}
+.alt-active .shortcut-hint { opacity: 1; color: var(--primary); }
+.sidebar .alt-active .shortcut-hint,
+.alt-active .sidebar .shortcut-hint { color: #ffffff; opacity: 0.9; }
+
+/* ---- Chord mode: after pressing Alt+<first char>, only items matching
+       that first char remain highlighted, waiting for the second char. */
+.chord-active [data-shortcut] { opacity: 0.35; transition: opacity 0.1s; }
+.chord-active [data-shortcut]:not([data-shortcut^=""]) { /* placeholder */ }
+/* JS sets body[data-chord-first="A"]; we use an attribute selector to
+   highlight only matching items. Three rules cover the most common
+   first letters succinctly via CSS attr matching at runtime. */
+body[data-chord-first] [data-shortcut] { opacity: 0.18; }
+body[data-chord-first] .shortcut-hint { opacity: 1; }
+/* Items whose chord starts with the held character pop forward.
+   The match is done in JS via classList toggling, since CSS can't
+   compare an attribute to another attribute. */
+body[data-chord-first] [data-shortcut].chord-match {
+    opacity: 1;
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+/* ---- Impersonation banner ---- */
+.impersonate-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: var(--warn-bg);
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    border-radius: var(--radius);
+    padding: 8px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+.impersonate-banner strong { color: var(--text); }
+
+/* ---- Login page tweaks for the MagDyn logo ---- */
+.login-brand img { width: 96px; height: auto; margin-bottom: 12px; }
+
+/* ---- Sidebar collapsible group ---- */
+.nav-group-toggle {
+    width: 100%;
+    background: transparent;
+    border: 0;
+    color: var(--sidebar-text);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+    border-radius: 0;
+    transition: background 0.12s;
+}
+.nav-group-toggle:hover { background: var(--sidebar-bg-hover); color: #ffffff; }
+.nav-group-toggle .nav-chevron {
+    margin-left: 6px;
+    font-size: 11px;
+    color: var(--sidebar-text-very-dim);
+    transition: transform 0.15s;
+}
+.nav-group-toggle .nav-group-count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--sidebar-text-very-dim);
+    background: rgba(255,255,255,0.06);
+    padding: 1px 6px;
+    border-radius: 8px;
+    min-width: 18px;
+    text-align: center;
+}
+.nav-group-toggle.open .nav-group-count { color: var(--sidebar-text); background: rgba(255,255,255,0.12); }
+.nav-group-toggle.open .nav-chevron { transform: rotate(180deg); color: #ffffff; }
+.nav-group-children { background: rgba(0,0,0,0.18); }
+.nav-group-children .nav-item.nav-child {
+    padding-left: 36px;
+    font-size: 13px;
+}
+.nav-group-children .nav-item.nav-child .nav-icon {
+    font-size: 14px;
+    opacity: 0.85;
+}
+
+/* ---- Permission matrix ---- */
+.perm-matrix th, .perm-matrix td {
+    text-align: center;
+    vertical-align: middle;
+    font-size: 12px;
+}
+.perm-matrix tbody th {
+    text-align: left;
+    font-weight: 600;
+}
+.perm-matrix input[type="checkbox"] { transform: scale(1.1); }
+
+/* ---- Asset module specifics ---- */
+.cal-warn-row    { background: var(--warn-bg); }
+.cal-overdue-row { background: var(--danger-bg); }
+.lookup-inline-add {
+    display: inline-flex; align-items: center; gap: 4px;
+    color: var(--success); font-size: 12px; text-decoration: none;
+    padding: 0 6px;
+}
+.lookup-inline-add:hover { text-decoration: underline; }
+
+/* The "+ create model" inline button next to a select */
+.field-with-add { display: flex; gap: 6px; align-items: stretch; }
+.field-with-add select, .field-with-add input { flex: 1; }
+
+/* ---- Training course screenshots ---- */
+.screenshot-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+}
+.screenshot-strip figure {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--surface);
+}
+.screenshot-strip img,
+.screenshot-strip svg { width: 100%; display: block; }
+.screenshot-strip figcaption {
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+}
+
+/* ---- Mobile shell-only styles (the desktop sidebar collapses below 720px) ---- */
+@media (max-width: 720px) {
+    .layout { flex-direction: column; }
+    .sidebar { width: 100%; height: auto; }
+    .nav { display: flex; overflow-x: auto; }
+    .nav-item { white-space: nowrap; }
+    .sidebar-footer { display: none; }
+}
+
+/* ============================================================
+   DataTable (sort / search / paginate)
+   ============================================================ */
+/* DataTable layout overview:
+   • .dt-wrap is a flex column (display rules below at line ~1310).
+   • When .dt-wrap appears anywhere inside .main, .main becomes a
+     viewport-height flex column (see .main:has(.dt-wrap) below)
+     and .dt-wrap fills the remaining vertical space.
+   • .dt-scroll inside .dt-wrap is the actual scrolling ancestor;
+     its sticky thead + sticky tfoot.dt-filters stay pinned to the
+     top and bottom of the visible scroll area as rows scroll. */
+.dt-wrap { position: relative; }
+.dt-loading { opacity: 0.55; transition: opacity 0.15s; pointer-events: none; }
+
+/* Scrolling container: grows to fill whatever vertical room is left
+   in the wrap after the toolbar. min-height:0 is the flex-layout
+   trick that lets the child actually shrink below its intrinsic
+   content height (without it, the container would balloon and the
+   page would scroll instead of the rows). */
+.dt-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+}
+.dt-scroll .dt-table { margin: 0; border: none; }
+
+.dt-table thead th {
+    user-select: none;
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 3 !important;
+    background: var(--surface);
+    /* sticky elements with transparent backgrounds let rows show through,
+       so we paint a solid background. The 1px border below mimics the
+       table's own thead-bottom border so it doesn't disappear when sticky. */
+    box-shadow: inset 0 -1px 0 var(--border);
+}
+/* Force separate border model — `border-collapse: collapse` (the default
+   on .data-table base) breaks `position: sticky` on <th> elements. With
+   collapse, browsers merge adjacent borders and the sticky positioning
+   loses its anchor — the thead unpins and scrolls with the rows.
+   `separate` + `border-spacing: 0` keeps the visual identical while
+   letting sticky engage. !important to override the base rule even if
+   magdyn-base.css hasn't been re-uploaded. */
+.dt-table {
+    border-collapse: separate !important;
+    border-spacing: 0 !important;
+}
+.dt-table th.dt-sortable { cursor: pointer; white-space: nowrap; }
+.dt-table th.dt-sortable:hover { background: var(--surface-alt, rgba(0,0,0,0.03)); }
+.dt-table th.dt-sortable:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+.dt-table .dt-arrow {
+    /* Inline immediately after the label with a tight 3px gap. The
+       th's right padding is trimmed to 2px (see the .dt-table thead th
+       rule lower in this file) so the chevron also sits flush against
+       the column separator. Net result: small gap on both sides of
+       the chevron, regardless of column width. */
+    margin-left: 3px;
+    font-size: 10px;
+    opacity: 0.4;
+    pointer-events: none;
+}
+.dt-table th.dt-sorted .dt-arrow { opacity: 1; color: var(--primary); }
+
+/* Legacy tr.dt-filters rules removed — filters now live as
+   tfoot.dt-filters > tr > td.dt-filter-td (styled below). */
+
+.dt-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+    font-size: 12px;
+}
+.dt-page-size .dt-size {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin: 0 4px;
+}
+.dt-pager {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.dt-pager .btn { min-width: 32px; }
+.dt-pager .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+/* Tighter page-head spacing. */
+.page-head { margin-bottom: 8px; }
+.dt-table { margin-bottom: 0; }
+
+/* The .dt-scroll container handles overflow; .dt-wrap remains a flex
+   column that includes the scroll area + the page-size/pager footer. */
+.dt-table { width: 100%; }
+.dt-table th, .dt-table td { vertical-align: middle; }
+
+/* ============================================================
+   SPA shell loading state
+   ============================================================ */
+body.spa-loading .main { opacity: 0.6; transition: opacity 0.1s; }
+body.spa-loading::after {
+    content: '';
+    position: fixed; top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, transparent, var(--primary), transparent);
+    background-size: 50% 100%;
+    background-repeat: no-repeat;
+    animation: spa-progress 0.9s linear infinite;
+    z-index: 9999;
+}
+@keyframes spa-progress {
+    0%   { background-position: -50% 0; }
+    100% { background-position: 150% 0; }
+}
+
+/* ============================================================
+   BOM tree (engineering BOM view)
+   ============================================================ */
+.bom-tree-toolbar {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.bom-tree, .bom-children {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+.bom-tree { padding: 4px 0; }
+
+.bom-node {
+    position: relative;
+    padding-left: 22px;
+}
+/* Vertical indent guide */
+.bom-children .bom-node::before {
+    content: '';
+    position: absolute;
+    left: 10px;
+    top: 0;
+    bottom: 0;
+    border-left: 1px solid var(--border, #d8dadf);
+}
+/* Hide the guide on the last child after its row */
+.bom-children .bom-node:last-child::before {
+    bottom: calc(100% - 18px);
+}
+/* Horizontal connector from the vertical guide to the row */
+.bom-children .bom-node::after {
+    content: '';
+    position: absolute;
+    left: 10px;
+    top: 16px;
+    width: 10px;
+    border-top: 1px solid var(--border, #d8dadf);
+}
+.bom-root::before, .bom-root::after { display: none; }
+
+.bom-row {
+    display: grid;
+    grid-template-columns: 22px 22px 1fr auto;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    transition: background-color 0.1s;
+    position: relative;
+    background: var(--surface);
+}
+.bom-row:hover { background: var(--surface-alt, #f3f4f7); }
+
+.bom-toggle {
+    width: 20px; height: 20px;
+    border: none; background: none;
+    cursor: pointer; padding: 0;
+    color: var(--text-muted, #6b7280);
+    font-size: 12px;
+    transition: transform 0.15s;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 3px;
+}
+.bom-toggle:hover { background: var(--surface-alt, #eef0f4); }
+.bom-toggle.bom-leaf { cursor: default; opacity: 0.35; }
+.bom-node.bom-closed > .bom-row > .bom-toggle { transform: rotate(-90deg); }
+.bom-node.bom-closed > .bom-children { display: none; }
+
+.bom-icon { font-size: 14px; line-height: 1; }
+
+.bom-main {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.bom-main .mono { color: var(--primary); }
+.bom-name { color: var(--text); }
+.bom-ref {
+    color: var(--text-muted);
+    font-size: 11px;
+    background: var(--surface-alt, #eef0f4);
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.bom-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.bom-qty { font-weight: 600; color: var(--text); }
+.bom-cost { color: var(--text); }
+.bom-stock-low { color: var(--danger, #d33); font-weight: 600; }
+
+/* ============================================================
+   Chip-style multi-select
+   ============================================================ */
+.chips-wrap {
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 4px;
+    min-height: 38px;
+}
+.chips-wrap:focus-within { border-color: var(--primary); }
+.chips-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+}
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 8px;
+    background: var(--surface-alt, #eef0f4);
+    color: var(--text);
+    border-radius: 12px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+.chip-x {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 4px;
+    border-radius: 50%;
+}
+.chip-x:hover { background: rgba(0,0,0,0.1); color: var(--danger, #d33); }
+.chips-input {
+    flex: 1;
+    min-width: 120px;
+    border: none;
+    outline: none;
+    padding: 4px 6px;
+    background: transparent;
+    font: inherit;
+    color: var(--text);
+}
+.chips-dropdown {
+    position: absolute;
+    left: 0; right: 0; top: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    max-height: 240px;
+    overflow-y: auto;
+    z-index: 50;
+    margin-top: 2px;
+}
+.chips-option {
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 13px;
+}
+.chips-option.hl, .chips-option:hover {
+    background: var(--surface-alt, #eef0f4);
+}
+.chips-empty {
+    padding: 8px 10px;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-style: italic;
+}
+
+/* ============================================================
+   BOM Designer
+   ============================================================ */
+.bd-wrap {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 16px;
+    min-height: 60vh;
+}
+.bd-palette {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 12px;
+    overflow-y: auto;
+    max-height: 75vh;
+}
+.bd-palette h3 { margin: 0 0 8px 0; font-size: 14px; }
+.bd-palette-search {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 8px;
+}
+.bd-palette-item {
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 4px;
+    background: var(--surface);
+    cursor: grab;
+    font-size: 12px;
+}
+.bd-palette-item:hover { background: var(--surface-alt, #f3f4f7); }
+.bd-palette-item:active { cursor: grabbing; }
+.bd-palette-item .mono { color: var(--primary); margin-right: 6px; }
+
+.bd-tree-holder {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 8px;
+    /* Horizontal scroll when deep BOMs overflow the container; vertical
+       scroll for tall trees. min-height keeps the empty state visible. */
+    overflow-x: auto;
+    overflow-y: auto;
+    min-height: 60vh;
+}
+
+.bd-node {
+    margin-left: 0;
+    position: relative;
+}
+.bd-children { padding-left: 14px; border-left: 1px dashed var(--border); margin-left: 7px; }
+/* Compress indent at deep levels so a 15-level BOM is still navigable.
+   Shallow levels keep the comfortable indent; deeper levels drop further
+   so we don't run out of horizontal real estate. The class
+   .bd-depth-deep is added by render_bom_designer_node for depth ≥ 8. */
+.bd-node.bd-depth-deep > .bd-children { padding-left: 9px; margin-left: 4px; }
+/* "Drop here to nest" hint inside empty .bd-children. Base sizing
+   (min-height, margin) is set by the existing .bd-children-empty rule
+   later in this file; this just adds the labelled affordance. */
+.bd-children-empty:empty::before {
+    content: '↳ drop here to nest';
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-style: italic;
+    line-height: 16px;
+    opacity: 0.5;
+    padding-left: 4px;
+}
+.bd-children-empty:hover:empty::before { opacity: 1; }
+.bd-row {
+    display: grid;
+    /* Columns: toggle · icon · label · qty · uom · delete
+       (drag handle removed — the whole row is the drag grip). Tightened
+       for a more compact designer. */
+    grid-template-columns: 16px 18px minmax(160px, 1fr) 64px 38px 22px;
+    gap: 6px;
+    align-items: center;
+    padding: 3px 6px;
+    border-radius: 4px;
+    background: var(--surface);
+    cursor: grab;
+    /* Minimum width keeps deep rows readable; the .bd-tree-holder
+       scrolls horizontally when total content exceeds container. */
+    min-width: 320px;
+}
+.bd-row:active { cursor: grabbing; }
+.bd-row:hover { background: var(--surface-alt, #f3f4f7); }
+.bd-source { opacity: 0.4; }
+
+/* Collapsible toggle — mirrors modules-tree's .bom-toggle. Click flips
+   the parent <li>'s aria-expanded; CSS in this file hides .bd-children
+   when expanded=false. Leaf rows use the same column for visual
+   alignment but with a non-interactive dot. */
+.bd-toggle {
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    user-select: none;
+    text-align: center;
+    transition: transform 0.12s;
+}
+.bd-toggle:hover { color: var(--text); }
+.bd-toggle.bd-leaf { cursor: default; opacity: 0.4; }
+.bd-toggle.bd-leaf:hover { color: var(--text-muted); }
+.bd-node[aria-expanded="false"] > .bd-row > .bd-toggle:not(.bd-leaf) { transform: rotate(-90deg); }
+.bd-node[aria-expanded="false"] > .bd-children { display: none; }
+
+/* Sub-assembly tint — analogous to modules-tree's .mod-group. The
+   subtle blue left-border plus background tint makes assemblies
+   visually distinct from leaf parts at a glance. */
+.bd-node.bd-assembly > .bd-row {
+    background: #f0f9ff;
+    border-left: 3px solid var(--info, #0284c7);
+}
+.bd-node.bd-assembly > .bd-row:hover { background: #e0f2fe; }
+.bd-node.bd-assembly.bd-root > .bd-row {
+    /* Root assembly gets a slightly stronger tint */
+    background: #e0f2fe;
+    border-left-width: 4px;
+}
+
+/* Inline pill in the label area — assembly count or "leaf" tag.
+   Smaller than the standard pill so it doesn't visually crowd the
+   item code/name. */
+.bd-pill {
+    font-size: 10px;
+    padding: 1px 6px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+/* Drag handle removed — the entire .bd-row is the drag grip now.
+   (SortableJS excludes the qty input, delete and toggle via `filter`.) */
+
+/* Drop indicators */
+.bd-over-into > .bd-row { background: rgba(0, 120, 255, 0.12); outline: 2px solid var(--primary); outline-offset: -2px; }
+.bd-over-before > .bd-row { border-top: 3px solid var(--primary); padding-top: 1px; }
+.bd-over-after  > .bd-row { border-bottom: 3px solid var(--primary); padding-bottom: 1px; }
+
+.bd-row .bd-icon { font-size: 14px; line-height: 1; }
+.bd-row .bd-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bd-row .bd-label .mono { color: var(--primary); margin-right: 6px; }
+.bd-row .bd-qty {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: right;
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 12px;
+}
+.bd-row .bd-uom { font-size: 11px; color: var(--text-muted); }
+.bd-row .bd-delete {
+    background: transparent; border: none; cursor: pointer;
+    color: var(--text-muted); font-size: 16px; padding: 0 4px;
+    border-radius: 3px;
+}
+.bd-row .bd-delete:hover { background: rgba(0,0,0,0.05); color: var(--danger, #d33); }
+
+/* ============================================================
+   BOM tree view (Ignite-style tabular)
+   ============================================================ */
+.bom-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 0;
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+.bom-tabs-spacer { flex: 1 1 auto; }
+.bom-tree-toggle {
+    margin-bottom: 4px;   /* tiny offset so it sits flush with tab bottoms */
+}
+.bom-tab {
+    padding: 8px 16px;
+    background: var(--surface-alt, #e6e8ed);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    text-decoration: none;
+}
+.bom-tab.active {
+    background: var(--surface);
+    font-weight: 600;
+    position: relative;
+    z-index: 1;
+}
+.bom-tab .count { color: var(--text-muted); font-weight: normal; }
+
+/* Two-row BOM grid header: all selector tabs in one scrollable row on
+   top, then the title + action buttons row below. */
+.bom-tabs-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px 0;
+    background: var(--surface);
+    /* Single row — scroll horizontally if there are more tabs than fit,
+       rather than wrapping onto a second line. */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    scrollbar-width: thin;
+}
+.bom-tabs-row .bom-tab { flex: 0 0 auto; }
+.bom-actions-row {
+    /* Reuse dt-toolbar base; just lay out title-left, actions-right. */
+    justify-content: space-between;
+}
+.bom-actions-row .bom-actions-title {
+    text-align: left;
+    flex: 0 0 auto;
+}
+
+.bom-grid-toolbar {
+    display: flex;
+    gap: 6px;
+    padding: 6px 0;
+}
+.bom-grid-scroll {
+    overflow: auto;
+    max-height: calc(100vh - 320px);
+    min-height: 300px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+.bom-grid-scroll .bom-grid { border: none; }
+
+.bom-grid {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 13px;
+}
+/* Flipped on by the resize JS as soon as the user starts dragging a
+   handle (or if there are saved widths in localStorage from a prior
+   session). In this mode columns enforce their explicit widths and
+   the table's total width is also pinned via inline style by the JS
+   — that pinning is what prevents sibling columns from auto-shrinking
+   when one grows. The .bom-grid-scroll wrapper provides horizontal
+   scroll for the overflow. */
+.bom-grid.bgrid-fixed-layout {
+    table-layout: fixed;
+}
+.bom-grid.bgrid-fixed-layout th,
+.bom-grid.bgrid-fixed-layout td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bom-grid thead th {
+    background: #8a8c93;          /* match screenshot's gray header */
+    color: white;
+    padding: 8px 10px;
+    text-align: left;
+    font-weight: 600;
+    border-right: 1px solid rgba(255,255,255,0.2);
+    position: sticky;
+    top: 0;
+    z-index: 3;
+}
+.bom-grid thead tr:nth-child(2) th {
+    /* The filter row is the SECOND row in the thead. Sticky it just below
+       the first header row using the row height of the first row. We use
+       a "top: 37px" pragmatic offset that matches the 8px padding + 13px
+       font-size; tune if the header row height changes. */
+    top: 37px;
+    z-index: 2;
+}
+.bom-grid thead th:last-child { border-right: none; }
+/* BOM grid header labels stay left-aligned even when their column is
+   marked .r (numeric body cells). Easier to scan a header row when
+   every label starts at the same x-offset. */
+.bom-grid thead th.r { text-align: left; }
+.bom-grid thead .bom-cog {
+    float: right;
+    cursor: pointer;
+    color: rgba(255,255,255,0.7);
+    margin-left: 8px;
+    font-size: 14px;
+}
+.bom-grid thead .bom-cog:hover { color: white; }
+
+.bom-grid .bom-filter-row th {
+    background: var(--surface);
+    padding: 4px 6px;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+}
+.bom-grid .bom-filter-row input {
+    width: 100%;
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.bom-grid tbody td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #ececef;
+    border-right: 1px solid #ececef;
+    vertical-align: middle;
+}
+.bom-grid tbody td:last-child { border-right: none; }
+.bom-grid tbody td.r { text-align: right; }
+.bom-grid tbody tr:nth-child(even) { background: #f7f7f9; }
+.bom-grid tbody tr.highlighted { background: #e5e5ea; }
+
+.bom-grid .bom-name-cell {
+    white-space: nowrap;
+}
+.bom-grid .bom-toggle-btn {
+    display: inline-block;
+    width: 18px; height: 18px;
+    border: 1px solid #888;
+    border-radius: 2px;
+    background: white;
+    cursor: pointer;
+    text-align: center;
+    line-height: 14px;
+    font-family: monospace;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+.bom-grid .bom-toggle-spacer { display: inline-block; width: 18px; margin-right: 4px; }
+.bom-grid .bom-product-link {
+    color: var(--text);
+    text-decoration: underline;
+}
+.bom-grid .bom-product-link:hover { color: var(--primary); }
+.bom-grid tr.bom-hidden { display: none; }
+
+/* Pending-SO badge rendered next to the part name in the BOM tree
+   grid. Compact "(N · Q)" format; the long description sits in the
+   title="" tooltip. Amber accent so a backlogged part stands out
+   visibly without dominating a tree full of badges. The pill is
+   suppressed entirely on parts with no open SOs (see bom_views.php),
+   so a clean tree reads as "no backlog anywhere right now". */
+.bom-grid .bom-so-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 6px;
+    font-size: 11px;
+    line-height: 18px;
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+    border-radius: 10px;
+    white-space: nowrap;
+    cursor: help;
+}
+
+/* Compact icon buttons used in datatable action cells. Wider than a
+   bare emoji so they still look tappable, narrow enough that 3-4 fit
+   in a typical Actions column without wrapping. */
+.btn-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background-color 0.1s, border-color 0.1s;
+}
+.btn-icon:hover {
+    background: var(--surface-alt, #eef0f4);
+    border-color: var(--border);
+}
+.btn-icon:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+}
+
+/* "Create" variant of the icon button: tinted to draw the eye on
+   empty-state rows where the user is meant to take action. */
+.btn-icon-accent {
+    width: auto;
+    padding: 0 8px;
+    color: var(--primary);
+    background: rgba(0, 120, 255, 0.06);
+    border-color: var(--primary);
+    font-size: 12px;
+    font-weight: 600;
+}
+.btn-icon-accent:hover {
+    background: rgba(0, 120, 255, 0.12);
+}
+
+/* ============================================================
+   Sidebar collapse — narrow icon-only mode
+   ============================================================ */
+.sidebar-collapse-btn {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 24px; height: 24px;
+    border: 1px solid var(--sidebar-border, rgba(255,255,255,0.15));
+    background: transparent;
+    color: var(--sidebar-text);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0;
+    opacity: 0.7;
+    transition: opacity 0.1s, background-color 0.1s;
+}
+.sidebar-collapse-btn:hover { opacity: 1; background: rgba(255,255,255,0.08); }
+
+/* Manual-view auto-collapse is handled by JS (see manuals.php) so
+   the user can still toggle expanded via the collapse button while
+   reading. Forcing via CSS would block the toggle. The script adds
+   the .collapsed class on .sidebar and .sidebar-collapsed on html
+   exactly like the regular collapse toggle, just without writing
+   localStorage — so the user's global preference is preserved for
+   when they navigate away. */
+
+/* Collapsed-state overrides. Width is set by the base CSS rule
+   `.sidebar.collapsed { width: 64px }`; we just hide text. */
+.sidebar.collapsed .brand-text,
+.sidebar.collapsed .nav-label,
+.sidebar.collapsed .nav-group-label,
+.sidebar.collapsed .nav-group-children,
+.sidebar.collapsed .nav-group-caret,
+.sidebar.collapsed .sidebar-footer .user-name,
+.sidebar.collapsed .sidebar-footer .user-email,
+.sidebar.collapsed .shortcut-hint {
+    display: none !important;
+}
+.sidebar.collapsed .brand {
+    padding: 14px 8px;
+    justify-content: center;
+}
+.sidebar.collapsed .sidebar-collapse-btn {
+    right: auto;
+    top: auto;
+    transform: none;
+    position: static;
+    margin-left: auto;
+}
+.sidebar.collapsed .nav-item,
+.sidebar.collapsed .nav-group-toggle {
+    justify-content: center;
+    padding: 10px 0;
+}
+.sidebar.collapsed .nav-icon { font-size: 18px; }
+
+/* Hide the group child-count badges (`2`, `5`, etc.) and the
+   expand chevron in collapsed mode. In expanded mode they add
+   useful "this group has N items" context next to the label. In
+   collapsed mode the label is hidden, so the badge floats to the
+   right of the centered icon and breaks the clean vertical column
+   of icons. They're not actionable on their own — clicking the
+   row still does the same thing — so hiding them costs nothing
+   functionally. */
+.sidebar.collapsed .nav-group-count,
+.sidebar.collapsed .nav-chevron {
+    display: none !important;
+}
+.sidebar.collapsed .sidebar-footer {
+    padding: 8px;
+    justify-content: center;
+}
+.sidebar.collapsed .logout { font-size: 11px; padding: 6px; }
+
+/* ============================================================
+   BOM grid: column resize handles
+   Each resizable <th data-bgrid-col> gets a thin handle anchored
+   to its right edge. Dragging changes that column's width;
+   double-clicking resets to auto. Widths are persisted in
+   localStorage keyed by column name.
+   ============================================================ */
+.bom-grid thead th[data-bgrid-col] {
+    position: sticky;            /* keep the sticky behaviour */
+    /* `relative` would override sticky; sticky already establishes a
+       containing block for absolutely-positioned descendants. */
+    overflow: visible;           /* so the handle can sit at the edge */
+}
+.bgrid-resize-handle {
+    position: absolute;
+    top: 0;
+    right: -3px;                 /* straddle the border for an easy grab */
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    user-select: none;
+    z-index: 4;
+}
+.bgrid-resize-handle:hover { background: rgba(255,255,255,0.25); }
+
+/* While resizing, freeze cursor + selection across the whole page so the
+   user can move past the table edge without losing the drag. */
+body.bgrid-resizing { cursor: col-resize !important; user-select: none; }
+body.bgrid-resizing * { cursor: col-resize !important; }
+
+/* ============================================================
+   Process Inventory: two-panel layout
+   Left = form fields, right = live consumption preview.
+   Collapses to stacked single-column on narrow viewports.
+   ============================================================ */
+.process-split {
+    display: grid;
+    grid-template-columns: minmax(300px, 1fr) minmax(300px, 1.4fr);
+    gap: 20px;
+    align-items: start;
+}
+.process-pane > h3 {
+    margin: 0 0 12px 0;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.process-pane-left .field { margin-bottom: 12px; }
+.process-pane-left .form-actions { margin-top: 16px; }
+.process-pane-right {
+    background: var(--surface-alt, #f6f7f9);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    position: sticky;
+    top: 80px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+}
+.process-pane-right #process-preview { font-size: 12.5px; }
+.process-pane-right .data-table { background: var(--surface); font-size: 12px; }
+.process-pane-right .data-table th { padding: 4px 6px; }
+.process-pane-right .data-table td { padding: 4px 6px; }
+
+@media (max-width: 880px) {
+    .process-split { grid-template-columns: 1fr; }
+    .process-pane-right { position: static; max-height: none; }
+}
+
+/* ============================================================
+   Per-line source picker in the Process preview pane.
+   Compact selects + a faint red wash on rows with shortfalls.
+   ============================================================ */
+.process-pane-right .proc-source {
+    width: 100%;
+    min-width: 140px;
+    padding: 2px 4px;
+    font-size: 11.5px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface);
+}
+.process-pane-right tr.row-short { background: rgba(220, 53, 69, 0.05); }
+.process-pane-right tr.row-short td { border-color: rgba(220, 53, 69, 0.15); }
+
+/* ============================================================
+   Ship & Receipt: accordion cards
+   <details class="card sr-accordion"> wraps each major section.
+   The summary acts as the card head and is clickable to toggle.
+   ============================================================ */
+.sr-accordion { padding: 0; }
+.sr-accordion > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 14px 20px;
+    border-bottom: 1px solid transparent;
+    user-select: none;
+    position: relative;
+}
+.sr-accordion[open] > summary { border-bottom-color: var(--border); }
+.sr-accordion > summary::-webkit-details-marker { display: none; }
+.sr-accordion > summary::after {
+    content: '▾';
+    position: absolute;
+    right: 20px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    transition: transform 0.15s;
+}
+.sr-accordion[open] > summary::after { transform: translateY(-50%) rotate(180deg); }
+.sr-accordion > summary > h2 { margin: 0; font-size: 16px; }
+.sr-accordion > * { padding: 0 20px; }
+.sr-accordion > summary { padding: 14px 20px; }
+.sr-accordion > :last-child { padding-bottom: 16px; }
+
+/* Disabled-state accordion on the New Ship & Receipt page. Hints at
+   what comes next without letting the user click into it. */
+.sr-accordion-disabled {
+    opacity: 0.6;
+    pointer-events: none;
+    background: var(--surface-alt, #f7f8fa);
+}
+.sr-accordion-disabled > summary { cursor: not-allowed; }
+.sr-accordion-disabled > summary::after { content: '🔒'; transform: translateY(-50%); }
+.sr-accordion-disabled[open] > summary::after { transform: translateY(-50%); }
+
+/* ============================================================
+   Ship & Receipt: compact 1366×768 layout
+   ============================================================ */
+/* Header form: pack 3 columns on wide screens, 2 on narrow.
+   Notes textareas get a smaller row-height to save vertical space. */
+@media (min-width: 1100px) {
+    #shiprcpt-form.form-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+    #shiprcpt-form .span-2 { grid-column: span 3; }
+}
+#shiprcpt-form textarea { min-height: 48px; }
+
+/* Side-by-side accordions on wide screens, stacked on narrow. */
+.sr-accordions-wrap {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 16px;
+    align-items: start;
+}
+@media (min-width: 1280px) {
+    .sr-accordions-wrap {
+        grid-template-columns: 1fr 1fr;
+    }
+    /* When side-by-side, reset the per-accordion margin since the
+       wrapper controls gap. */
+    .sr-accordions-wrap > details { margin-top: 0 !important; }
+}
+
+/* Each accordion's body caps at 40vh and scrolls internally. The
+   summary + actions stay visible. */
+.sr-accordion[open] > *:not(summary) {
+    max-height: 40vh;
+    overflow-y: auto;
+}
+/* Sub-section padding inside accordion: tighter than the global .card */
+.sr-accordion .data-table th,
+.sr-accordion .data-table td {
+    padding: 4px 8px;
+    font-size: 12.5px;
+}
+.sr-accordion .form-grid {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+}
+.sr-accordion .form-grid .span-2 { grid-column: span 4; }
+.sr-accordion .form-grid input,
+.sr-accordion .form-grid select { padding: 4px 6px; font-size: 12.5px; }
+.sr-accordion .form-grid label { font-size: 11.5px; }
+
+/* Sticky page-head so the status pill + back button stay visible
+   while you scroll any of the line tables. Scoped to Ship & Receipt
+   page so other pages aren't affected. */
+.sr-page .page-head { position: sticky; top: 0; background: var(--surface); z-index: 5; padding-top: 6px; padding-bottom: 6px; }
+
+/* ============================================================
+   Ship & Receipt: COMPACT LAYOUT
+   Targets a 1366×768 worst-case viewport. Aim is to surface
+   header + both accordions without forcing the user to scroll
+   the whole page; long line lists scroll internally instead.
+   Created: 20260515_211500_IST
+   ============================================================ */
+
+/* Sticky page-head so status + actions stay visible while
+   line lists scroll. Applies only on pages with the sr-page
+   marker class added in inventory_shiprcpt.php. */
+.sr-page .page-head {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg);
+    padding-top: 8px;
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+/* Header card: switch from 2-col to 3-col on wider viewports
+   so it stays inside one viewport height. Scoped to the header
+   form (#shiprcpt-form) so accordion add-forms keep their own
+   4-col layout. */
+#shiprcpt-form.form-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px 14px;
+}
+@media (min-width: 1180px) {
+    #shiprcpt-form.form-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+    #shiprcpt-form.form-grid .span-2 { grid-column: span 3; }
+}
+
+/* Trim card padding to claw back vertical space. Applies to all
+   cards inside the S&R page. */
+.sr-page .card {
+    padding: 12px 16px;
+}
+.sr-page .card-head h2 { margin: 0; font-size: 15px; }
+/* Field overrides scoped to the HEADER form only, so accordion
+   add-forms keep their own (already-compact) styling from the
+   .sr-accordion .form-grid rules above. */
+#shiprcpt-form .field { margin-bottom: 0; }
+#shiprcpt-form .field label { font-size: 12px; margin-bottom: 2px; }
+#shiprcpt-form .field input,
+#shiprcpt-form .field select,
+#shiprcpt-form .field textarea {
+    font-size: 13px;
+    padding: 4px 6px;
+}
+#shiprcpt-form textarea { resize: vertical; }
+
+/* Notes tabs: collapse the three textareas into a single row of
+   tabs + a single textarea area. We render all three textareas
+   in the DOM (so the form submits them) but show only the active
+   one. The tab nav lives at the top, the textarea fills below. */
+.sr-notes-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 6px;
+}
+.sr-notes-tabs button {
+    background: none;
+    border: none;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    border-radius: 0;
+}
+.sr-notes-tabs button:hover { color: var(--text); }
+.sr-notes-tabs button.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+    font-weight: 600;
+}
+.sr-notes-panel { display: none; }
+.sr-notes-panel.active { display: block; }
+.sr-notes-panel textarea {
+    width: 100%;
+    min-height: 60px;
+    font-size: 12.5px;
+}
+
+/* Side-by-side accordions: handled by .sr-accordions-wrap rules above.
+   No additional grid rules needed here. */
+.sr-accordion > summary { padding: 8px 14px; }
+.sr-accordion[open] > summary { border-bottom: 1px solid var(--border); }
+
+/* Bound the line-list inside each accordion so very long lists
+   scroll internally rather than pushing the whole page. The form
+   below (Add receive item / Add ship item) stays visible. */
+.sr-line-table {
+    max-height: 30vh;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+}
+.sr-line-table table { margin: 0; }
+.sr-line-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-alt, #f6f7f9);
+    z-index: 1;
+}
+
+/* Tight add-line form inside each accordion */
+.sr-page .sr-accordion .form-grid {
+    margin-top: 8px;
+    gap: 6px 10px;
+}
+.sr-page .sr-accordion .form-grid .field label { font-size: 11px; }
+
+/* Edited indicator — soft pill */
+.sr-page .pill-edited {
+    background: rgba(255, 159, 64, 0.15);
+    color: #b45f00;
+    font-size: 11px;
+}
+
+/* ============================================================
+   SIDEBAR — tighter visual rhythm, dim shortcut hints
+   Created: 20260515_234500_IST
+   ============================================================ */
+
+/* The <kbd> hint that appears when a label has no matching letter
+   for its shortcut chord (e.g. Reports + P → "Reports P"). The base
+   <kbd> style is a chunky badge meant for body text. In the sidebar
+   it's repeated on every item — too much. Dim it to a faint
+   half-width grey letter that only really stands out under Alt. */
+.sidebar kbd {
+    display: inline;
+    padding: 0;
+    background: transparent;
+    border: none;
+    font-family: inherit;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--sidebar-text-very-dim);
+    opacity: 0.5;
+    margin-left: 4px;
+    vertical-align: super;
+    letter-spacing: 0.5px;
+}
+.alt-active .sidebar kbd,
+body[data-chord-first] .sidebar kbd { opacity: 1; color: #ffffff; }
+
+/* Underlined letter inside sidebar labels: keep subtle off-state */
+.sidebar .nav-item u {
+    text-decoration: none;
+    border-bottom: 1px dotted var(--sidebar-text-very-dim);
+}
+.alt-active .sidebar .nav-item u {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    border-bottom: 0;
+    color: #ffffff;
+}
+
+/* Group children: tighter rows, subtle indent rule, smaller gap */
+.nav-group-children {
+    padding: 2px 0 4px 0;
+    background: rgba(0, 0, 0, 0.22);
+    border-left: 2px solid rgba(255, 255, 255, 0.06);
+    margin-left: 14px;
+}
+.nav-group-children .nav-item.nav-child {
+    padding: 6px 12px 6px 22px;
+    font-size: 12.5px;
+    border-radius: 0;
+    margin: 0;
+    background: transparent;
+    color: var(--sidebar-text);
+}
+.nav-group-children .nav-item.nav-child:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: #ffffff;
+}
+.nav-group-children .nav-item.nav-child.active {
+    background: var(--sidebar-bg-active);
+    color: #ffffff;
+    font-weight: 500;
+}
+.nav-group-children .nav-item.nav-child .nav-icon {
+    font-size: 13px;
+    opacity: 0.7;
+    margin-right: 6px;
+}
+
+/* Group toggle button: tighter, less aggressive when closed */
+.nav-group-toggle {
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 500;
+}
+.nav-group-toggle.open {
+    color: #ffffff;
+}
+.nav-group-toggle .nav-group-count {
+    font-size: 10px;
+    padding: 0 5px;
+    min-width: 16px;
+    line-height: 16px;
+    height: 16px;
+}
+
+/* Collapsed sidebar: keep glyphs centred without the kbd hints peeking */
+.sidebar.collapsed kbd { display: none; }
+
+/* ============================================================
+   DATA TABLE — full-screen, single-toolbar, pill-shaped filters
+   Created: 20260516_104500_IST · Revised: 20260516_111000_IST
+   ============================================================ */
+
+/* The wrap is a flex column. When .main contains a dt-wrap (page's
+   primary content is a data table), .main itself becomes a fixed-
+   height flex container so the dt-wrap can claim the remaining
+   viewport height and the dt-scroll inside it is the actual
+   scrolling ancestor. Without this, the page itself scrolls and
+   the sticky thead/tfoot never engage because dt-scroll's content
+   fits in dt-scroll's intrinsic height.
+
+   The :has() selector targets ANY dt-wrap descendant, not just
+   :first-child — covers the common case where a flash message or
+   impersonate banner sits above the table. Pages without a
+   dt-wrap are unaffected (their .main keeps natural sizing). */
+.dt-wrap {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    box-sizing: border-box;
+    max-height: 60vh;
+    min-height: 200px;
+    background: var(--surface);
+    overflow: hidden;
+}
+.main:has(.dt-wrap) {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0;
+}
+.main:has(.dt-wrap) > * {
+    flex-shrink: 0;
+}
+.main:has(.dt-wrap) > .dt-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    max-height: none;
+}
+
+/* :has()-free fallback. The data_table_render() function adds the
+   has-dt-wrap class to <body> on page load (see includes/datatable.php).
+   This duplicates the rules above so layouts work in browsers / contexts
+   where :has() doesn't evaluate consistently. Same effect: viewport-
+   height .main, dt-wrap fills the rest, dt-scroll handles overflow,
+   sticky thead engages.
+
+   Belt-and-braces: lock the entire chain (html, body, .layout, .main)
+   so nothing along the way can grow past the viewport. !important to
+   override any earlier rule (like .layout's min-height: 100vh, which
+   would otherwise let .layout grow past 100vh and push .main down).
+   The chain:
+     html, body          → 100vh, overflow: hidden (page itself can't scroll)
+     .layout (flex row)  → 100vh (sidebar + main fill viewport)
+     .main               → 100vh, overflow: hidden, flex column
+     .dt-wrap            → flex 1 inside .main
+     .dt-scroll          → overflow: auto (the ACTUAL scrolling element)
+     thead th            → position: sticky, top: 0 (pin to dt-scroll top)
+*/
+html.has-dt-wrap,
+body.has-dt-wrap {
+    height: 100vh !important;
+    min-height: 100vh !important;
+    max-height: 100vh !important;
+    overflow: hidden !important;
+}
+body.has-dt-wrap .layout {
+    height: 100vh !important;
+    min-height: 100vh !important;
+    max-height: 100vh !important;
+    overflow: hidden !important;
+}
+body.has-dt-wrap .main {
+    height: 100vh !important;
+    max-height: 100vh !important;
+    overflow: hidden !important;
+    display: flex !important;
+    flex-direction: column !important;
+    padding: 0 !important;
+}
+body.has-dt-wrap .main > * {
+    flex-shrink: 0;
+}
+body.has-dt-wrap .main > .dt-wrap {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+}
+/* .dt-scroll inside dt-wrap is the actual scrolling area. Make sure
+   it can scroll. */
+body.has-dt-wrap .dt-wrap > .dt-scroll {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: auto !important;
+}
+/* Legacy compatibility: if a page still wraps the datatable in a
+   .card, strip the card's chrome so the table goes edge-to-edge
+   without overflowing. We don't use negative margins — those push
+   the table outside the visible area on some layouts. */
+.card:has(> .dt-wrap) {
+    padding: 0;
+    overflow: hidden;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+}
+
+/* Single horizontal toolbar at the top.
+   Layout: left (summary + page-size + custom actions) | title | right (pager). */
+.dt-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+    min-height: 44px;
+}
+.dt-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 0;
+}
+.dt-toolbar-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    text-align: center;
+    flex: 0 0 auto;
+}
+.dt-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 0;
+    justify-content: flex-end;
+}
+.dt-toolbar .dt-summary { white-space: nowrap; }
+.dt-toolbar .dt-page-size { display: inline-flex; align-items: center; gap: 4px; }
+.dt-toolbar .dt-page-size select {
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface);
+    font-size: 12px;
+}
+.dt-toolbar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 6px;
+}
+/* Buttons inside the toolbar are sized down to match the summary
+   text's visual weight. Anything larger feels overwrought. */
+.dt-toolbar .btn { padding: 5px 12px; font-size: 12px; min-height: 28px; line-height: 1.3; }
+.dt-toolbar .btn-icon { padding: 3px 6px; min-height: 24px; }
+
+/* Pager buttons compacted to fit in the toolbar */
+.dt-toolbar .dt-pager-btn,
+.dt-toolbar .dt-pager-page {
+    padding: 4px 10px;
+    font-size: 12px;
+    min-width: 28px;
+}
+
+/* The scroll area takes the rest of the wrap height. */
+.dt-wrap .dt-scroll {
+    flex: 1 1 auto;
+    max-height: none;
+    min-height: 0;
+    border: none;
+    border-radius: 0;
+    overflow: auto;
+    background: var(--surface);
+}
+
+/* Filter row lives inside <tfoot> so its cell widths match the
+   data columns automatically. Each td is sticky-positioned to the
+   bottom of the scroll container so the bar stays visible regardless
+   of how few rows are shown. */
+.dt-table tfoot.dt-filters td.dt-filter-td {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    padding: 6px 8px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    box-shadow: inset 0 1px 0 var(--border);
+}
+.dt-filter-pill {
+    display: flex;
+    align-items: center;
+    background: var(--surface-alt, #f3f4f7);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px 2px 10px;
+    transition: border-color 0.12s, background 0.12s;
+    min-width: 0;            /* let flex shrink below content size */
+}
+.dt-filter-pill:focus-within {
+    border-color: var(--primary);
+    background: var(--surface);
+}
+.dt-filter-icon {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-right: 6px;
+    flex-shrink: 0;
+}
+.dt-filter-pill .dt-col-filter {
+    flex: 1 1 0;
+    width: 100%;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    outline: none;
+    font-size: 12.5px;
+    padding: 4px 0;
+    color: var(--text);
+}
+.dt-filter-pill .dt-col-filter::placeholder {
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+.dt-filter-pill .dt-col-filter-select { cursor: pointer; appearance: none; }
+
+/* Hide the old dt-footer (moved up into the toolbar) and the old
+   .dt-filterbar (moved into the table as tfoot). */
+.dt-wrap + .dt-footer,
+.dt-wrap .dt-footer,
+.dt-wrap > .dt-filterbar,
+.dt-wrap .dt-filterbar { display: none; }
+
+/* ============================================================
+   COLUMN RESIZE HANDLES
+   A thin vertical strip on the right edge of each <th> (except
+   the last one). On hover/drag it goes blue so the user sees
+   they can grab it. Resize JS lives in assets/js/datatable.js.
+   ============================================================ */
+.dt-table { table-layout: auto; }
+/* table-layout: fixed is set by the resize JS as soon as the user
+   starts dragging (or saved widths are loaded). Auto is the default
+   so columns naturally size to content on first paint. The table's
+   total width is also pinned via inline style by the JS — that
+   pinning is what prevents sibling columns from auto-shrinking when
+   one column grows. The .dt-scroll wrapper provides horizontal
+   scrolling when the table grows past container width. */
+.dt-table.dt-fixed-layout { table-layout: fixed; }
+.dt-table[data-dt-resizable="1"] th { position: relative; }
+.dt-resize-handle {
+    position: absolute;
+    top: 0;
+    right: -3px;            /* span the border between cells */
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 4;
+    user-select: none;
+    background: transparent;
+    transition: background 0.12s;
+}
+.dt-resize-handle:hover,
+.dt-resize-handle.dt-resizing { background: var(--primary); opacity: 0.4; }
+body.dt-resizing-active { cursor: col-resize; user-select: none; }
+body.dt-resizing-active * { cursor: col-resize !important; }
+
+/* When fixed layout is active, cells enforce widths and content
+   ellipses if it doesn't fit. The filter cells stay visible. */
+.dt-table.dt-fixed-layout th,
+.dt-table.dt-fixed-layout td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dt-table.dt-fixed-layout tfoot td.dt-filter-td {
+    overflow: visible;
+    white-space: normal;
+}
+/* The th label needs to allow its sort arrow + resize handle to live
+   alongside the text. Use inline layout. */
+.dt-th-label {
+    display: inline-block;
+    vertical-align: middle;
+    max-width: calc(100% - 30px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ============================================================
+   SIDEBAR — at-rest shortcut hints (visible but quiet)
+   ============================================================ */
+.sidebar .nav-item u {
+    text-decoration: underline;
+    text-decoration-color: rgba(255, 255, 255, 0.4);
+    text-underline-offset: 2px;
+    text-decoration-thickness: 1px;
+    border-bottom: 0;
+}
+.alt-active .sidebar .nav-item u,
+body[data-chord-first] .sidebar .nav-item u {
+    text-decoration-color: #ffffff;
+    text-decoration-thickness: 2px;
+}
+.sidebar kbd { opacity: 0.7; }
+
+/* ============================================================
+   FORM PAGES — toolbar header + edge-to-edge body
+   Mirrors the data-table toolbar pattern so add/edit pages and
+   list pages share visual schema. Created: 20260516_114500_IST
+   ============================================================ */
+
+/* Wrapper sits flush against the sidebar/viewport edges.
+   .main padding is zeroed when .form-page is the first child. */
+.main:has(> .form-page:first-child) { padding: 0; }
+.form-page {
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+}
+
+/* Toolbar at top: same flex layout as .dt-toolbar so the two visually
+   match. The middle title is centered; left and right zones flex equal. */
+.form-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+    min-height: 44px;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+}
+.form-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 0;
+}
+.form-toolbar-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    text-align: center;
+    flex: 0 0 auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.form-toolbar-subtitle {
+    margin-left: 8px;
+    font-weight: normal;
+}
+.form-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 0;
+    justify-content: flex-end;
+}
+.form-toolbar .btn {
+    /* All toolbar buttons render uniform: same height, same inner gap
+       between icon glyphs and text, same baseline. inline-flex +
+       align-items:center keeps emoji/unicode glyphs visually centered
+       with the label regardless of their natural baseline. gap: 6px
+       between icon and label so "✓ Approve" reads as evenly spaced as
+       "↻ Rework" or "← Inspections". Forced height (not min-height)
+       so no button grows taller than its peers when its label has a
+       larger glyph. */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 12px;
+    font-size: 12px;
+    line-height: 1;
+    height: 30px;
+    min-height: 30px;
+    border-radius: var(--radius);
+    white-space: nowrap;
+}
+/* Emoji + unicode glyphs in buttons sit on different baselines by
+   default. Normalize by giving them a fixed font-size that's slightly
+   smaller than the label, and use a font stack that prefers monochrome
+   forms over color emoji where possible. */
+.form-toolbar .btn > .btn-glyph,
+.form-toolbar .btn::first-letter {
+    /* This is a hint to the user — buttons with leading single-char
+       glyphs (like ✓ ↻ ← ✗) won't have explicit .btn-glyph spans yet,
+       but the rule above documents the convention. */
+}
+/* When buttons sit in a group, no shadow between them */
+.form-toolbar .btn + .btn { margin-left: 0; }
+.form-toolbar form { display: inline; }
+
+/* Form body: comfortable gutter inside the page. Page scrolls
+   naturally when content overflows — the toolbar's position:sticky
+   keeps it pinned to the top of the viewport during scroll. */
+.form-page-body {
+    padding: 20px 28px;
+}
+/* Sections inside the form body — use .form-section for sub-grids
+   (contacts, addresses, etc.) so they visually separate from the
+   main header form. Plain cards inside form-page-body work too. */
+.form-page-body .form-section {
+    border-top: 1px solid var(--border);
+    margin-top: 20px;
+    padding-top: 16px;
+}
+.form-page-body .form-section h2,
+.form-page-body .form-section h3 {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+/* ============================================================
+   COMBOBOX (search-and-select replacement for <select>)
+   Created: 20260516_120000_IST
+   ============================================================ */
+.cb-wrap {
+    position: relative;
+    display: block;
+}
+/* Hide the original <select> visually but keep it in the DOM so
+   form submission still sends the selected value. Don't use display:none
+   — that breaks form-level required validation in some browsers. */
+.cb-wrap > select.cb-native {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    top: 0;
+    left: 0;
+}
+/* Combobox input — styled to match .field input[type="text"] exactly.
+   We use `all: revert` followed by explicit styling so the input
+   starts from browser-default values rather than inheriting from
+   ancestors. Some pages set `text-align: center` or unusual heights
+   on form containers, and those leak into the input via inheritance
+   even when our CSS targets the input directly with !important —
+   because the inherited values are computed AT the input, not on
+   any ancestor. `all: revert` resets every property to browser
+   default first, then our explicit rules below win cleanly.
+
+   Note: we then have to re-set every property we care about because
+   `all: revert` wipes color, font, border, etc. */
+.cb-wrap > input.cb-input {
+    all: revert !important;
+    /* Now apply our baseline */
+    display: block !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    padding: 8px 28px 8px 11px !important;
+    margin: 0 !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: var(--radius) !important;
+    background: white !important;
+    font-family: inherit !important;
+    font-size: 13.5px !important;
+    font-weight: normal !important;
+    line-height: 1.4 !important;
+    color: var(--text) !important;
+    text-align: left !important;
+    outline: none !important;
+    height: auto !important;
+    min-height: 0 !important;
+    transition: border-color 0.12s, box-shadow 0.12s !important;
+    -webkit-appearance: none !important;
+    appearance: none !important;
+}
+.cb-wrap.cb-open > input.cb-input,
+.cb-wrap > input.cb-input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(30, 58, 138, 0.1);
+}
+.cb-chev {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: var(--text-muted);
+    pointer-events: auto;
+    cursor: pointer;
+    user-select: none;
+}
+.cb-wrap.cb-open .cb-chev { color: var(--primary); transform: translateY(-50%) rotate(180deg); }
+
+/* Dropdown menu — rendered with position:fixed (not absolute) so an
+   ancestor's overflow:hidden / overflow:auto / transform / contain
+   can't clip it. The JS sets top / left / width inline from the
+   wrap's getBoundingClientRect() each time the menu opens. */
+.cb-menu {
+    position: fixed;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    /* Very high z-index so the menu sits above sticky headers,
+       modal-ish floating UI, the sidebar, etc. Anything that
+       legitimately needs to be on top of this (true modal dialogs)
+       should use a higher value. */
+    z-index: 9999;
+}
+.cb-item {
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+}
+.cb-item:hover,
+.cb-item.cb-highlight {
+    background: var(--surface-alt, #f3f4f7);
+}
+.cb-item.cb-selected {
+    background: rgba(99,102,241,0.10);
+    color: var(--primary);
+    font-weight: 500;
+}
+.cb-item.cb-disabled {
+    color: var(--text-muted);
+    cursor: not-allowed;
+}
+.cb-empty {
+    padding: 8px 10px;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-style: italic;
+    text-align: center;
+}
+
+/* ============================================================
+   DATA-TABLE FILTER PILL SELECT — visual fix
+   The native <select> rendering busted out of the pill's rounded
+   shape because UA stylesheets give selects intrinsic min-width.
+   These rules constrain the select to the pill bounds and hide the
+   default chevron so our pill keeps its 🔍 icon as the only adornment.
+   ============================================================ */
+.dt-filter-pill .dt-col-filter-select {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    padding: 4px 0;
+    font-size: 12.5px;
+    color: var(--text);
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    cursor: pointer;
+    /* Truncate long option labels rather than overflow */
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+}
+.dt-filter-pill .dt-col-filter-select::-ms-expand { display: none; }
+.dt-filter-pill .dt-col-filter-select option {
+    /* Browser native dropdown menu — make sure it's readable */
+    background: var(--surface);
+    color: var(--text);
+}
+
+/* ============================================================
+   DATA TABLE — denser rows, unconditional ellipsis + tooltip
+   Created: 20260516_125000_IST
+   ============================================================ */
+
+/* Tighten row + header padding for the data-table inside a dt-wrap.
+   Plain .data-table instances elsewhere (e.g. legacy custom tables)
+   keep their base padding.
+
+   The header's right padding is trimmed to 2px so the sort chevron
+   (inline immediately after the label) sits flush against the
+   column separator. The .dt-resize-handle is absolutely positioned
+   at right:-3px and unaffected by this padding. */
+.dt-table thead th {
+    padding: 7px 2px 7px 12px;
+    font-size: 10.5px;
+}
+.dt-table tbody td {
+    padding: 7px 12px;
+    font-size: 12.5px;
+}
+
+/* Ellipsis + tooltip on all data-table cells unconditionally.
+   Combined with table-layout:auto, this only takes effect when a
+   column is constrained (e.g. by user resize or viewport pressure).
+   When auto-layout has room, content displays in full as normal. */
+.dt-table tbody td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 0;          /* lets text-overflow:ellipsis activate inside a table */
+}
+.dt-table thead th .dt-th-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* The filter pill input must still be visible inside its overflow-hidden
+   td — pills are short enough they typically fit, but allow them to flex
+   to the cell width. */
+.dt-table tfoot td.dt-filter-td {
+    overflow: visible;
+    white-space: normal;
+    max-width: none;
+}
+
+/* When the cell content is HTML (pills, links, code tags), we need the
+   inline children to also clip. The `title` attribute set by JS reveals
+   the full text on hover regardless. */
+.dt-table tbody td > * { vertical-align: middle; }
+
+/* ============================================================
+   FORM PAGES — denser layout for long forms
+   Created: 20260516_131500_IST
+   ============================================================ */
+
+/* Tighter grid inside form pages: smaller row gap, normal-case labels,
+   shorter label-to-input distance, slightly slimmer inputs. */
+.form-page-body .form-grid {
+    gap: 12px 16px;            /* row gap, col gap */
+}
+.form-page-body .field label {
+    text-transform: none;       /* don't shout — labels read as written */
+    letter-spacing: 0;
+    font-size: 11.5px;
+    margin-bottom: 3px;
+    color: var(--text-muted);
+}
+.form-page-body .field input[type="text"],
+.form-page-body .field input[type="email"],
+.form-page-body .field input[type="number"],
+.form-page-body .field input[type="date"],
+.form-page-body .field input[type="datetime-local"],
+.form-page-body .field input[type="time"],
+.form-page-body .field input[type="password"],
+.form-page-body .field input[type="url"],
+.form-page-body .field input[type="tel"],
+.form-page-body .field input[type="search"],
+.form-page-body .field select,
+.form-page-body .field textarea {
+    padding: 6px 10px;
+    font-size: 13px;
+}
+.form-page-body .field textarea { line-height: 1.4; }
+.form-page-body .field .muted.small {
+    margin-top: 2px;
+    font-size: 11px;
+}
+/* Empty grid spacer fields (used to force layout breaks) — collapse
+   their vertical contribution so they don't add a row of whitespace. */
+.form-page-body .form-grid > .field:empty { padding: 0; min-height: 0; }
+
+/* ============================================================
+   FORM DENSITY pass 2 + PILL HEIGHT
+   Created: 20260516_134800_IST
+   ============================================================ */
+
+/* 4-column grid inside form-page bodies. .span-2 still works (spans
+   half the width); add .span-3 for three columns and .span-4 for full. */
+.form-page-body .form-grid {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px 14px;
+}
+.form-page-body .form-grid .field.span-2 { grid-column: span 2; }
+.form-page-body .form-grid .field.span-3 { grid-column: span 3; }
+.form-page-body .form-grid .field.span-4 { grid-column: span 4; }
+
+/* Even tighter input + label spacing */
+.form-page-body .field label {
+    font-size: 11px;
+    margin-bottom: 2px;
+}
+.form-page-body .field input[type="text"],
+.form-page-body .field input[type="email"],
+.form-page-body .field input[type="number"],
+.form-page-body .field input[type="date"],
+.form-page-body .field input[type="datetime-local"],
+.form-page-body .field input[type="time"],
+.form-page-body .field input[type="password"],
+.form-page-body .field input[type="url"],
+.form-page-body .field input[type="tel"],
+.form-page-body .field input[type="search"],
+.form-page-body .field select,
+.form-page-body .field textarea {
+    padding: 4px 9px;
+    font-size: 12.5px;
+    min-height: 28px;
+}
+.form-page-body .field textarea { min-height: 0; }
+.form-page-body .field .muted.small { font-size: 10.5px; margin-top: 1px; }
+
+/* Form body padding can shrink too — the toolbar already has gutters. */
+.form-page-body { padding: 14px 18px; }
+
+/* ============================================================
+   PILLS — denser everywhere
+   Reduces the perceived row height in lists with status pills,
+   and matches the new compact form/toolbar feel.
+   ============================================================ */
+.pill {
+    padding: 1px 7px;
+    font-size: 10px;
+    letter-spacing: 0.03em;
+    line-height: 1.5;
+}
+
+/* ============================================================
+   FORM DENSITY pass 3 — tighten vertical rhythm further
+   Created: 20260516_141500_IST
+   ============================================================ */
+.form-page-body .form-grid {
+    gap: 5px 14px;             /* row gap 8 → 5 */
+}
+.form-page-body .field label {
+    font-size: 10.5px;
+    margin-bottom: 1px;
+}
+.form-page-body .field input[type="text"],
+.form-page-body .field input[type="email"],
+.form-page-body .field input[type="number"],
+.form-page-body .field input[type="date"],
+.form-page-body .field input[type="datetime-local"],
+.form-page-body .field input[type="time"],
+.form-page-body .field input[type="password"],
+.form-page-body .field input[type="url"],
+.form-page-body .field input[type="tel"],
+.form-page-body .field input[type="search"],
+.form-page-body .field select {
+    padding: 3px 8px;
+    font-size: 12px;
+    min-height: 26px;
+    line-height: 1.3;
+}
+/* Textareas don't get a min-height override — but we cap their visible
+   height so a `rows="3"` doesn't dominate. The user can still drag the
+   resize handle if they need more room. */
+.form-page-body .field textarea {
+    padding: 4px 8px;
+    font-size: 12px;
+    line-height: 1.35;
+    min-height: 0;
+    max-height: 60px;
+}
+.form-page-body .field .muted.small { font-size: 10px; margin-top: 0; line-height: 1.3; }
+
+/* Form page body padding tightened more */
+.form-page-body { padding: 10px 16px; }
+
+/* ============================================================
+   BOM DESIGNER + BOM VIEW — restyled to match data-table density
+   Created: 20260516_143000_IST
+   ============================================================ */
+
+/* ---- Designer: row density ---- */
+.bd-row {
+    padding: 3px 8px;
+    font-size: 12px;
+    gap: 6px;
+}
+.bd-row .bd-icon { font-size: 12px; }
+.bd-row .bd-qty {
+    padding: 1px 4px;
+    font-size: 11.5px;
+    min-height: 22px;
+    width: 100%;
+    box-sizing: border-box;
+}
+.bd-row .bd-uom { font-size: 10px; }
+.bd-row .bd-delete {
+    font-size: 12px;
+    padding: 1px 4px;
+}
+.bd-row .bd-label .mono { font-size: 11px; }
+/* Ellipsis on label like data-table cells */
+.bd-row .bd-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ---- Designer: Sortable.js drag affordances ---- */
+.bd-ghost {
+    opacity: 0.5;
+    background: var(--primary-light, #eef2ff) !important;
+}
+.bd-ghost > .bd-row { background: transparent; }
+.bd-chosen { outline: 2px solid var(--primary); outline-offset: -2px; }
+.bd-drag {
+    /* While dragging, hide the dragged element's children (so we don't
+       paint the whole subtree as a giant drag image). Sortable handles
+       the visual replicate; we just want a slim element. */
+    opacity: 0.95;
+}
+.bd-drag > .bd-children { display: none; }
+
+/* Empty <ul.bd-children> needs SOME height so Sortable can detect drop
+   into an otherwise-empty parent. */
+.bd-children-empty {
+    min-height: 14px;
+    margin: 2px 0 2px 22px;
+    border-left: 2px dashed transparent;
+    transition: border-color 0.12s, background 0.12s;
+}
+.bd-children-empty.sortable-active,
+ul.bd-children:empty {
+    min-height: 14px;
+    border-left-color: var(--border, #e2e6ee);
+    background: rgba(99, 102, 241, 0.04);
+}
+
+/* Palette items: while dragging, the clone leaving the palette is visually
+   highlighted. */
+.bd-palette-ghost {
+    opacity: 0.35;
+}
+.bd-palette-chosen {
+    background: var(--primary-light, #eef2ff);
+}
+
+/* In-flight flash banner */
+.bd-flash {
+    padding: 6px 12px;
+    border-radius: 4px;
+    margin: 0 0 8px 0;
+    font-size: 12.5px;
+    background: var(--danger-bg, #fee2e2);
+    color: var(--danger, #b91c1c);
+    border: 1px solid var(--danger, #fca5a5);
+}
+.bd-flash[data-kind="info"] { background: var(--info-bg); color: var(--info); border-color: var(--info); }
+
+/* ---- BOM VIEW: read-only tree, data-table density ---- */
+.bom-row {
+    padding: 5px 10px;
+    font-size: 12.5px;
+    gap: 8px;
+}
+.bom-row .bom-toggle {
+    font-size: 12px;
+    padding: 0 3px;
+    line-height: 1;
+}
+.bom-row .bom-icon { font-size: 13px; }
+.bom-row .bom-main {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bom-row .bom-main .mono { font-size: 11.5px; }
+.bom-row .bom-name { font-size: 12.5px; }
+.bom-row .bom-meta {
+    gap: 10px;
+    font-size: 11px;
+}
+.bom-row .bom-qty,
+.bom-row .bom-cost,
+.bom-row .bom-stock { font-size: 11px; }
+.bom-tree-toolbar { padding: 6px 10px; }
+.bom-tree-toolbar .btn { font-size: 11.5px; padding: 4px 9px; min-height: 26px; }
+
+/* Hover same as data-table */
+.bom-row:hover { background: var(--surface-alt, #f3f4f7); }
+.bd-row:hover  { background: var(--surface-alt, #f3f4f7); }
+
+/* ============================================================
+   BOM TREE GRID — restyled to match data-table look
+   Created: 20260516_150000_IST
+   ============================================================ */
+
+/* The wrap now uses dt-wrap so it gets the full-bleed behavior. The
+   scroll inside it fills the remaining height after the toolbar. */
+.bom-grid-wrap {
+    display: flex;
+    flex-direction: column;
+}
+.bom-grid-wrap .bom-grid-scroll {
+    flex: 1 1 auto;
+    border: none;
+    border-radius: 0;
+    max-height: none;
+    min-height: 0;
+}
+
+/* Tabs inline inside the toolbar — compact, no card-like tab look */
+.bom-grid-wrap .dt-toolbar-left { gap: 4px; flex-wrap: wrap; }
+.bom-grid-wrap .bom-tab {
+    padding: 3px 10px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    text-decoration: none;
+    line-height: 1.5;
+}
+.bom-grid-wrap .bom-tab:hover { background: var(--surface-alt, #f3f4f7); color: var(--text); }
+.bom-grid-wrap .bom-tab.active {
+    background: var(--primary-light, #eef2ff);
+    color: var(--primary);
+    border-color: var(--primary-light, #eef2ff);
+    font-weight: 600;
+}
+.bom-grid-wrap .bom-tab .count { color: inherit; opacity: 0.7; font-weight: normal; }
+
+/* Header row — light gray like the data-table, not the dark slate.
+   The cog icon stays but in muted color. */
+.bom-grid-wrap .bom-grid thead th {
+    background: var(--surface-alt, #f3f4f7);
+    color: var(--text-muted);
+    padding: 4px 12px;
+    font-weight: 600;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-right: 1px solid var(--border);
+}
+.bom-grid-wrap .bom-grid thead .bom-cog {
+    color: var(--text-muted);
+    opacity: 0.4;
+    font-size: 11px;
+}
+.bom-grid-wrap .bom-grid thead .bom-cog:hover { color: var(--primary); opacity: 1; }
+
+/* Filter row second-row top offset (column-header height changed) */
+.bom-grid-wrap .bom-grid thead tr:nth-child(2) th {
+    top: 24px;
+    background: var(--surface);
+    padding: 3px 6px;
+}
+/* The filter pill inside the filter row */
+.bom-grid-wrap .bom-grid .bom-filter-row .dt-filter-pill { width: 100%; }
+.bom-grid-wrap .bom-grid .bom-filter-row input {
+    border: none;
+    padding: 0;
+    font-size: 11.5px;
+    width: 100%;
+    background: transparent;
+    outline: none;
+}
+
+/* Body row density — 30% tighter than the data-table base */
+.bom-grid-wrap .bom-grid tbody td {
+    padding: 4px 10px;
+    font-size: 12px;
+    line-height: 1.35;
+    border-right: 1px solid #ececef;
+}
+.bom-grid-wrap .bom-grid tbody td:last-child { border-right: none; }
+/* No zebra striping — matches the data-table look */
+.bom-grid-wrap .bom-grid tbody tr:nth-child(even) { background: transparent; }
+.bom-grid-wrap .bom-grid tbody tr:hover { background: var(--surface-alt, #fafbfc); }
+
+/* Ellipsis on the name cell (the longest one); narrower truncation on
+   the detail cell. Numeric columns stay short anyway. */
+.bom-grid-wrap .bom-grid .bom-name-cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 0;
+}
+
+/* Toolbar buttons are slightly tighter to match */
+.bom-grid-wrap .dt-toolbar .btn-sm { padding: 4px 9px; font-size: 11.5px; min-height: 26px; }
+
+/* Toggle button + spacer inside the tighter BOM grid rows */
+.bom-grid-wrap .bom-grid .bom-toggle-btn {
+    width: 15px; height: 15px;
+    line-height: 11px;
+    font-size: 11px;
+    margin-right: 4px;
+}
+.bom-grid-wrap .bom-grid .bom-toggle-spacer { width: 15px; }
+
+/* ============================================================
+   BOM TREE — filter row in tfoot (sticky bottom) + row actions
+   Created: 20260516_163000_IST
+   ============================================================ */
+
+/* Filter row in <tfoot> sticky at the bottom of the scroll container,
+   matching the data-table pattern. */
+.bom-grid-wrap .bom-grid tfoot.bom-filter-foot th {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    background: var(--surface);
+    padding: 4px 6px;
+    border-top: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+}
+.bom-grid-wrap .bom-grid tfoot.bom-filter-foot th:last-child {
+    border-right: none;
+}
+.bom-grid-wrap .bom-grid tfoot .dt-filter-pill { width: 100%; }
+.bom-grid-wrap .bom-grid tfoot .bom-filter-row input {
+    border: none;
+    padding: 0;
+    font-size: 11.5px;
+    width: 100%;
+    background: transparent;
+    outline: none;
+}
+
+/* Per-row Actions dropdown: gear button + menu next to it.
+   The menu is absolute-positioned so it doesn't disturb the row layout. */
+.bom-actions-menu {
+    position: relative;
+    display: inline-block;
+}
+.bom-actions-trigger {
+    /* Match the look of other .btn-icon buttons but signal "menu" */
+    cursor: pointer;
+    font-size: 14px;
+}
+.bom-actions-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 2px;
+    min-width: 200px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+    z-index: 20;
+    padding: 4px 0;
+    /* Prevent the dropdown from being clipped by the cell's overflow */
+    /* (we already removed overflow-hidden from this cell via .bom-grid td) */
+}
+.bom-actions-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.3;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.bom-actions-item:hover {
+    background: var(--surface-alt, #f3f4f7);
+    color: var(--text);
+    text-decoration: none;
+}
+.bom-actions-icon {
+    display: inline-block;
+    width: 16px;
+    text-align: center;
+    font-size: 13px;
+}
+/* The cells the dropdown is in shouldn't clip it — allow overflow.
+   Also give the cell a sensible width so the gear button has room. */
+.bom-grid-wrap .bom-grid tbody td:last-child {
+    overflow: visible;
+    max-width: none;
+    width: 1%;
+    white-space: nowrap;
+    text-align: center;
+}
+/* Same for the tfoot last cell (empty placeholder, but match width). */
+.bom-grid-wrap .bom-grid tfoot tr.bom-filter-row th:last-child {
+    width: 1%;
+}
+
+/* ============================================================
+   RUNNING NOTES
+   Created: 20260516_180000_IST
+   ============================================================ */
+.notes-section {
+    /* Inherits .form-section visual style from existing CSS */
+}
+
+/* Composer */
+.notes-composer {
+    background: var(--surface-alt, #f7f8fa);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+}
+.notes-composer-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+.notes-composer-row .notes-type-select {
+    width: 160px;
+    padding: 4px 8px;
+    font-size: 12px;
+    min-height: 28px;
+}
+.notes-attach-btn {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.notes-attach-preview { font-size: 11px; }
+.notes-editor {
+    background: white;
+    min-height: 100px;
+}
+.notes-composer-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 6px;
+}
+
+/* Quill toolbar — restyle to match the app's compact look */
+.notes-editor + .ql-toolbar,
+.notes-editor.ql-container,
+.ql-toolbar.ql-snow,
+.ql-container.ql-snow {
+    border-color: var(--border) !important;
+    font-family: inherit;
+}
+.ql-toolbar.ql-snow {
+    border-radius: 4px 4px 0 0;
+    padding: 4px;
+}
+.ql-container.ql-snow {
+    border-radius: 0 0 4px 4px;
+    font-size: 13px;
+}
+.ql-editor { min-height: 80px; padding: 8px 10px; }
+.ql-editor.ql-blank::before { font-style: normal; color: var(--text-muted); }
+
+/* Notes list */
+.notes-list { display: flex; flex-direction: column; gap: 10px; }
+.note-item {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 9px 12px;
+    background: var(--surface);
+}
+.note-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+    font-size: 12px;
+}
+.note-author { font-size: 12.5px; }
+.note-when { font-size: 11px; }
+.note-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 2px;
+}
+.note-actions .btn-icon { padding: 2px 6px; font-size: 13px; }
+.note-body {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text);
+}
+.note-body p { margin: 0 0 6px 0; }
+.note-body p:last-child { margin-bottom: 0; }
+.note-body ul, .note-body ol { margin: 4px 0 4px 22px; padding: 0; }
+.note-body blockquote {
+    border-left: 3px solid var(--border-strong, #cbd5e1);
+    padding-left: 10px;
+    margin: 6px 0;
+    color: var(--text-muted);
+}
+.note-body code {
+    background: var(--surface-alt, #f3f4f7);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+.note-body pre {
+    background: var(--surface-alt, #f3f4f7);
+    padding: 8px 10px;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 12px;
+}
+.note-body a { color: var(--primary); }
+
+.note-attachments {
+    margin-top: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.note-attachment {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    background: var(--surface-alt, #f3f4f7);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 11.5px;
+    color: var(--text);
+    text-decoration: none;
+}
+.note-attachment:hover {
+    background: var(--primary-light, #eef2ff);
+    color: var(--primary);
+    text-decoration: none;
+}
+.note-type-pill { font-size: 9.5px; }
+
+/* ============================================================
+   NOTES MODAL POPUP
+   Created: 20260516_190000_IST
+   ============================================================ */
+.notes-modal[hidden] { display: none; }
+.notes-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.notes-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.45);
+}
+.notes-modal-dialog {
+    position: relative;
+    background: var(--surface);
+    border-radius: 8px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
+    width: min(720px, 92vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+}
+.notes-modal-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+}
+.notes-modal-title {
+    margin: 0;
+    font-size: 14.5px;
+    font-weight: 600;
+}
+.notes-modal-close-btn {
+    margin-left: auto;
+}
+.notes-modal-body {
+    padding: 14px 18px;
+    overflow-y: auto;
+}
+body.notes-modal-open { overflow: hidden; }
+/* Inside the modal, drop the section heading & outer border that the
+   inline rendering would have. */
+.notes-section-modal h2 { display: none; }
+
+/* The notes-popup button itself — match the rest of the form_toolbar
+   ghost buttons but with a slight notes-icon tilt. */
+.notes-popup-btn { gap: 4px; }
+.notes-popup-count { font-weight: 600; color: var(--primary); }
+
+/* ============================================================
+   ADD NOTE — entity picker
+   ============================================================ */
+.entity-picker { position: relative; }
+.entity-picker-search {
+    width: 100%;
+    /* The .field input styles apply automatically; this is just for
+       belt-and-suspenders. */
+}
+.entity-picker-dropdown {
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    z-index: 50;
+}
+.entity-picker-item {
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 12.5px;
+}
+.entity-picker-item:hover {
+    background: var(--surface-alt, #f3f4f7);
+}
+.entity-picker-empty {
+    padding: 8px 10px;
+}
+.entity-picker-chosen {
+    margin-top: 4px;
+    font-size: 11.5px;
+    color: var(--success, #16a34a);
+}
+
+/* ============================================================
+   DATA TABLE — gear-icon row actions dropdown
+   Created: 20260516_180000_IST
+   Pattern shared by every list page. The row's Actions cell becomes
+   a single ⚙ button; its dropdown shows the original action buttons
+   restyled as left-aligned menu items.
+   ============================================================ */
+.dt-actions {
+    position: relative;
+    display: inline-block;
+    text-align: left;
+}
+.dt-actions-trigger {
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 6px;
+    line-height: 1;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text-muted);
+}
+.dt-actions-trigger:hover {
+    color: var(--primary);
+    background: var(--surface-alt, #f3f4f7);
+    border-color: var(--border);
+}
+.dt-actions-dropdown {
+    /* JS sets position:fixed + coords on open; defaults handle the
+       hidden state. */
+    min-width: 170px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+    z-index: 100;
+    padding: 4px 0;
+}
+
+/* Restyle inner buttons/links/forms so they look like menu items.
+   Each direct child (or button inside an inline form) becomes a full-
+   width row with left-aligned text. */
+.dt-actions-dropdown > a,
+.dt-actions-dropdown > button,
+.dt-actions-dropdown > form > button {
+    display: block;
+    width: 100%;
+    height: auto;            /* Override .btn-icon's fixed 28px */
+    padding: 6px 12px;
+    font-size: 12.5px;
+    line-height: 1.3;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    color: var(--text);
+    cursor: pointer;
+    min-height: 0;
+    margin: 0;
+}
+/* Inside the dropdown, icon-button text labels become visible. Outside
+   the dropdown (i.e. an action cell that wasn't wrapped — shouldn't
+   normally happen but we're defensive), labels stay hidden so the icon
+   alone shows. */
+.dt-action-label { display: none; }
+.dt-actions-dropdown .dt-action-label {
+    display: inline;
+    margin-left: 2px;
+}
+.dt-actions-dropdown > form {
+    display: block;
+    margin: 0;
+}
+.dt-actions-dropdown > a:hover,
+.dt-actions-dropdown > button:hover,
+.dt-actions-dropdown > form > button:hover {
+    background: var(--surface-alt, #f3f4f7);
+    color: var(--text);
+    text-decoration: none;
+}
+/* Danger-class buttons retain their destructive color */
+.dt-actions-dropdown > button.btn-danger,
+.dt-actions-dropdown > form > button.btn-danger {
+    color: var(--danger, #b91c1c);
+}
+.dt-actions-dropdown > button.btn-danger:hover,
+.dt-actions-dropdown > form > button.btn-danger:hover {
+    background: var(--danger-bg, #fee2e2);
+    color: var(--danger, #b91c1c);
+}
+/* Inline "in use" spans (e.g. shown instead of Delete when row is in
+   use) read as informational rather than clickable. */
+.dt-actions-dropdown > span {
+    display: block;
+    padding: 6px 12px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-style: italic;
+}
+/* Hide stray whitespace between inline-flex remnants */
+.dt-actions-dropdown { font-size: 0; }
+.dt-actions-dropdown > * { font-size: 12.5px; }
+
+/* The Actions column shouldn't clip the gear button when overflow is
+   applied to data-table cells. It already auto-fits via white-space:nowrap
+   + the column's last-cell width:1% trick, but ensure overflow doesn't
+   eat the button on narrow viewports. */
+.dt-table tbody td:has(.dt-actions) {
+    overflow: visible;
+    max-width: none;
+    width: 1%;
+    text-align: right;
+    white-space: nowrap;
+}
+
+/* ============================================================
+   NOTES — redacted state + lazy composer toggle
+   Created: 20260516_230000_IST
+   ============================================================ */
+
+/* Redacted notes: dimmed background, italic body, warning pill in head. */
+.note-item-redacted {
+    background: var(--surface-alt, #fff7ed);
+    border-color: var(--warn, #d4ac0d);
+}
+.note-body-redacted {
+    font-style: italic;
+    color: var(--text-muted, #6b7280);
+}
+.note-redacted-pill {
+    font-size: 9.5px;
+    letter-spacing: 0.4px;
+}
+.note-attachments-redacted {
+    margin-top: 6px;
+    font-style: italic;
+}
+
+/* Composer-toggle row sits where the composer used to be — a single
+   button reveals the form on demand so the modal opens fast. */
+.notes-composer-toggle-row {
+    margin-bottom: 12px;
+}
+.notes-composer-toggle {
+    width: 100%;
+    text-align: center;
+}
+.notes-composer[hidden] { display: none; }
+
+/* ============================================================
+   RUNNING NOTES — attachment column list of filenames
+   Created: 20260516_205000_IST
+   ============================================================ */
+.note-att-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    align-items: flex-start;
+}
+.note-att-link {
+    display: inline-block;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    line-height: 1.3;
+}
+
+/* ============================================================
+   ATTACHMENT PREVIEW — full-viewport modal hosting an iframe
+   Created: 20260516_211500_IST
+   ============================================================ */
+.att-preview-modal[hidden] { display: none; }
+.att-preview-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10001; /* above notes-modal (10000) so previewing from
+                       inside a notes modal stacks correctly */
+    display: flex;
+    align-items: stretch;
+    justify-content: stretch;
+}
+.att-preview-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.65);
+    backdrop-filter: blur(2px);
+}
+.att-preview-dialog {
+    position: relative;
+    margin: 24px;
+    flex: 1;
+    background: var(--surface, #fff);
+    border-radius: 10px;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.att-preview-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    background: var(--surface-alt, #f8fafc);
+    flex-shrink: 0;
+}
+.att-preview-name {
+    flex: 1;
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--text, #1e293b);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+.att-preview-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.att-preview-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+}
+.att-preview-body iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #fff;
+}
+body.att-preview-modal-open { overflow: hidden; }
+
+/* ============================================================
+   INSPECTION module
+   Created: 20260516_240000_IST
+   ============================================================ */
+.tpl-items-wrap { max-width: 1200px; }
+.tpl-items input[type="text"],
+.tpl-items input[type="number"],
+.tpl-items select {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 12px;
+    padding: 3px 6px;
+}
+.tpl-items td { padding: 4px 6px; vertical-align: middle; }
+.tpl-items th { font-size: 11px; padding: 6px; }
+.tpl-items td.c { text-align: center; }
+
+.ins-results td,
+.ins-results-edit td { vertical-align: top; padding: 8px 10px; }
+.ins-results-edit input[type="text"],
+.ins-results-edit input[type="number"],
+.ins-results-edit select {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 12px;
+    padding: 3px 6px;
+}
+
+.ins-verdict-notes {
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    white-space: pre-wrap;
+}
+
+/* Success pill — used for pass/approved states */
+.pill-success {
+    background: #ecfdf5;
+    color: #166534;
+}
+.btn-success {
+    background: #16a34a;
+    color: white;
+    border-color: #15803d;
+}
+.btn-success:hover { background: #15803d; }
+
+/* ============================================================
+   INSPECTION TEMPLATE TARGET CHIPS
+   Created: 20260517_000000_IST
+   Used in /inspection.php?action=template_edit by the
+   .tpl-tgt-picker multi-select widget for asset / inv_item links.
+   ============================================================ */
+.tpl-tgt-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.tpl-tgt-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px 3px 10px;
+    background: var(--surface-alt, #f8fafc);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 14px;
+    font-size: 12.5px;
+    line-height: 1.4;
+}
+.tpl-tgt-chip .chip-label {
+    color: var(--text, #1e293b);
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.tpl-tgt-chip .chip-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted, #64748b);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 11px;
+}
+.tpl-tgt-chip .chip-remove:hover {
+    background: var(--danger-bg, #fef2f2);
+    color: var(--danger, #991b1b);
+}
+
+/* ============================================================
+   GD&T SYMBOL — inline glyph rendered next to a check item's
+   label on the inspection view and execute pages.
+   Created: 20260517_030000_IST
+   ============================================================ */
+.gdt-symbol {
+    display: inline-block;
+    min-width: 18px;
+    margin-right: 6px;
+    padding: 0 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: center;
+    background: var(--primary-light, #eef2fb);
+    color: var(--primary, #1e3a8a);
+    border: 1px solid var(--primary, #1e3a8a);
+    border-radius: 3px;
+    line-height: 1.5;
+}
+.tpl-gdt-select { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* ============================================================
+   BUBBLE NUMBER — balloon callout from engineering drawings.
+   Rendered in the inspection view + execute pages and the
+   template editor's first column.
+   Created: 20260517_060000_IST
+   ============================================================ */
+.bubble-no {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 5px;
+    border-radius: 50%;
+    background: #fff7ed;
+    color: #9a3412;
+    border: 1.5px solid #ea580c;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1;
+}
+/* Compact input variant — the bubble-number cell in the template
+   editor uses this to keep the column narrow while staying scannable. */
+.tpl-bubble {
+    width: 100%;
+    max-width: 60px;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ============================================================
+   ENGINEERING TOOLS — wrapper page + iframe
+   Created: 20260517_080000_IST
+   Used by /tools.php (landing card grid + per-tool iframe view)
+   ============================================================ */
+
+/* Landing card grid */
+.tool-card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+}
+.tool-card {
+    display: flex;
+    gap: 14px;
+    padding: 18px;
+    background: var(--surface, #fff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    text-decoration: none;
+    color: inherit;
+    transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+.tool-card:hover {
+    border-color: var(--primary, #1e3a8a);
+    box-shadow: 0 2px 12px rgba(30, 58, 138, 0.08);
+    transform: translateY(-1px);
+}
+.tool-card-icon {
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--primary-light, #eef2fb);
+    color: var(--primary, #1e3a8a);
+    border-radius: 8px;
+    font-size: 22px;
+}
+.tool-card-body { flex: 1 1 auto; min-width: 0; }
+.tool-card-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text, #1e293b);
+    margin-bottom: 4px;
+}
+.tool-card-desc {
+    font-size: 13px;
+    color: var(--text-muted, #64748b);
+    line-height: 1.4;
+}
+.tool-card-manual {
+    display: inline-block;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-muted, #64748b);
+}
+
+/* ============================================================
+   Per-tool iframe view — full-bleed layout
+   Updated: 20260517_113000_IST
+
+   The iframe should span the entire main area edge-to-edge, with only
+   a slim 40px action strip at the top for back/standalone/manual links.
+   We zero out .main's default padding when it's hosting a tool iframe
+   (via :has on the slim strip), and size the iframe to fill the rest
+   of the viewport.
+   ============================================================ */
+
+/* When .main contains a tool iframe, drop its own padding so the
+   iframe can bleed to the edges. Uses :has() (supported in all
+   evergreen browsers since mid-2023). */
+.main:has(> .tool-frame-head) {
+    padding: 0;
+}
+
+/* Slim action strip at the top — title compressed, buttons inline.
+   Sticky at the top of the main pane so it stays visible while
+   the iframe scrolls (most tools manage their own scroll). */
+.tool-frame-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 6px 14px;
+    margin: 0;
+    height: 40px;
+    box-sizing: border-box;
+    background: var(--surface, #fff);
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+}
+.tool-frame-head > div:first-child {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    overflow: hidden;
+}
+.tool-frame-head h1 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--text, #1e293b);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+/* Hide the description paragraph in the slim strip — the tool's own
+   header has its name and explanation. */
+.tool-frame-head p { display: none; }
+
+.tool-frame-head .head-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.tool-frame-head .head-actions .btn {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+/* The iframe itself — full bleed. Height = viewport minus the strip. */
+.tool-frame {
+    display: block;
+    width: 100%;
+    height: calc(100vh - 40px);
+    border: 0;
+    margin: 0;
+    background: #fff;
+}
+
+/* If the impersonation banner is showing inside .main, the iframe
+   shrinks to make room for it. The banner is ~40px so we double the
+   subtraction. */
+.main:has(> .impersonate-banner) .tool-frame {
+    height: calc(100vh - 80px);
+}
+
+/* ============================================================
+   THIRD-LEVEL SIDEBAR NESTING
+   Used by header.php's nav-subgroup-toggle + nav-subgroup-children
+   for cases like Tools > Engineering Calculator > Unit Converter.
+   Created: 20260517_110000_IST
+   ============================================================ */
+.nav-subgroup-toggle {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    cursor: pointer;
+    /* Match nav-child padding so the toggle aligns with sibling leaf
+       children, just with a chevron on the right. */
+}
+.nav-subgroup-toggle .nav-chevron {
+    margin-left: auto;
+    font-size: 10px;
+    opacity: 0.5;
+    transition: transform 0.12s;
+}
+.nav-subgroup-toggle.open .nav-chevron { transform: rotate(180deg); }
+.nav-subgroup-toggle .nav-group-count {
+    margin-left: auto;
+    margin-right: 6px;
+    font-size: 10px;
+    opacity: 0.55;
+}
+.nav-subgroup-toggle.open .nav-group-count { margin-right: 6px; }
+/* When the chevron is present we want the count tucked next to it,
+   not at the far right (which is the chevron's spot). Re-claim
+   margin-left:auto for the chevron only. */
+.nav-subgroup-toggle .nav-group-count + .nav-chevron { margin-left: 6px; }
+
+.nav-subgroup-children {
+    /* Indent grandchildren one extra step relative to second-level
+       children, and add a thin left rail so the depth reads clearly. */
+    margin-left: 18px;
+    padding-left: 8px;
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+.nav-subgroup-children .nav-grandchild {
+    /* Tighter vertical density at the deepest level; the icon is the
+       primary scanning aid here. */
+    padding-top: 5px;
+    padding-bottom: 5px;
+    font-size: 12.5px;
+}
+.nav-subgroup-children .nav-grandchild.active {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* ============================================================
+   CSV IMPORT — preview page styling
+   Created: 20260517_120000_IST
+   Used by includes/_import.php (import_render_preview + import_modal_html)
+   ============================================================ */
+.import-preview-page {
+    padding: 16px 24px;
+}
+.import-preview-page .page-head {
+    margin-bottom: 12px;
+}
+.import-summary {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 12px 0;
+}
+.import-summary .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+.import-summary .pill-active  { background: rgba(34, 197, 94, 0.12);  color: #15803d; }
+.import-summary .pill-info    { background: rgba(59, 130, 246, 0.12); color: #1d4ed8; }
+.import-summary .pill-neutral { background: rgba(148, 163, 184, 0.18); color: #475569; }
+.import-summary .pill-danger  { background: rgba(239, 68, 68, 0.12);  color: #b91c1c; }
+
+.import-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin: 12px 0 16px;
+}
+
+.import-preview-table {
+    width: 100%;
+    font-size: 13px;
+}
+.import-preview-table th,
+.import-preview-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    vertical-align: top;
+}
+.import-preview-table thead th {
+    background: var(--surface-alt, #f8fafc);
+    font-weight: 600;
+    text-align: left;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+/* Status row coloring — pale tints so the table stays readable */
+.import-preview-table tr.imp-insert { background: rgba(34, 197, 94, 0.06); }
+.import-preview-table tr.imp-update { background: rgba(59, 130, 246, 0.06); }
+.import-preview-table tr.imp-skip   { background: rgba(148, 163, 184, 0.06); color: #64748b; }
+.import-preview-table tr.imp-error  { background: rgba(239, 68, 68, 0.08); }
+.import-preview-table tr.imp-error td { color: #7f1d1d; }
+
+/* ============================================================
+   SHIP & RECEIPT — create / edit form layout
+   ============================================================
+   Numbered steps with prominent badges, clear separation between
+   sections, and visible hierarchy. Replaces the previous flat
+   card layout where everything ran together. */
+.shr-form { display: flex; flex-direction: column; gap: 14px; }
+.shr-step {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+.shr-step-head {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    padding: 14px 18px 10px;
+    background: linear-gradient(180deg, var(--surface-alt, #f9fafb), var(--surface));
+    border-bottom: 1px solid var(--border);
+}
+.shr-step-num {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: white;
+    font-weight: 600;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+}
+.shr-step-title {
+    margin: 0 0 2px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+}
+.shr-step-help {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+.shr-step-body { padding: 16px 18px; }
+
+/* Add-item panel inside step 2 — flex row of inputs + load button */
+.shr-add-panel {
+    background: var(--surface-alt, #f9fafb);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px;
+    margin-bottom: 12px;
+}
+.shr-add-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+.shr-add-row .field label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+}
+
+/* Manual line entry — collapsed by default; the BOM checklist
+   above handles the common case. */
+.shr-manual {
+    margin-top: 14px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 0;
+}
+.shr-manual > summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--surface-alt, #f9fafb);
+    border-radius: 6px;
+}
+.shr-manual[open] > summary {
+    border-bottom: 1px dashed var(--border);
+    border-radius: 6px 6px 0 0;
+}
+.shr-manual > summary:hover { background: var(--surface, #fff); }
+.shr-manual .shr-manual-hint { font-weight: normal; margin-left: 6px; }
+.shr-manual > *:not(summary) { padding: 14px; }
+
+/* Primary submit button — slightly bigger to feel like a finishing action */
+.btn.btn-lg {
+    padding: 10px 22px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+/* Visually-hidden — for labels we don't want to render visually
+   but still want screen readers to announce */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Side-by-side date inputs inside a single field cell. Two children
+   each get their own input + helper-text caption below. */
+.shr-due-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+.shr-due-pair > div { display: flex; flex-direction: column; }
+.shr-due-pair input[type="date"] { width: 100%; box-sizing: border-box; }
+.shr-due-pair .muted { margin-top: 3px; }
+
+/* ============================================================
+   DataTable column-prefs panel (Phase A of vendor/ship-rcpt PRD)
+   Triggered by the "⚙ Columns" button in every dt-toolbar.
+   ============================================================ */
+.dt-cols-btn { margin-left: 6px; }
+
+.dt-cols-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+    padding: 14px;
+    font-size: 13px;
+}
+.dt-cols-panel-head {
+    display: flex;
+    align-items: baseline;
+    margin-bottom: 10px;
+}
+.dt-cols-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+.dt-cols-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 4px;
+    border-radius: 4px;
+    cursor: move;
+}
+.dt-cols-item:hover { background: var(--surface-alt, #f5f6f8); }
+.dt-cols-item.dt-cols-dragging { opacity: 0.4; }
+.dt-cols-drag {
+    color: var(--text-muted);
+    font-weight: 700;
+    user-select: none;
+    cursor: grab;
+}
+.dt-cols-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    cursor: pointer;
+    margin: 0;
+}
+.dt-cols-label input[type=checkbox] { margin: 0; }
+.dt-cols-panel-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+.dt-cols-panel-foot .grow { flex: 1; }

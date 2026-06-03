@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <rect width="800" height="500" fill="#f4f5f7"/>
+
+    <!-- Sidebar -->
+    <rect x="0" y="0" width="180" height="500" fill="#0f172a"/>
+    <rect x="16" y="20" width="24" height="24" rx="4" fill="#dc2626"/>
+    <text x="48" y="38" fill="#ffffff" font-size="14" font-weight="600">MagDyn</text>
+    <text x="20" y="84"  fill="#94a3b8" font-size="12">⊞  Dashboard</text>
+    <text x="20" y="116" fill="#94a3b8" font-size="12">👥  Users</text>
+    <rect x="8" y="128" width="164" height="32" rx="6" fill="#1e3a8a"/>
+    <text x="20" y="148" fill="#ffffff" font-size="12">🛡  Roles &amp; Permissions</text>
+    <text x="20" y="180" fill="#94a3b8" font-size="12">📖  Training</text>
+
+    <!-- Title -->
+    <text x="208" y="42" fill="#1a1f2e" font-size="20" font-weight="600">Edit role — Manager</text>
+    <text x="208" y="62" fill="#6b7280" font-size="12">Tick the permissions this role should grant.</text>
+
+    <!-- Form card -->
+    <rect x="208" y="86" width="582" height="76" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+    <text x="220" y="106" fill="#6b7280" font-size="11" font-weight="600">CODE</text>
+    <text x="220" y="126" fill="#1a1f2e" font-size="13" font-family="ui-monospace, Menlo">manager</text>
+    <text x="360" y="106" fill="#6b7280" font-size="11" font-weight="600">NAME</text>
+    <text x="360" y="126" fill="#1a1f2e" font-size="13">Manager</text>
+    <text x="500" y="106" fill="#6b7280" font-size="11" font-weight="600">DESCRIPTION</text>
+    <text x="500" y="126" fill="#1a1f2e" font-size="13">Can manage content; not users</text>
+
+    <!-- Permissions matrix -->
+    <rect x="208" y="180" width="582" height="298" rx="6" fill="#ffffff" stroke="#e3e5ea"/>
+    <text x="220" y="204" fill="#1a1f2e" font-size="14" font-weight="600">Permissions</text>
+    <line x1="208" y1="222" x2="790" y2="222" stroke="#e3e5ea"/>
+
+    <!-- Rows -->
+    <text x="220" y="248" fill="#6b7280" font-size="10" font-weight="600">MODULE</text>
+    <text x="380" y="248" fill="#6b7280" font-size="10" font-weight="600">PERMISSIONS</text>
+
+    <text x="220" y="276" fill="#1a1f2e" font-size="12" font-weight="600">👥 Users</text>
+    <rect x="380" y="266" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="398" y="276" fill="#1a1f2e" font-size="11">view</text>
+    <rect x="436" y="266" width="12" height="12" rx="2" fill="#ffffff" stroke="#d0d4dc"/>
+    <text x="454" y="276" fill="#1a1f2e" font-size="11">manage</text>
+    <rect x="504" y="266" width="12" height="12" rx="2" fill="#ffffff" stroke="#d0d4dc"/>
+    <text x="522" y="276" fill="#1a1f2e" font-size="11">impersonate</text>
+
+    <text x="220" y="306" fill="#1a1f2e" font-size="12" font-weight="600">🛡 Roles &amp; Permissions</text>
+    <rect x="380" y="296" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="398" y="306" fill="#1a1f2e" font-size="11">view</text>
+    <rect x="436" y="296" width="12" height="12" rx="2" fill="#ffffff" stroke="#d0d4dc"/>
+    <text x="454" y="306" fill="#1a1f2e" font-size="11">manage</text>
+
+    <text x="220" y="336" fill="#1a1f2e" font-size="12" font-weight="600">📖 Training</text>
+    <rect x="380" y="326" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="398" y="336" fill="#1a1f2e" font-size="11">view</text>
+    <rect x="436" y="326" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="454" y="336" fill="#1a1f2e" font-size="11">manage</text>
+    <rect x="504" y="326" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="522" y="336" fill="#1a1f2e" font-size="11">create</text>
+
+    <text x="220" y="366" fill="#1a1f2e" font-size="12" font-weight="600">🔔 Notifications</text>
+    <rect x="380" y="356" width="12" height="12" rx="2" fill="#1e3a8a"/>
+    <text x="398" y="366" fill="#1a1f2e" font-size="11">view</text>
+
+    <!-- Buttons -->
+    <rect x="220" y="426" width="80" height="32" rx="6" fill="#1e3a8a"/>
+    <text x="246" y="446" fill="#ffffff" font-size="12" font-weight="600"><tspan text-decoration="underline">S</tspan>ave</text>
+    <rect x="308" y="426" width="80" height="32" rx="6" fill="#ffffff" stroke="#d0d4dc"/>
+    <text x="328" y="446" fill="#1a1f2e" font-size="12"><tspan text-decoration="underline">C</tspan>ancel</text>
+</svg>

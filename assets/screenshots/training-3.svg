@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <rect width="800" height="500" fill="#f4f5f7"/>
+
+    <!-- Phone frame (centered) -->
+    <rect x="280" y="20" width="240" height="460" rx="36" fill="#0f172a"/>
+    <rect x="290" y="44" width="220" height="412" rx="20" fill="#ffffff"/>
+
+    <!-- Status bar -->
+    <text x="306" y="62" fill="#1a1f2e" font-size="11" font-weight="600">9:41</text>
+    <circle cx="495" cy="58" r="3" fill="#1a1f2e"/>
+    <circle cx="488" cy="58" r="3" fill="#1a1f2e"/>
+    <circle cx="481" cy="58" r="3" fill="#1a1f2e"/>
+
+    <!-- App header -->
+    <rect x="290" y="68" width="220" height="44" fill="#ffffff"/>
+    <rect x="302" y="80" width="20" height="20" rx="4" fill="#dc2626"/>
+    <text x="330" y="95" fill="#1a1f2e" font-size="13" font-weight="600">MagDyn</text>
+    <line x1="290" y1="112" x2="510" y2="112" stroke="#e3e5ea"/>
+
+    <!-- Tile grid 2x3 -->
+    <g transform="translate(298, 124)">
+        <!-- Tile 1: Dashboard -->
+        <rect x="0"   y="0"   width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="12"  y="28"  font-size="22">⊞</text>
+        <text x="12"  y="56"  fill="#1a1f2e" font-size="11" font-weight="600">Dashboard</text>
+        <text x="12"  y="70"  fill="#6b7280" font-size="9">Overview</text>
+
+        <!-- Tile 2: Users -->
+        <rect x="106" y="0"   width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="118" y="28"  font-size="22">👥</text>
+        <text x="118" y="56"  fill="#1a1f2e" font-size="11" font-weight="600">Users</text>
+        <text x="118" y="70"  fill="#6b7280" font-size="9">Manage accounts</text>
+
+        <!-- Tile 3: Training -->
+        <rect x="0"   y="96"  width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="12"  y="124" font-size="22">📖</text>
+        <text x="12"  y="152" fill="#1a1f2e" font-size="11" font-weight="600">Training</text>
+        <text x="12"  y="166" fill="#6b7280" font-size="9">Role-based</text>
+
+        <!-- Tile 4: Notifications -->
+        <rect x="106" y="96"  width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="118" y="124" font-size="22">🔔</text>
+        <text x="118" y="152" fill="#1a1f2e" font-size="11" font-weight="600">Notifications</text>
+        <text x="118" y="166" fill="#6b7280" font-size="9">Prefs</text>
+
+        <!-- Tile 5: Audit -->
+        <rect x="0"   y="192" width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="12"  y="220" font-size="22">📋</text>
+        <text x="12"  y="248" fill="#1a1f2e" font-size="11" font-weight="600">Audit</text>
+        <text x="12"  y="262" fill="#6b7280" font-size="9">Activity log</text>
+
+        <!-- Tile 6: Mobile -->
+        <rect x="106" y="192" width="96" height="84" rx="8" fill="#ffffff" stroke="#e3e5ea"/>
+        <text x="118" y="220" font-size="22">📱</text>
+        <text x="118" y="248" fill="#1a1f2e" font-size="11" font-weight="600">Mobile</text>
+        <text x="118" y="262" fill="#6b7280" font-size="9">Settings</text>
+    </g>
+
+    <!-- Footer -->
+    <text x="400" y="438" fill="#6b7280" font-size="10" text-anchor="middle">Signed in as System Administrator</text>
+    <text x="400" y="452" fill="#1d4ed8" font-size="10" text-anchor="middle">Edit mobile modules</text>
+
+    <!-- Caption -->
+    <text x="40"  y="50"  fill="#1a1f2e" font-size="14" font-weight="600">Progressive Web App</text>
+    <text x="40"  y="72"  fill="#6b7280" font-size="11">Installable to home screen</text>
+    <text x="40"  y="86"  fill="#6b7280" font-size="11">Works offline once cached</text>
+    <text x="40"  y="100" fill="#6b7280" font-size="11">Native push on Android / iOS</text>
+
+    <text x="40"  y="240" fill="#1a1f2e" font-size="14" font-weight="600">Each user picks</text>
+    <text x="40"  y="260" fill="#6b7280" font-size="11">which modules they want</text>
+    <text x="40"  y="274" fill="#6b7280" font-size="11">accessible on mobile.</text>
+</svg>

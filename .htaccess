@@ -1,0 +1,39 @@
+# MagDyn — top-level rules
+# Created: 20260515_060024_IST
+
+Options -Indexes
+
+# PWA manifest should be served as application/manifest+json
+# (manifest.php sets this itself, but in case a static .webmanifest is added):
+AddType application/manifest+json .webmanifest
+
+# Service worker must come from same origin, served as JS
+AddType application/javascript .js
+
+# ---- Cache headers ----
+# The service worker itself must never be cached, otherwise updates take
+# many days to roll out. Browsers already do this by default for
+# /service-worker.js, but we make it explicit for safety.
+<Files "service-worker.js">
+    <IfModule mod_headers.c>
+        Header set Cache-Control "no-cache, no-store, must-revalidate"
+        Header set Pragma "no-cache"
+        Header set Expires "0"
+    </IfModule>
+</Files>
+
+# JS and CSS use a ?v=<mtime> cache buster (see asset_url() in helpers.php),
+# but tell the browser to revalidate anyway as belt-and-braces.
+<FilesMatch "\.(js|css)$">
+    <IfModule mod_headers.c>
+        Header set Cache-Control "no-cache, must-revalidate"
+    </IfModule>
+</FilesMatch>
+
+# Static images can be cached aggressively — the asset_url() helper still
+# busts them when the file changes.
+<FilesMatch "\.(png|jpg|jpeg|gif|webp|svg|ico)$">
+    <IfModule mod_headers.c>
+        Header set Cache-Control "public, max-age=2592000"
+    </IfModule>
+</FilesMatch>

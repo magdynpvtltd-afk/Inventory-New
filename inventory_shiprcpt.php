@@ -1,0 +1,3767 @@
+<?php
+/**
+ * MagDyn — Inventory: Ship & Receipt (v2)
+ * Rewritten: 20260517_233000_IST
+ *
+ * New flow:
+ *   1. CREATE. User picks a mode: 'receive' (incoming only), 'ship'
+ *      (outgoing only), or 'both' (the classic process / rework cycle).
+ *      Header carries vendor + due dates (ship_due_date for ship-side
+ *      flows, receive_due_date for receive-side). Line items live in
+ *      inv_shipment_lines, each tagged 'ship' or 'receive'. SOURCE
+ *      LOCATION is per-line (only required on 'ship' lines — where
+ *      the item is drawn from). NO destination location on the
+ *      header — destination is captured at receipt time.
+ *
+ *   2. APPROVE. Same gate as the invoice flow. After approval the
+ *      ship/receive event handlers unlock.
+ *
+ *   3. SHIP (one-shot). For 'ship' or 'both' modes. Posts a single
+ *      ship_out txn per ship-line, deducts stock from each line's
+ *      src_location_id, flips status to 'shipped'.
+ *
+ *   4. RECEIVE (multi-event, partial allowed). For 'receive' or
+ *      'both' modes. Each receipt event is one inv_receipts row +
+ *      one ship_in txn, capturing receipt_date, due_date_snapshot
+ *      (for vendor-perf analytics), and the destination location
+ *      the user picks at that moment.
+ *
+ *   5. CLOSE. Manual button when the user considers the shipment
+ *      done — or implicit: when every receive-line's qty_received
+ *      hits qty_planned, the UI surfaces a "fully received" pill
+ *      and the close-out is one click.
+ *
+ * Status transitions:
+ *   draft   → approved   (via Approve)
+ *   approved → shipped   (via Ship — only if mode != 'receive')
+ *   any of {approved, shipped} → closed   (via Close)
+ *   any of {draft, approved} → cancelled  (via Cancel)
+ *
+ * Receipts can be recorded as soon as status is 'approved' (or
+ * 'shipped' for 'both' mode). The system doesn't hard-block early
+ * receipts because shipped/received timelines often overlap with
+ * vendor lead-time realities.
+ *
+ * Behaviors deferred from the v1 module (not built here): BOM
+ * auto-populate of receive lines from the ship-side items'
+ * sub-assembly definition, vendor-cascading data refresh on edit,
+ * scrap/correction txns when editing posted ship lines. These can
+ * be added back as separate features.
+ */
+require_once __DIR__ . '/includes/bootstrap.php';
+require_login();
+require_permission('inventory_shiprcpt', 'view');
+require_once __DIR__ . '/includes/datatable.php';
+require_once __DIR__ . '/includes/_inventory_txn.php';
+require_once __DIR__ . '/includes/_codes.php';
+require_once __DIR__ . '/includes/_qc.php';
+require_once __DIR__ . '/includes/_purchase_orders.php';   // Phase C — auto-PO on save
+require_once __DIR__ . '/includes/_asset_txn.php';         // Phase C — asset send/receive on ship/receive
+require_once __DIR__ . '/includes/_invoice_links.php';
+
+$action    = (string)input('action', 'index');
+$canManage = permission_check('inventory_shiprcpt', 'manage');
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
+
+function shr_modes_with_ship()    { return ['ship', 'both']; }
+function shr_modes_with_receive() { return ['receive', 'both']; }
+
+/** Editable: draft only (line items still mutable). Once approved
+ *  the header + line items become read-only for everything except
+ *  the structured ship/receive event actions. */
+function shr_is_editable($status) { return $status === 'draft'; }
+
+/** Generate the next ship_no. Delegates to the central code_next()
+ *  helper which reads format settings from the code_sequences admin
+ *  table. The legacy hardcoded "SH-YYMMDD-N" format is the default
+ *  seed; admins can change the prefix or pad via the Code Sequences
+ *  admin page. */
+function shr_next_ship_no()
+{
+    return code_next('shipment');
+}
+
+function shr_next_receipt_no()
+{
+    return code_next('receipt');
+}
+
+/** Convenience: refresh a shipment line's qty_received aggregate from
+ *  the sum of its inv_receipts. Called after receipt insert/delete. */
+function shr_recompute_line_received($lineId)
+{
+    db_exec(
+        'UPDATE inv_shipment_lines
+            SET qty_received = (
+                SELECT COALESCE(SUM(qty_received), 0)
+                  FROM inv_receipts WHERE shipment_line_id = ?
+            )
+          WHERE id = ?',
+        [(int)$lineId, (int)$lineId]
+    );
+}
+
+/** Item picker options — used in the line-item form. Mirrors the
+ *  invoice picker pattern (active items only, capped). */
+function shr_item_picker_options()
+{
+    return db_all(
+        'SELECT id, code,
+                CONCAT(code, " — ", COALESCE(NULLIF(short_description, ""), name)) AS label,
+                uom
+           FROM inv_items
+          WHERE is_active = 1
+          ORDER BY code
+          LIMIT 2000'
+    );
+}
+
+// ----------------------------------------------------------------
+// VENDOR DATA — JSON endpoint that returns a vendor's contacts +
+// addresses so the new/edit form can cascade-update its dropdowns
+// after the user picks a vendor. Read-only; minimal data.
+// ----------------------------------------------------------------
+if ($action === 'vendor_data') {
+    header('Content-Type: application/json; charset=utf-8');
+    $vendorId = (int)input('vendor_id', 0);
+    if ($vendorId <= 0) {
+        echo json_encode(['contacts' => [], 'addresses' => []]);
+        exit;
+    }
+    $contacts = db_all(
+        'SELECT id, name, designation, email, phone, is_primary
+           FROM vendor_contacts WHERE vendor_id = ?
+          ORDER BY is_primary DESC, sort_order, name',
+        [$vendorId]
+    );
+    $addresses = db_all(
+        'SELECT id, label, line1, line2, city, state, pincode, country, is_primary
+           FROM vendor_addresses WHERE vendor_id = ?
+          ORDER BY is_primary DESC, sort_order, id',
+        [$vendorId]
+    );
+    echo json_encode(['contacts' => $contacts, 'addresses' => $addresses]);
+    exit;
+}
+
+// ----------------------------------------------------------------
+// BOM POPULATE — add ship lines for a chosen sub-assembly's BOM
+// children, plus a receive line for the sub-assembly itself.
+// Draft-only. The user picks an inv_items.id + a multiplier qty;
+// for each BOM child we add a 'ship' line at (child.qty * multiplier),
+// and append one 'receive' line for the parent at the multiplier qty.
+// This restores the v1 rework-cycle convenience: pick the sub-assy
+// you want made, get the raw-mat ship lines auto-populated.
+// ----------------------------------------------------------------
+if ($action === 'populate_from_bom') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id        = (int)input('id', 0);
+    $itemId    = (int)input('bom_item_id', 0);
+    $mult      = (float)input('bom_multiplier', 1);
+    $defaultSrcLocId = (int)input('bom_default_src_location_id', 0);
+
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if (!shr_is_editable($sh['status'])) {
+        flash_set('error', 'Can only populate lines on a draft shipment.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if ($itemId <= 0 || $mult <= 0) {
+        flash_set('error', 'Pick an item and a positive multiplier.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+
+    $children = db_all(
+        'SELECT bl.child_item_id, bl.qty AS line_qty, bl.sort_order, i.uom
+           FROM inv_bom_lines bl
+           JOIN inv_items i ON i.id = bl.child_item_id
+          WHERE bl.parent_item_id = ?
+          ORDER BY bl.sort_order, bl.id',
+        [$itemId]
+    );
+    if (empty($children)) {
+        flash_set('error', 'Picked item has no BOM. Define BOM children first or add lines manually.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+
+    // Next sort_order to append after existing lines.
+    $nextSort = (int)db_val(
+        'SELECT COALESCE(MAX(sort_order), -1) + 1 FROM inv_shipment_lines WHERE shipment_id = ?',
+        [$id], 0
+    );
+    try {
+        db()->beginTransaction();
+
+        // 1. Ship lines for the BOM children (only meaningful for
+        //    ship or both modes; for receive-only we still add them
+        //    but they'll be filtered out at save — defensive against
+        //    user changing mode after populate.).
+        if (in_array($sh['mode'], shr_modes_with_ship(), true)) {
+            foreach ($children as $c) {
+                $required = (float)$c['line_qty'] * $mult;
+                db_exec(
+                    'INSERT INTO inv_shipment_lines
+                       (shipment_id, sort_order, line_kind, item_id, qty_planned, src_location_id)
+                     VALUES (?, ?, "ship", ?, ?, ?)',
+                    [$id, $nextSort++, (int)$c['child_item_id'], $required,
+                     $defaultSrcLocId > 0 ? $defaultSrcLocId : null]
+                );
+            }
+        }
+
+        // 2. Receive line for the sub-assembly itself (only for receive
+        //    or both modes).
+        if (in_array($sh['mode'], shr_modes_with_receive(), true)) {
+            db_exec(
+                'INSERT INTO inv_shipment_lines
+                   (shipment_id, sort_order, line_kind, item_id, qty_planned, src_location_id)
+                 VALUES (?, ?, "receive", ?, ?, NULL)',
+                [$id, $nextSort++, $itemId, $mult]
+            );
+        }
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Could not populate from BOM: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    flash_set('success', 'Lines added from BOM. Review and edit before approval.');
+    redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// SUGGEST_RECEIVE_LINES — scan ship lines, infer candidate parents
+// ----------------------------------------------------------------
+// Inverse of populate_from_bom. Given the current ship lines on a
+// draft shipment, scan inv_bom_lines for parents whose children appear
+// in the ship lines, compute the implied parent qty (limited by the
+// least-covered child), and present the candidates for the user to
+// pick from. Doesn't add lines directly — the user confirms via
+// add_receive_lines below.
+//
+// The implied qty formula: for a candidate parent P with BOM children
+// (c1×q1, c2×q2, ...), and ship lines that include some of those
+// children at qtys (s_c1, s_c2, ...), implied_qty = min(s_ci / qi)
+// across children present in BOTH the BOM and the ship lines.
+// Children that aren't in the ship lines reduce coverage but don't
+// zero out the suggestion — partial coverage is reported as "X of Y
+// children covered" so the user can decide if the suggestion makes
+// sense for their case.
+// ----------------------------------------------------------------
+function shr_compute_receive_candidates($shipmentId) {
+    $shipmentId = (int)$shipmentId;
+
+    // Active ship lines, grouped by item id (sum qty in case the same
+    // item appears multiple times).
+    $shipLines = db_all(
+        "SELECT item_id, SUM(qty_planned) AS total_qty
+           FROM inv_shipment_lines
+          WHERE shipment_id = ? AND line_kind = 'ship'
+            AND item_id IS NOT NULL
+          GROUP BY item_id",
+        [$shipmentId]
+    );
+    if (empty($shipLines)) return [];
+    $shipQtyByItem = [];
+    foreach ($shipLines as $sl) {
+        $shipQtyByItem[(int)$sl['item_id']] = (float)$sl['total_qty'];
+    }
+    $childItemIds = array_keys($shipQtyByItem);
+    $placeholders = implode(',', array_fill(0, count($childItemIds), '?'));
+
+    // Find all distinct parent items that have at least one of our
+    // ship-line items as a BOM child.
+    $candidateParents = db_all(
+        "SELECT DISTINCT bl.parent_item_id, i.code AS parent_code, i.name AS parent_name,
+                i.short_description AS parent_short_desc
+           FROM inv_bom_lines bl
+           JOIN inv_items i ON i.id = bl.parent_item_id
+          WHERE bl.child_item_id IN ($placeholders)
+          ORDER BY i.code",
+        $childItemIds
+    );
+    if (empty($candidateParents)) return [];
+
+    $results = [];
+    foreach ($candidateParents as $cp) {
+        $parentId = (int)$cp['parent_item_id'];
+        // Get the full BOM for this candidate parent
+        $bom = db_all(
+            "SELECT child_item_id, qty FROM inv_bom_lines WHERE parent_item_id = ?",
+            [$parentId]
+        );
+        if (empty($bom)) continue;
+
+        $coveredCount = 0;
+        $totalChildren = count($bom);
+        $impliedByChild = []; // array of implied parent counts per child
+        $details = [];        // per-child detail rows for the UI
+        foreach ($bom as $b) {
+            $childId   = (int)$b['child_item_id'];
+            $childQty  = (float)$b['qty'];
+            $isCovered = isset($shipQtyByItem[$childId]);
+            if ($isCovered && $childQty > 0) {
+                $coveredCount++;
+                $impliedByChild[] = $shipQtyByItem[$childId] / $childQty;
+            }
+            $details[] = [
+                'child_id'    => $childId,
+                'bom_qty'     => $childQty,
+                'shipped_qty' => $isCovered ? $shipQtyByItem[$childId] : null,
+                'covered'     => $isCovered,
+            ];
+        }
+
+        // Skip candidates with zero coverage (no overlap at all)
+        if ($coveredCount === 0) continue;
+
+        // Implied qty = floor of the minimum ratio across covered children
+        $impliedQty = floor(min($impliedByChild));
+        if ($impliedQty <= 0) continue;
+
+        $results[] = [
+            'parent_id'         => $parentId,
+            'parent_code'       => $cp['parent_code'],
+            'parent_name'       => $cp['parent_short_desc'] ?: $cp['parent_name'],
+            'implied_qty'       => $impliedQty,
+            'covered_count'     => $coveredCount,
+            'total_children'    => $totalChildren,
+            'coverage_pct'      => round(($coveredCount / $totalChildren) * 100),
+            'details'           => $details,
+        ];
+    }
+
+    // Sort: best-coverage first, then highest implied qty
+    usort($results, function ($a, $b) {
+        if ($a['coverage_pct'] !== $b['coverage_pct']) {
+            return $b['coverage_pct'] <=> $a['coverage_pct'];
+        }
+        return $b['implied_qty'] <=> $a['implied_qty'];
+    });
+    return $results;
+}
+
+if ($action === 'suggest_receive_lines') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if (!shr_is_editable($sh['status'])) {
+        flash_set('error', 'Can only populate lines on a draft shipment.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if (!in_array($sh['mode'], shr_modes_with_receive(), true)) {
+        flash_set('error', 'This shipment\'s mode doesn\'t include receive lines.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    $candidates = shr_compute_receive_candidates($id);
+    if (empty($candidates)) {
+        flash_set('error', 'No BOM matches found. Add ship lines first, or define BOMs that include those items as children.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    // Stash candidates in session for the picker page
+    $_SESSION['shr_receive_candidates_' . $id] = $candidates;
+    redirect(url('/inventory_shiprcpt.php?action=pick_receive_lines&id=' . $id));
+}
+
+if ($action === 'pick_receive_lines') {
+    require_permission('inventory_shiprcpt', 'manage');
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    $candidates = $_SESSION['shr_receive_candidates_' . $id] ?? null;
+    if (!$candidates) {
+        // Session expired or never set — recompute on the fly
+        $candidates = shr_compute_receive_candidates($id);
+        if (empty($candidates)) {
+            flash_set('error', 'No BOM matches found. Add ship lines first.');
+            redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+        }
+        $_SESSION['shr_receive_candidates_' . $id] = $candidates;
+    }
+    $page_title  = 'Add receive lines from ship items';
+    $page_module = 'inventory_shiprcpt';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="page-head">
+        <div>
+            <h1>Add receive lines</h1>
+            <p class="muted">
+                Based on the ship lines in this draft, here are the parent items whose BOMs
+                they could be producing. Check the ones you want to receive — one receive line
+                will be added for each at the implied quantity (floor of the minimum
+                <code>ship_qty / bom_child_qty</code> ratio across the covered children).
+            </p>
+        </div>
+    </div>
+
+    <form method="post" action="<?= h(url('/inventory_shiprcpt.php?action=add_receive_lines')) ?>">
+        <?= csrf_field() ?>
+        <input type="hidden" name="id" value="<?= (int)$id ?>">
+
+        <div class="card" style="margin-bottom: 14px;">
+            <div class="card-head"><h3 style="margin: 0; font-size: 15px;">Candidate parent items (<?= count($candidates) ?>)</h3></div>
+            <div class="card-body" style="padding: 0;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 40px;">Add</th>
+                            <th>Parent code</th>
+                            <th>Parent name</th>
+                            <th class="r">Implied qty</th>
+                            <th class="r">Coverage</th>
+                            <th>Children matched</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($candidates as $i => $c): ?>
+                            <tr>
+                                <td>
+                                    <input type="checkbox" name="add_parent_id[]" value="<?= (int)$c['parent_id'] ?>"
+                                           <?= $c['coverage_pct'] >= 80 ? 'checked' : '' ?>>
+                                </td>
+                                <td><code><?= h($c['parent_code']) ?></code></td>
+                                <td><?= h($c['parent_name']) ?></td>
+                                <td class="r"><?= (int)$c['implied_qty'] ?></td>
+                                <td class="r">
+                                    <?php $pillCls = $c['coverage_pct'] >= 80 ? 'pill-success' : ($c['coverage_pct'] >= 50 ? 'pill-info' : 'pill-warning'); ?>
+                                    <span class="pill <?= $pillCls ?>"><?= (int)$c['coverage_pct'] ?>%</span>
+                                </td>
+                                <td class="muted small"><?= (int)$c['covered_count'] ?> of <?= (int)$c['total_children'] ?> BOM children present in ship lines</td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div style="margin-top: 14px;">
+            <button type="submit" class="btn btn-primary">Add selected receive lines</button>
+            <a class="btn btn-ghost" href="<?= h(url('/inventory_shiprcpt.php?action=edit&id=' . $id)) ?>">Cancel</a>
+        </div>
+    </form>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+if ($action === 'add_receive_lines') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if (!shr_is_editable($sh['status'])) {
+        flash_set('error', 'Can only modify a draft shipment.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    $candidates = $_SESSION['shr_receive_candidates_' . $id] ?? null;
+    if (!$candidates) {
+        flash_set('error', 'Session expired. Re-run the suggest step.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    $pickedIds = (array)input('add_parent_id', []);
+    $pickedIds = array_map('intval', $pickedIds);
+    if (empty($pickedIds)) {
+        flash_set('error', 'Nothing selected.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    // Map candidate by parent_id for fast qty lookup
+    $byParentId = [];
+    foreach ($candidates as $c) $byParentId[(int)$c['parent_id']] = $c;
+
+    $nextSort = (int)db_val(
+        'SELECT COALESCE(MAX(sort_order), -1) + 1 FROM inv_shipment_lines WHERE shipment_id = ?',
+        [$id], 0
+    );
+    $added = 0;
+    try {
+        db()->beginTransaction();
+        foreach ($pickedIds as $pid) {
+            if (!isset($byParentId[$pid])) continue;
+            $c = $byParentId[$pid];
+            db_exec(
+                'INSERT INTO inv_shipment_lines
+                   (shipment_id, sort_order, line_kind, item_id, qty_planned, src_location_id)
+                 VALUES (?, ?, "receive", ?, ?, NULL)',
+                [$id, $nextSort++, $pid, (float)$c['implied_qty']]
+            );
+            $added++;
+        }
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Could not add receive lines: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    unset($_SESSION['shr_receive_candidates_' . $id]);
+    flash_set('success', $added . ' receive line' . ($added === 1 ? '' : 's') . ' added. Review and edit before approval.');
+    redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// BOM_FOR_RECEIVE_ITEM — JSON endpoint for the Add-receive-item panel
+// ----------------------------------------------------------------
+// Returns the immediate BOM children of an item as JSON, so the client
+// JS can render a checklist. No checklisting logic on the server.
+// Read-only; no CSRF needed (it's a GET).
+// ----------------------------------------------------------------
+if ($action === 'bom_for_receive_item') {
+    require_permission('inventory_shiprcpt', 'view');
+    header('Content-Type: application/json');
+    $itemId = (int)input('item_id', 0);
+    if ($itemId <= 0) {
+        echo json_encode(['ok' => false, 'reason' => 'Missing item_id']);
+        exit;
+    }
+    $parent = db_one(
+        'SELECT i.id, i.code, i.short_description, i.name, u.label AS uom_label
+           FROM inv_items i
+           LEFT JOIN inv_uom u ON u.id = i.uom_id
+          WHERE i.id = ?',
+        [$itemId]
+    );
+    if (!$parent) {
+        echo json_encode(['ok' => false, 'reason' => 'Item not found']);
+        exit;
+    }
+    $children = db_all(
+        'SELECT bl.child_item_id AS id, bl.qty AS bom_qty,
+                i.code, i.short_description, i.name, u.label AS uom_label
+           FROM inv_bom_lines bl
+           JOIN inv_items i ON i.id = bl.child_item_id
+           LEFT JOIN inv_uom u ON u.id = i.uom_id
+          WHERE bl.parent_item_id = ?
+          ORDER BY bl.sort_order, bl.id',
+        [$itemId]
+    );
+    // Build a per-child stock_by_loc map so the UI can render a Source
+    // dropdown listing ONLY locations that actually have stock for that
+    // specific child. Single batched query keyed by child_item_id is
+    // cheaper than N separate AJAX calls.
+    $childIds = array_map(function ($c) { return (int)$c['id']; }, $children);
+    $stockByItem = [];
+    if (!empty($childIds)) {
+        $placeholders = implode(',', array_fill(0, count($childIds), '?'));
+        $stockRows = db_all(
+            "SELECT s.item_id, s.location_id, s.qty, l.name AS loc_name, l.code AS loc_code
+               FROM inv_item_location_stock s
+               JOIN locations l ON l.id = s.location_id
+              WHERE s.item_id IN ($placeholders)
+                AND s.qty > 0
+                AND l.is_active = 1
+              ORDER BY s.qty DESC, l.name",
+            $childIds
+        );
+        foreach ($stockRows as $sr) {
+            $stockByItem[(int)$sr['item_id']][] = [
+                'location_id' => (int)$sr['location_id'],
+                'name'        => $sr['loc_name'],
+                'code'        => $sr['loc_code'],
+                'qty'         => (float)$sr['qty'],
+            ];
+        }
+    }
+    echo json_encode([
+        'ok'       => true,
+        'parent'   => [
+            'id'        => (int)$parent['id'],
+            'code'      => $parent['code'],
+            'label'     => $parent['short_description'] ?: $parent['name'],
+            'uom_label' => $parent['uom_label'] ?? '',
+        ],
+        'children' => array_map(function ($c) use ($stockByItem) {
+            return [
+                'id'           => (int)$c['id'],
+                'code'         => $c['code'],
+                'label'        => $c['short_description'] ?: $c['name'],
+                'bom_qty'      => (float)$c['bom_qty'],
+                'uom_label'    => $c['uom_label'] ?? '',
+                // Locations with positive stock for this child. Empty
+                // array means "no stock anywhere" — the UI surfaces a
+                // warning so the user can't accidentally pick a zero-
+                // stock location.
+                'stock_by_loc' => $stockByItem[(int)$c['id']] ?? [],
+            ];
+        }, $children),
+    ]);
+    exit;
+}
+
+// ----------------------------------------------------------------
+// STOCK_BY_LOCATION — AJAX endpoint for manual-line entry
+// ----------------------------------------------------------------
+// Returns locations with positive stock for one item. Used to filter
+// the Source dropdown on a manual ship line so users can't pick a
+// location that doesn't actually have the item.
+// ----------------------------------------------------------------
+if ($action === 'stock_by_location') {
+    require_permission('inventory_shiprcpt', 'view');
+    header('Content-Type: application/json');
+    $itemId = (int)input('item_id', 0);
+    if ($itemId <= 0) {
+        echo json_encode(['ok' => false, 'reason' => 'Missing item_id']);
+        exit;
+    }
+    $rows = db_all(
+        'SELECT l.id, l.name, l.code, s.qty
+           FROM inv_item_location_stock s
+           JOIN locations l ON l.id = s.location_id
+          WHERE s.item_id = ? AND s.qty > 0 AND l.is_active = 1
+          ORDER BY s.qty DESC, l.name',
+        [$itemId]
+    );
+    echo json_encode([
+        'ok'        => true,
+        'locations' => array_map(function ($r) {
+            return [
+                'id'   => (int)$r['id'],
+                'name' => $r['name'],
+                'code' => $r['code'],
+                'qty'  => (float)$r['qty'],
+            ];
+        }, $rows),
+    ]);
+    exit;
+}
+
+// ----------------------------------------------------------------
+// ADD_FROM_BOM_CHECKLIST — commit user's checklist submission
+// ----------------------------------------------------------------
+// POST from the Add-receive-item panel. Inputs:
+//   id                       — shipment id
+//   parent_item_id           — the item to receive
+//   parent_qty               — qty of the parent (multiplier)
+//   default_src_location_id  — optional, applied to every checked ship line
+//   child_include[]          — array of child item ids the user checked
+//   child_qty_{childId}      — qty for each checked child (already
+//                              multiplied client-side, but server uses
+//                              this as the source of truth)
+//
+// Appends to existing lines (never replaces). Receive line for the
+// parent + one ship line per checked child. Draft-only.
+// ----------------------------------------------------------------
+if ($action === 'add_from_bom_checklist') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id           = (int)input('id', 0);
+    $parentItemId = (int)input('parent_item_id', 0);
+    $parentQty    = (float)input('parent_qty', 0);
+    $included     = (array)input('child_include', []);
+    $included     = array_map('intval', $included);
+
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if (!shr_is_editable($sh['status'])) {
+        flash_set('error', 'Can only modify a draft shipment.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if ($parentItemId <= 0 || $parentQty <= 0) {
+        flash_set('error', 'Pick an item and a positive qty.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+
+    // Sanity-check the parent has a BOM. The panel only loads if so,
+    // but defend against direct-POST. If parent has no BOM, we still
+    // add the receive line — the user might just want a receive-only
+    // shipment for that parent.
+    $bom = db_all(
+        'SELECT child_item_id, qty FROM inv_bom_lines WHERE parent_item_id = ? ORDER BY sort_order, id',
+        [$parentItemId]
+    );
+    $bomByChild = [];
+    foreach ($bom as $b) $bomByChild[(int)$b['child_item_id']] = (float)$b['qty'];
+
+    // Validate that every checked child has a non-zero source location
+    // picked AND that the picked location actually holds stock for the
+    // item. Mirrors the client-side guard but defends against direct
+    // POSTs and stale UI state.
+    $missingSrcCodes = [];
+    foreach ($included as $childId) {
+        if ($childId <= 0) continue;
+        if (!isset($bomByChild[$childId])) continue;
+        $srcKey = 'child_src_' . $childId;
+        $srcId = (int)input($srcKey, 0);
+        if ($srcId <= 0) {
+            $codeRow = db_one('SELECT code FROM inv_items WHERE id = ?', [$childId]);
+            $missingSrcCodes[] = $codeRow['code'] ?? ('#' . $childId);
+            continue;
+        }
+        $stockRow = db_one(
+            'SELECT qty FROM inv_item_location_stock WHERE item_id = ? AND location_id = ?',
+            [$childId, $srcId]
+        );
+        if (!$stockRow || (float)$stockRow['qty'] <= 0) {
+            $codeRow = db_one('SELECT code FROM inv_items WHERE id = ?', [$childId]);
+            $missingSrcCodes[] = ($codeRow['code'] ?? ('#' . $childId)) . ' (picked location has no stock)';
+        }
+    }
+    if (!empty($missingSrcCodes)) {
+        flash_set('error', 'Source location issue for: ' . implode(', ', $missingSrcCodes)
+                         . '. Pick locations with positive stock for each ship line.');
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+
+    // Next sort_order
+    $nextSort = (int)db_val(
+        'SELECT COALESCE(MAX(sort_order), -1) + 1 FROM inv_shipment_lines WHERE shipment_id = ?',
+        [$id], 0
+    );
+    $shipLinesAdded = 0;
+    try {
+        db()->beginTransaction();
+        // 1. Receive line for the parent
+        db_exec(
+            'INSERT INTO inv_shipment_lines
+               (shipment_id, sort_order, line_kind, item_id, qty_planned, src_location_id)
+             VALUES (?, ?, "receive", ?, ?, NULL)',
+            [$id, $nextSort++, $parentItemId, $parentQty]
+        );
+        // 2. Ship lines for each checked child
+        foreach ($included as $childId) {
+            if ($childId <= 0) continue;
+            if (!isset($bomByChild[$childId])) continue; // not actually in the BOM; skip
+            $qtyKey = 'child_qty_' . $childId;
+            $qty = (float)input($qtyKey, 0);
+            if ($qty <= 0) {
+                // Fall back to bom_qty × parent_qty if missing
+                $qty = $bomByChild[$childId] * $parentQty;
+            }
+            if ($qty <= 0) continue;
+            $srcId = (int)input('child_src_' . $childId, 0);
+            db_exec(
+                'INSERT INTO inv_shipment_lines
+                   (shipment_id, sort_order, line_kind, item_id, qty_planned, src_location_id)
+                 VALUES (?, ?, "ship", ?, ?, ?)',
+                [$id, $nextSort++, $childId, $qty, $srcId]
+            );
+            $shipLinesAdded++;
+        }
+        // 3. Auto-derive and write back the new mode on the shipment.
+        // It's idempotent — recomputes from inv_shipment_lines.
+        $kindsNow = db_all(
+            "SELECT DISTINCT line_kind FROM inv_shipment_lines WHERE shipment_id = ?",
+            [$id]
+        );
+        $hasShip = $hasRecv = false;
+        foreach ($kindsNow as $r) {
+            if ($r['line_kind'] === 'ship')    $hasShip = true;
+            if ($r['line_kind'] === 'receive') $hasRecv = true;
+        }
+        $newMode = $hasShip && $hasRecv ? 'both' : ($hasShip ? 'ship' : ($hasRecv ? 'receive' : 'both'));
+        db_exec('UPDATE inv_shipments SET mode = ? WHERE id = ?', [$newMode, $id]);
+
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Could not add receive item: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+    }
+    flash_set('success',
+        'Receive line added' .
+        ($shipLinesAdded > 0
+            ? ' along with ' . $shipLinesAdded . ' ship line' . ($shipLinesAdded === 1 ? '' : 's')
+            : '') .
+        '. Review and edit before approval.');
+    redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// SAVE — create / edit header + lines
+// ----------------------------------------------------------------
+if ($action === 'save') {
+    // Diagnostic logging — written to PHP error_log so we can confirm
+    // the request actually reached this handler and inspect what was
+    // POSTed. Remove once the 503 diagnosis is complete.
+    error_log('[shiprcpt save] entered. POST keys: ' . implode(',', array_keys($_POST))
+            . '; line_kind count=' . count((array)($_POST['line_kind'] ?? []))
+            . '; line_item_id count=' . count((array)($_POST['line_item_id'] ?? []))
+            . '; line_qty count=' . count((array)($_POST['line_qty'] ?? []))
+            . '; line_src_location_id count=' . count((array)($_POST['line_src_location_id'] ?? []))
+            . '; src values=[' . implode(',', (array)($_POST['line_src_location_id'] ?? [])) . ']');
+
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+
+    $id            = (int)input('id', 0);
+    // Mode is now DERIVED from line content (no user-picked radio in the
+    // new form). Inspect the submitted line_kind[] values to decide:
+    //   - has ship + has receive  → 'both'
+    //   - has ship only           → 'ship'
+    //   - has receive only        → 'receive'
+    //   - no lines at all         → default 'both' (existing behavior)
+    {
+        $kindsIn = (array)input('line_kind', []);
+        $itemsIn = (array)input('line_item_id', []);
+        $qtysIn  = (array)input('line_qty', []);
+        $hasShip = $hasRecv = false;
+        $n = max(count($kindsIn), count($itemsIn));
+        for ($i = 0; $i < $n; $i++) {
+            $kk = isset($kindsIn[$i]) ? (string)$kindsIn[$i] : '';
+            $ii = isset($itemsIn[$i]) ? (int)$itemsIn[$i] : 0;
+            $qq = isset($qtysIn[$i])  ? (float)$qtysIn[$i] : 0;
+            if ($ii <= 0 || $qq <= 0) continue;   // skip incomplete rows
+            if ($kk === 'ship')    $hasShip = true;
+            if ($kk === 'receive') $hasRecv = true;
+        }
+        if ($hasShip && $hasRecv) $mode = 'both';
+        else if ($hasShip)        $mode = 'ship';
+        else if ($hasRecv)        $mode = 'receive';
+        else                      $mode = 'both';
+    }
+    $vendorId      = (int)input('vendor_id', 0);
+    $vendorContactId = (int)input('vendor_contact_id', 0) ?: null;
+    // Phase D1 — is_amending=1 (hidden field) means this save is an
+    // amendment of a past-draft shipment, NOT a draft edit. It bypasses
+    // the editable() check and triggers po_create_amendment_for_shipment
+    // (new PO version) instead of po_ensure_for_shipment (idempotent v1).
+    $isAmendingSave = (int)input('is_amending', 0) === 1;
+    $vendorAddressId = (int)input('vendor_address_id', 0) ?: null;
+    $shipDueDate   = trim((string)input('ship_due_date', ''));
+    $recvDueDate   = trim((string)input('receive_due_date', ''));
+    $refDoc        = trim((string)input('ref_doc', ''));
+    $notes         = trim((string)input('notes', ''));
+    $isRework      = input('is_rework') ? 1 : 0;
+    // PO-style header fields (all optional)
+    $paymentTerms       = trim((string)input('payment_terms', ''));
+    $packingForwarding  = trim((string)input('packing_forwarding', ''));
+    $freightInsurance   = trim((string)input('freight_insurance', ''));
+    $notesPo            = trim((string)input('notes_po', ''));
+    $specialInstr       = trim((string)input('special_instructions', ''));
+    $internalNotes      = trim((string)input('internal_notes', ''));
+    // Phase C — new header fields
+    $courierId          = (int)input('courier_id', 0) ?: null;
+    $reference          = trim((string)input('reference', ''));
+    // Terms & Conditions snapshot at save time. We pull the current
+    // Settings value once and freeze it on the shipment row so the
+    // PO print continues showing the T&C that was in force when the
+    // PO was issued, even if Settings is edited later.
+    $termsConditions    = magdyn_setting('shiprcpt.terms_conditions', '');
+
+    if (!in_array($mode, ['receive', 'ship', 'both'], true)) {
+        flash_set('error', 'Invalid mode.');
+        redirect(url('/inventory_shiprcpt.php?action=' . ($id ? 'edit&id=' . $id : 'new')));
+    }
+    // Empty-string dates become NULL for storage. Mode determines
+    // which dates are required: 'ship' or 'both' need ship_due_date,
+    // 'receive' or 'both' need receive_due_date.
+    $shipDueDate = $shipDueDate === '' ? null : $shipDueDate;
+    $recvDueDate = $recvDueDate === '' ? null : $recvDueDate;
+
+    $errors = [];
+    if ($vendorId <= 0) $errors[] = 'Vendor is required.';
+    if (in_array($mode, shr_modes_with_ship(), true) && !$shipDueDate) {
+        $errors[] = 'Ship due date is required for ship/both modes.';
+    }
+    if (in_array($mode, shr_modes_with_receive(), true) && !$recvDueDate) {
+        $errors[] = 'Receive due date is required for receive/both modes.';
+    }
+    foreach ([$shipDueDate, $recvDueDate] as $d) {
+        if ($d !== null && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $d)) {
+            $errors[] = 'Due dates must be YYYY-MM-DD.';
+            break;
+        }
+    }
+
+    if ($errors) {
+        flash_set('error', implode(' ', $errors));
+        redirect(url('/inventory_shiprcpt.php?action=' . ($id ? 'edit&id=' . $id : 'new')));
+    }
+
+    $uid = (int)current_user_id();
+    $isNew = ($id === 0);
+
+    try {
+        db()->beginTransaction();
+
+        if ($isNew) {
+            $shipNo = shr_next_ship_no();
+            db_exec(
+                'INSERT INTO inv_shipments
+                   (ship_no, vendor_id, courier_id, reference,
+                    vendor_contact_id, vendor_address_id,
+                    mode, ship_due_date, receive_due_date,
+                    payment_terms, packing_forwarding, freight_insurance,
+                    status, ref_doc, notes, notes_po, special_instructions, internal_notes,
+                    terms_conditions, is_rework, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [$shipNo, $vendorId, $courierId, $reference ?: null,
+                 $vendorContactId, $vendorAddressId,
+                 $mode, $shipDueDate, $recvDueDate,
+                 $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
+                 'draft', $refDoc ?: null, $notes ?: null,
+                 $notesPo ?: null, $specialInstr ?: null, $internalNotes ?: null,
+                 $termsConditions ?: null, $isRework, $uid]
+            );
+            $id = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
+        } else {
+            $existing = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+            if (!$existing) {
+                db()->rollBack();
+                flash_set('error', 'Shipment not found.');
+                redirect(url('/inventory_shiprcpt.php'));
+            }
+            if (!shr_is_editable($existing['status']) && !$isAmendingSave) {
+                db()->rollBack();
+                flash_set('error', 'Cannot edit shipment after approval. Use Amend instead.');
+                redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+            }
+            if ($isAmendingSave && in_array($existing['status'], ['cancelled'], true)) {
+                db()->rollBack();
+                flash_set('error', 'A cancelled shipment cannot be amended.');
+                redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+            }
+            db_exec(
+                'UPDATE inv_shipments
+                    SET vendor_id = ?, courier_id = ?, reference = ?,
+                        vendor_contact_id = ?, vendor_address_id = ?,
+                        mode = ?, ship_due_date = ?, receive_due_date = ?,
+                        payment_terms = ?, packing_forwarding = ?, freight_insurance = ?,
+                        ref_doc = ?, notes = ?, notes_po = ?,
+                        special_instructions = ?, internal_notes = ?, is_rework = ?
+                  WHERE id = ?',
+                [$vendorId, $courierId, $reference ?: null,
+                 $vendorContactId, $vendorAddressId,
+                 $mode, $shipDueDate, $recvDueDate,
+                 $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
+                 $refDoc ?: null, $notes ?: null, $notesPo ?: null,
+                 $specialInstr ?: null, $internalNotes ?: null, $isRework, $id]
+            );
+        }
+
+        // Save line items. Read parallel form arrays, validate per-row,
+        // wipe + reinsert (simpler than diffing; safe at draft status
+        // because nothing references inv_shipment_lines.id yet).
+        $kinds = (array)input('line_kind', []);
+        $items = (array)input('line_item_id', []);
+        $qtys  = (array)input('line_qty', []);
+        $srcs  = (array)input('line_src_location_id', []);
+        $lnotes= (array)input('line_notes', []);
+        // Phase C — entity_type per line, plus the optional asset_id
+        // (for entity_type='asset' lines), pending_name (for not-yet-
+        // existing inv_items), and per-line before/delivery dates.
+        $entities  = (array)input('line_entity_type', []);
+        $assetIds  = (array)input('line_asset_id', []);
+        $pNames    = (array)input('line_pending_name', []);
+        $pUoms     = (array)input('line_pending_uom_id', []);
+        $beforeDts = (array)input('line_before_date', []);
+        $deliveryDts = (array)input('line_delivery_date', []);
+        // Phase D1 fix — line_id[] carries existing row ids (0 for new
+        // rows). Lets us diff against existing DB rows on amendment so
+        // we never wipe lines that have receipts behind them.
+        $lineIds   = (array)input('line_id', []);
+        $n = max(count($kinds), count($items), count($qtys), count($lineIds));
+
+        // ------------------------------------------------------------
+        // Step 1 — validate + build a $specs list. Same gates as
+        // before; bad rows still bail out via redirect.
+        // ------------------------------------------------------------
+        $specs = [];
+        for ($i = 0; $i < $n; $i++) {
+            $lid    = isset($lineIds[$i]) ? (int)$lineIds[$i] : 0;
+            $kind   = isset($kinds[$i]) ? (string)$kinds[$i] : '';
+            $itemId = isset($items[$i]) ? (int)$items[$i] : 0;
+            $qty    = isset($qtys[$i])  ? (float)$qtys[$i] : 0;
+            $srcId  = isset($srcs[$i])  ? (int)$srcs[$i]  : 0;
+            $ln     = isset($lnotes[$i]) ? trim((string)$lnotes[$i]) : '';
+            $entity = isset($entities[$i]) ? (string)$entities[$i] : 'inv_item';
+            if (!in_array($entity, ['inv_item', 'asset'], true)) $entity = 'inv_item';
+            $assetId   = isset($assetIds[$i]) ? (int)$assetIds[$i] : 0;
+            $pName     = isset($pNames[$i])   ? trim((string)$pNames[$i]) : '';
+            $pUomId    = isset($pUoms[$i])    ? (int)$pUoms[$i]    : 0;
+            $beforeDt  = isset($beforeDts[$i])   ? trim((string)$beforeDts[$i])   : '';
+            $deliveryDt= isset($deliveryDts[$i]) ? trim((string)$deliveryDts[$i]) : '';
+
+            if ($qty <= 0) continue;
+            if ($entity === 'asset') {
+                if ($assetId <= 0) continue;
+            } else if ($pName !== '') {
+                // Pending — itemId optional/zero
+            } else {
+                if ($itemId <= 0) continue;
+            }
+            if (!in_array($kind, ['ship', 'receive'], true)) continue;
+            if ($mode === 'ship'    && $kind !== 'ship')    continue;
+            if ($mode === 'receive' && $kind !== 'receive') continue;
+            if ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0 && $srcId <= 0) {
+                db()->rollBack();
+                flash_set('error', 'Each ship line for an inventory item needs a source location.');
+                redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+            }
+            if ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) {
+                try {
+                    $stockRow = db_one(
+                        'SELECT qty FROM inv_item_location_stock WHERE item_id = ? AND location_id = ?',
+                        [$itemId, $srcId]
+                    );
+                    if (!$stockRow || (float)$stockRow['qty'] <= 0) {
+                        db()->rollBack();
+                        flash_set('error', 'Ship line source location has no stock for item #' . $itemId . '.');
+                        redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+                    }
+                } catch (\Throwable $sve) {
+                    error_log('[shiprcpt save] stock check skipped: ' . $sve->getMessage());
+                }
+            }
+            $specs[] = [
+                'line_id'         => $lid,
+                'sort_order'      => $i,
+                'kind'            => $kind,
+                'entity'          => $entity,
+                'item_id'         => ($entity === 'asset' || $pName !== '') ? ($itemId > 0 ? $itemId : null) : $itemId,
+                'asset_id'        => $entity === 'asset' ? $assetId : null,
+                'pending_name'    => ($entity === 'inv_item' && $pName !== '') ? $pName : null,
+                'pending_uom_id'  => ($entity === 'inv_item' && $pName !== '' && $pUomId > 0) ? $pUomId : null,
+                'qty_planned'     => $qty,
+                'src_location_id' => ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) ? $srcId : null,
+                'before_date'     => $beforeDt   !== '' ? $beforeDt   : null,
+                'delivery_date'   => $deliveryDt !== '' ? $deliveryDt : null,
+                'notes'           => $ln ?: null,
+            ];
+        }
+        if (empty($specs)) {
+            db()->rollBack();
+            flash_set('error', 'Add at least one line item before saving.');
+            redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+        }
+
+        // ------------------------------------------------------------
+        // Step 2 — write the lines.
+        // Draft saves: wipe-and-reinsert (no events to protect).
+        // Amendments: UPDATE existing / INSERT new / DELETE only if
+        //   the existing line has no events behind it.
+        // ------------------------------------------------------------
+        $written = 0;
+        if ($isAmendingSave) {
+            $existingIds = [];
+            foreach (db_all('SELECT id, qty_shipped FROM inv_shipment_lines WHERE shipment_id = ?', [$id]) as $r) {
+                $existingIds[(int)$r['id']] = (float)$r['qty_shipped'];
+            }
+            $submittedIds = [];
+            foreach ($specs as $s) {
+                if ($s['line_id'] > 0) $submittedIds[$s['line_id']] = true;
+            }
+            // Lines the operator removed from the form. Refuse to drop
+            // any that have shipped qty or any receipt rows behind them.
+            foreach ($existingIds as $eid => $shippedQty) {
+                if (isset($submittedIds[$eid])) continue;
+                if ($shippedQty > 0) {
+                    db()->rollBack();
+                    flash_set('error', "Cannot remove line #$eid from the shipment — it has already been shipped. Keep the line and adjust the rest of the amendment.");
+                    redirect(url('/inventory_shiprcpt.php?action=amend&id=' . $id));
+                }
+                $rcptCnt = (int)db_val('SELECT COUNT(*) FROM inv_receipts WHERE shipment_line_id = ?', [$eid], 0);
+                if ($rcptCnt > 0) {
+                    db()->rollBack();
+                    flash_set('error', "Cannot remove line #$eid from the shipment — it has $rcptCnt receipt(s) recorded against it. Cancel those receipts first if you really need to drop this line.");
+                    redirect(url('/inventory_shiprcpt.php?action=amend&id=' . $id));
+                }
+            }
+            // UPDATE / INSERT
+            foreach ($specs as $s) {
+                if ($s['line_id'] > 0 && isset($existingIds[$s['line_id']])) {
+                    db_exec(
+                        'UPDATE inv_shipment_lines
+                            SET sort_order = ?, line_kind = ?, entity_type = ?,
+                                item_id = ?, asset_id = ?,
+                                pending_name = ?, pending_uom_id = ?,
+                                qty_planned = ?, src_location_id = ?,
+                                before_date = ?, delivery_date = ?, notes = ?
+                          WHERE id = ?',
+                        [$s['sort_order'], $s['kind'], $s['entity'],
+                         $s['item_id'], $s['asset_id'],
+                         $s['pending_name'], $s['pending_uom_id'],
+                         $s['qty_planned'], $s['src_location_id'],
+                         $s['before_date'], $s['delivery_date'], $s['notes'],
+                         (int)$s['line_id']]
+                    );
+                } else {
+                    db_exec(
+                        'INSERT INTO inv_shipment_lines
+                            (shipment_id, sort_order, line_kind, entity_type,
+                             item_id, asset_id, pending_name, pending_uom_id,
+                             qty_planned, src_location_id, before_date, delivery_date, notes)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [$id, $s['sort_order'], $s['kind'], $s['entity'],
+                         $s['item_id'], $s['asset_id'],
+                         $s['pending_name'], $s['pending_uom_id'],
+                         $s['qty_planned'], $s['src_location_id'],
+                         $s['before_date'], $s['delivery_date'], $s['notes']]
+                    );
+                }
+                $written++;
+            }
+            // Safe DELETEs
+            foreach ($existingIds as $eid => $shippedQty) {
+                if (!isset($submittedIds[$eid])) {
+                    db_exec('DELETE FROM inv_shipment_lines WHERE id = ?', [$eid]);
+                }
+            }
+        } else {
+            // Draft mode — keep the original wipe-and-reinsert. Cheap
+            // and correct because drafts can't have events yet.
+            db_exec('DELETE FROM inv_shipment_lines WHERE shipment_id = ?', [$id]);
+            foreach ($specs as $s) {
+                db_exec(
+                    'INSERT INTO inv_shipment_lines
+                        (shipment_id, sort_order, line_kind, entity_type,
+                         item_id, asset_id, pending_name, pending_uom_id,
+                         qty_planned, src_location_id, before_date, delivery_date, notes)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [$id, $s['sort_order'], $s['kind'], $s['entity'],
+                     $s['item_id'], $s['asset_id'],
+                     $s['pending_name'], $s['pending_uom_id'],
+                     $s['qty_planned'], $s['src_location_id'],
+                     $s['before_date'], $s['delivery_date'], $s['notes']]
+                );
+                $written++;
+            }
+        }
+
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Could not save shipment: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=' . ($isNew ? 'new' : 'edit&id=' . $id)));
+    }
+
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details)
+         VALUES (?, ?, ?, ?)",
+        [$uid, $isNew ? 'shiprcpt.create' : 'shiprcpt.update', $id, $mode]
+    );
+
+    // Phase C/D1 — PO generation.
+    //   - First save / draft edit  → po_ensure_for_shipment (idempotent v1)
+    //   - Amendment of past-draft   → po_create_amendment_for_shipment (new version)
+    // Never throws — wrap so a downstream issue (e.g. code_sequences
+    // misconfigured) doesn't block the local save flash.
+    $newPo = null;
+    try {
+        if ($isAmendingSave) {
+            $newPo = po_create_amendment_for_shipment($id, $uid);
+        } else {
+            $newPo = po_ensure_for_shipment($id, $uid);
+        }
+    } catch (\Throwable $ePo) {
+        error_log('[shiprcpt save] PO generation failed: ' . $ePo->getMessage());
+    }
+
+    if ($isAmendingSave) {
+        $msg = 'Shipment amended';
+        if ($newPo) $msg .= ' — new PO ' . po_label_with_version($newPo) . ' issued';
+        $msg .= '.';
+        flash_set('success', $msg);
+    } else {
+        flash_set('success', $isNew ? 'Shipment created as draft. Approve it to start movements.' : 'Shipment updated.');
+    }
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// APPROVE
+// ----------------------------------------------------------------
+if ($action === 'approve') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if ($sh['status'] !== 'draft') {
+        flash_set('error', 'Only draft shipments can be approved.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    $uid = (int)current_user_id();
+    db_exec(
+        'UPDATE inv_shipments SET status = ?, approved_by = ?, approved_at = NOW() WHERE id = ?',
+        ['approved', $uid, $id]
+    );
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.approve', ?, ?)",
+        [$uid, $id, $sh['ship_no']]
+    );
+    flash_set('success', 'Shipment approved.');
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// SHIP — post the one-shot ship event
+// ----------------------------------------------------------------
+if ($action === 'ship') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    if (!in_array($sh['mode'], shr_modes_with_ship(), true)) {
+        flash_set('error', 'This shipment has no ship side — nothing to send.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if ($sh['status'] !== 'approved') {
+        flash_set('error', 'Only approved shipments can be shipped.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    $actualShipDate = trim((string)input('actual_ship_date', '')) ?: date('Y-m-d');
+
+    $shipLines = db_all(
+        "SELECT * FROM inv_shipment_lines WHERE shipment_id = ? AND line_kind = 'ship' ORDER BY sort_order, id",
+        [$id]
+    );
+    if (empty($shipLines)) {
+        flash_set('error', 'No ship lines to post.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+
+    $uid = (int)current_user_id();
+    try {
+        db()->beginTransaction();
+        foreach ($shipLines as $L) {
+            $entity = $L['entity_type'] ?? 'inv_item';
+            if ($entity === 'asset') {
+                // Phase C — ship an asset = send_vendor transaction.
+                // No inventory ledger movement because the asset isn't
+                // tracked in inv_txns. Just write the audit row.
+                if (!empty($L['asset_id'])) {
+                    asset_txn_record(
+                        (int)$L['asset_id'],
+                        'send_vendor',
+                        ['to_vendor_id' => (int)$sh['vendor_id']],
+                        $uid,
+                        'Auto: shipped via ' . $sh['ship_no']
+                    );
+                }
+            } elseif (!empty($L['item_id'])) {
+                // Regular inv_item ship line — post the ledger txn.
+                inv_post_txn(
+                    'ship_out',
+                    $actualShipDate,
+                    (int)$L['item_id'],
+                    (int)$L['src_location_id'],
+                    -1 * (float)$L['qty_planned'],
+                    null,
+                    $sh['ref_doc'] ?: null,
+                    'Ship-out for ' . $sh['ship_no']
+                );
+            }
+            // Pending-name lines on the ship side don't ship anything
+            // — they describe an expected receipt. Skip them safely.
+            db_exec(
+                'UPDATE inv_shipment_lines SET qty_shipped = qty_planned WHERE id = ?',
+                [(int)$L['id']]
+            );
+        }
+        db_exec(
+            'UPDATE inv_shipments
+                SET status = ?, shipped_by = ?, shipped_at = NOW(), actual_ship_date = ?
+              WHERE id = ?',
+            ['shipped', $uid, $actualShipDate, $id]
+        );
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Ship-out failed: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.ship', ?, ?)",
+        [$uid, $id, $sh['ship_no'] . ' on ' . $actualShipDate]
+    );
+    flash_set('success', 'Shipped.');
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// RECEIVE — record one receipt event (partial allowed)
+// ----------------------------------------------------------------
+if ($action === 'receive_save') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id     = (int)input('id', 0);
+    $lineId = (int)input('shipment_line_id', 0);
+    $qty    = (float)input('qty_received', 0);
+    $rcptDate = trim((string)input('receipt_date', '')) ?: date('Y-m-d');
+    $locId  = (int)input('dst_location_id', 0);
+    $notes  = trim((string)input('notes', ''));
+
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+    $line = db_one(
+        "SELECT * FROM inv_shipment_lines WHERE id = ? AND shipment_id = ? AND line_kind = 'receive'",
+        [$lineId, $id]
+    );
+    if (!$line) {
+        flash_set('error', 'Receive line not found.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if (!in_array($sh['status'], ['approved', 'shipped'], true)) {
+        flash_set('error', 'Receipts can be recorded only after approval.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    if ($qty <= 0) {
+        flash_set('error', 'Receipt qty must be > 0.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+
+    // Force destination to LOC-QCH (Quality Check Hold). All incoming
+    // material lands here pending inspection regardless of what the
+    // operator picked on the form. The inspection's approval routes
+    // the qty out to the appropriate location automatically. We still
+    // accept whatever was posted (so old forms don't error) but the
+    // override below ignores it.
+    $qchLocId = qc_loc_id('LOC-QCH');
+    if (!$qchLocId) {
+        flash_set('error', 'LOC-QCH location is missing. Run the migration that seeds it.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    $locId = $qchLocId;
+
+    $uid = (int)current_user_id();
+    $entity = $line['entity_type'] ?? 'inv_item';
+
+    // ---- Phase C — asset receive branch ----
+    if ($entity === 'asset') {
+        if (empty($line['asset_id'])) {
+            flash_set('error', 'Asset line has no linked asset_id.');
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+        try {
+            db()->beginTransaction();
+            asset_txn_record(
+                (int)$line['asset_id'],
+                'receive_vendor',
+                ['to_location_id' => $locId],
+                $uid,
+                'Auto: received via ' . $sh['ship_no']
+            );
+            db_exec(
+                'UPDATE inv_shipment_lines SET qty_received = qty_planned WHERE id = ?',
+                [(int)$line['id']]
+            );
+            db()->commit();
+        } catch (\Throwable $e) {
+            if (db()->inTransaction()) db()->rollBack();
+            flash_set('error', 'Asset receipt failed: ' . $e->getMessage());
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+        db_exec(
+            "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.receive_asset', ?, ?)",
+            [$uid, $id, $sh['ship_no'] . ' asset ' . $line['asset_id']]
+        );
+        flash_set('success', 'Asset receipt recorded.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+
+    // ---- Phase C — pending (not-yet-existing) item branch ----
+    // Create the inv_items row at receipt time, bind it to the line,
+    // then fall through to the normal ledger-post receive flow below.
+    if (empty($line['item_id']) && !empty($line['pending_name'])) {
+        $newCode = function_exists('inv_id_generate') ? inv_id_generate() : ('I-' . date('YmdHis'));
+        try {
+            db_exec(
+                'INSERT INTO inv_items (code, name, uom_id, is_active)
+                  VALUES (?, ?, ?, 1)',
+                [$newCode, (string)$line['pending_name'],
+                 !empty($line['pending_uom_id']) ? (int)$line['pending_uom_id'] : null]
+            );
+            $newItemId = (int)db()->lastInsertId();
+            db_exec(
+                'UPDATE inv_shipment_lines SET item_id = ?, pending_name = NULL WHERE id = ?',
+                [$newItemId, (int)$line['id']]
+            );
+            $line['item_id'] = $newItemId;
+        } catch (\Throwable $e) {
+            flash_set('error', 'Could not create the pending item on receipt: ' . $e->getMessage());
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+    }
+
+    try {
+        db()->beginTransaction();
+        // inv_post_txn returns ['txn_id' => N, 'qty_after' => X] — extract
+        // the id for the FK on inv_receipts.txn_id. Passing the whole
+        // array would coerce to the string "Array" which then casts to 0
+        // and the FK constraint fk_invr_txn rejects the insert.
+        $txnResult = inv_post_txn(
+            'ship_in',
+            $rcptDate,
+            (int)$line['item_id'],
+            $locId,
+            $qty,
+            null,
+            $sh['ref_doc'] ?: null,
+            'Receipt for ' . $sh['ship_no']
+        );
+        $txnId = is_array($txnResult) ? (int)$txnResult['txn_id'] : (int)$txnResult;
+        $rcptNo = shr_next_receipt_no();
+        db_exec(
+            'INSERT INTO inv_receipts
+               (receipt_no, shipment_id, shipment_line_id, qty_received, receipt_date,
+                due_date_snapshot, dst_location_id, txn_id, ref_doc, notes, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [$rcptNo, $id, (int)$line['id'], $qty, $rcptDate,
+             $sh['receive_due_date'], $locId, $txnId,
+             $sh['ref_doc'] ?: null, $notes ?: null, $uid]
+        );
+        shr_recompute_line_received((int)$line['id']);
+
+        // Auto-create the QC inspection. Linked to this txn so it shows
+        // in the pending QC list and the approve step can move the
+        // qty out of LOC-QCH atomically.
+        qc_auto_create_inspection_for_txn($txnId);
+
+        // Phase C2 — persist Price + GST% to the receive-side pricing
+        // table so the PO print can render them and Phase D invoicing
+        // can pick them up. Upsert by (shipment_id, item_id). Wrapped
+        // in try so a missing table on older installs degrades quietly.
+        try {
+            $rPrice = input('price', null);
+            $rGst   = input('gst_pct', null);
+            $rPrice = ($rPrice === '' || $rPrice === null) ? null : (float)$rPrice;
+            $rGst   = ($rGst   === '' || $rGst   === null) ? null : (float)$rGst;
+            if (($rPrice !== null || $rGst !== null) && !empty($line['item_id'])) {
+                $existing = db_one(
+                    "SELECT id FROM inv_shipment_receive_lines WHERE shipment_id = ? AND item_id = ?",
+                    [$id, (int)$line['item_id']]
+                );
+                if ($existing) {
+                    db_exec(
+                        "UPDATE inv_shipment_receive_lines
+                            SET price = COALESCE(?, price),
+                                gst_pct = COALESCE(?, gst_pct)
+                          WHERE id = ?",
+                        [$rPrice, $rGst, (int)$existing['id']]
+                    );
+                } else {
+                    db_exec(
+                        "INSERT INTO inv_shipment_receive_lines
+                            (shipment_id, item_id, qty_expected, qty_received, price, gst_pct)
+                          VALUES (?, ?, ?, 0, ?, ?)",
+                        [$id, (int)$line['item_id'], (float)$line['qty_planned'], $rPrice, $rGst]
+                    );
+                }
+            }
+        } catch (\Throwable $ePr) {
+            error_log('[shiprcpt receive_save] receive-line pricing upsert skipped: ' . $ePr->getMessage());
+        }
+
+        db()->commit();
+    } catch (\Throwable $e) {
+        if (db()->inTransaction()) db()->rollBack();
+        flash_set('error', 'Receipt failed: ' . $e->getMessage());
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.receive', ?, ?)",
+        [$uid, $id, $sh['ship_no'] . ' line ' . $line['id'] . ' qty ' . $qty . ' to LOC-QCH']
+    );
+    flash_set('success', 'Receipt recorded at LOC-QCH; inspection pending.');
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+// ----------------------------------------------------------------
+// CLOSE / CANCEL
+// ----------------------------------------------------------------
+if ($action === 'close') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+    if (!in_array($sh['status'], ['approved', 'shipped'], true)) {
+        flash_set('error', 'Only active shipments can be closed.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    db_exec('UPDATE inv_shipments SET status = ? WHERE id = ?', ['closed', $id]);
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.close', ?, ?)",
+        [(int)current_user_id(), $id, $sh['ship_no']]
+    );
+    flash_set('success', 'Shipment closed.');
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+if ($action === 'cancel') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+    if (!in_array($sh['status'], ['draft', 'approved'], true)) {
+        flash_set('error', 'Only draft or approved shipments can be cancelled (no stock has moved).');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    // Hard-block: if any receipt on this shipment is linked to an
+    // invoice, the user must unlink first. We list the invoices in
+    // the flash so they know where to go.
+    $blockingInvoices = db_all(
+        'SELECT DISTINCT i.invoice_no
+           FROM inv_receipts r
+           JOIN invoice_lines il    ON il.inv_receipt_id = r.id
+           JOIN invoice_items ii    ON ii.id = il.invoice_item_id
+           JOIN invoices i          ON i.id = ii.invoice_id
+          WHERE r.shipment_id = ?
+          ORDER BY i.invoice_no',
+        [$id]
+    );
+    if ($blockingInvoices) {
+        $nos = invoice_link_format_invoice_list($blockingInvoices);
+        flash_set('error', 'Cannot cancel: receipts on this shipment are linked to invoice(s): '
+            . $nos . '. Unlink them first on each invoice\'s Links page.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    db_exec('UPDATE inv_shipments SET status = ? WHERE id = ?', ['cancelled', $id]);
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.cancel', ?, ?)",
+        [(int)current_user_id(), $id, $sh['ship_no']]
+    );
+    flash_set('success', 'Shipment cancelled.');
+    redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+}
+
+if ($action === 'delete') {
+    require_permission('inventory_shiprcpt', 'manage');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+    if (!in_array($sh['status'], ['draft', 'cancelled'], true)) {
+        flash_set('error', 'Only draft or cancelled shipments can be deleted (anything else has stock implications).');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    // Hard-block: shipments with linked receipts must have those
+    // invoice links removed first. Without this, deleting the
+    // shipment would CASCADE through inv_receipts → invoice_lines
+    // (we have ON DELETE SET NULL on inv_receipt_id) and orphan
+    // the link rows — bad audit trail.
+    $blockingInvoices = db_all(
+        'SELECT DISTINCT i.invoice_no
+           FROM inv_receipts r
+           JOIN invoice_lines il    ON il.inv_receipt_id = r.id
+           JOIN invoice_items ii    ON ii.id = il.invoice_item_id
+           JOIN invoices i          ON i.id = ii.invoice_id
+          WHERE r.shipment_id = ?
+          ORDER BY i.invoice_no',
+        [$id]
+    );
+    if ($blockingInvoices) {
+        $nos = invoice_link_format_invoice_list($blockingInvoices);
+        flash_set('error', 'Cannot delete: receipts on this shipment are linked to invoice(s): '
+            . $nos . '. Unlink them first.');
+        redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+    }
+    db_exec('DELETE FROM inv_shipments WHERE id = ?', [$id]);
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'shiprcpt.delete', ?, ?)",
+        [(int)current_user_id(), $id, $sh['ship_no']]
+    );
+    flash_set('success', 'Shipment deleted.');
+    redirect(url('/inventory_shiprcpt.php'));
+}
+
+// ----------------------------------------------------------------
+// NEW / EDIT / AMEND — form
+// ----------------------------------------------------------------
+// 'amend' is a Phase D1 variant of 'edit' that unlocks the form on
+// a past-draft shipment so the operator can change locked fields
+// (item_id, qty). On save (driven by the hidden is_amending flag
+// posted with the form), a NEW PO version is created instead of
+// the idempotent v1 ensure-call.
+if ($action === 'new' || $action === 'edit' || $action === 'amend') {
+    if ($action === 'new') require_permission('inventory_shiprcpt', 'manage');
+    if ($action === 'amend') require_permission('inventory_shiprcpt', 'manage');
+    $isAmending = ($action === 'amend');
+    $id = ($action === 'edit' || $action === 'amend') ? (int)input('id', 0) : 0;
+    $sh = $id > 0 ? db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]) : null;
+    if ($action === 'edit') {
+        if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+        if (!shr_is_editable($sh['status'])) {
+            flash_set('error', 'This shipment is past draft and cannot be edited.');
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+    }
+    if ($action === 'amend') {
+        if (!$sh) { flash_set('error', 'Shipment not found.'); redirect(url('/inventory_shiprcpt.php')); }
+        // Amend is only meaningful on a past-draft shipment that has
+        // a PO to amend FROM. A draft shipment hasn't issued a PO yet,
+        // so the operator should just keep editing it normally.
+        if (shr_is_editable($sh['status'])) {
+            flash_set('info', 'Shipment is still a draft — edit it directly instead of amending.');
+            redirect(url('/inventory_shiprcpt.php?action=edit&id=' . $id));
+        }
+        if (in_array($sh['status'], ['cancelled'], true)) {
+            flash_set('error', 'A cancelled shipment cannot be amended.');
+            redirect(url('/inventory_shiprcpt.php?action=view&id=' . $id));
+        }
+    }
+    $lines = $id > 0
+        ? db_all('SELECT * FROM inv_shipment_lines WHERE shipment_id = ? ORDER BY sort_order, id', [$id])
+        : [];
+    if (empty($lines)) $lines = [null];
+    else $lines[] = null;   // one trailing empty for adding
+
+    $vendors   = db_all('SELECT id, code, name, is_active FROM vendors ORDER BY name');
+    $locations = db_all('SELECT id, name FROM locations WHERE is_active = 1 ORDER BY name');
+    $itemOpts  = shr_item_picker_options();
+
+    $vMode        = $sh['mode']             ?? 'both';
+    $vVendorId    = (int)($sh['vendor_id']  ?? 0);
+    $vContactId   = (int)($sh['vendor_contact_id'] ?? 0);
+    $vAddressId   = (int)($sh['vendor_address_id'] ?? 0);
+    $vShipDue     = $sh['ship_due_date']    ?? '';
+    $vRecvDue     = $sh['receive_due_date'] ?? '';
+    $vRefDoc      = $sh['ref_doc']          ?? '';
+    $vNotes       = $sh['notes']            ?? '';
+    $vIsRework    = (int)($sh['is_rework']  ?? 0);
+    // PO-style fields (added by migration 220000)
+    $vPaymentTerms      = $sh['payment_terms']       ?? '';
+    $vPackForw          = $sh['packing_forwarding']  ?? '';
+    $vFreightIns        = $sh['freight_insurance']   ?? '';
+    $vNotesPo           = $sh['notes_po']            ?? '';
+    $vSpecialInstr      = $sh['special_instructions'] ?? '';
+    $vInternalNotes     = $sh['internal_notes']      ?? '';
+    // Phase C2 — new header fields
+    $vCourierId         = (int)($sh['courier_id'] ?? 0);
+    $vReference         = (string)($sh['reference'] ?? '');
+    // Terms & conditions: prefer the snapshot stored on this row
+    // (frozen at save time); fall back to the current Settings value
+    // for a never-saved new shipment.
+    $vTermsConditions   = (string)($sh['terms_conditions'] ?? '');
+    if ($vTermsConditions === '') {
+        $vTermsConditions = magdyn_setting('shiprcpt.terms_conditions', '');
+    }
+    $couriers = db_all('SELECT id, code, name FROM shipping_couriers WHERE is_active = 1 ORDER BY sort_order, name');
+    // Existing lines (for edit) — fetch the Phase C extras too so the
+    // line grid renders them. New-mode starts with empty rows.
+    $existingLines = $id > 0
+        ? db_all(
+            "SELECT l.*,
+                    i.code AS item_code, i.name AS item_name,
+                    a.asset_tag AS asset_tag,
+                    am.name AS asset_model_name
+               FROM inv_shipment_lines l
+          LEFT JOIN inv_items i  ON i.id = l.item_id
+          LEFT JOIN assets    a  ON a.id = l.asset_id
+          LEFT JOIN asset_models am ON am.id = a.model_id
+              WHERE l.shipment_id = ?
+              ORDER BY l.sort_order, l.id",
+            [$id]
+          )
+        : [];
+    // Lists for the line pickers
+    $allAssets = db_all(
+        "SELECT a.id, a.asset_tag, COALESCE(am.name, '') AS model_name
+           FROM assets a
+      LEFT JOIN asset_models am ON am.id = a.model_id
+          WHERE a.status <> 'archived'
+          ORDER BY a.asset_tag"
+    );
+    $allUoms = [];
+    try {
+        $allUoms = db_all("SELECT id, code, label FROM inv_uom ORDER BY code");
+    } catch (\Throwable $e) { /* table may be named differently in older installs */ }
+
+    // Pre-fetch contacts + addresses for the CURRENT vendor so the
+    // dropdowns render with the right options on first paint. JS
+    // cascade replaces these client-side when the vendor changes.
+    $vendorContacts  = $vVendorId > 0
+        ? db_all('SELECT id, name, designation, is_primary FROM vendor_contacts
+                   WHERE vendor_id = ? ORDER BY is_primary DESC, sort_order, name', [$vVendorId])
+        : [];
+    $vendorAddresses = $vVendorId > 0
+        ? db_all('SELECT id, label, line1, city FROM vendor_addresses
+                   WHERE vendor_id = ? ORDER BY is_primary DESC, sort_order, id', [$vVendorId])
+        : [];
+
+    $page_title  = $id ? 'Edit shipment' : 'New shipment';
+    $page_module = 'inventory_shiprcpt';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <?= form_toolbar([
+        'back_href'  => url('/inventory_shiprcpt.php' . ($id ? '?action=view&id=' . $id : '')),
+        'back_label' => $id ? 'Back to shipment' : 'Back to list',
+        'title'      => $id ? ('Edit ' . h($sh['ship_no'])) : 'New shipment',
+    ]) ?>
+
+    <?php /* The "Suggest receive lines" inner form lives OUTSIDE the main
+            shipment form because HTML doesn't allow nested <form> tags
+            — nesting orphans every element after the inner </form> from
+            the outer form, breaking submission. The submit button stays
+            inside the main form visually and links here via form="...".
+            Only relevant for existing drafts ($id > 0). */ ?>
+    <?php if (($action === 'new' || $action === 'edit' || $action === 'amend') && $id > 0 && ($sh === null || shr_is_editable($sh['status']) || $isAmending)): ?>
+    <form id="shr-suggest-form" method="post"
+          action="<?= h(url('/inventory_shiprcpt.php?action=suggest_receive_lines')) ?>"
+          style="display:none;">
+        <?= csrf_field() ?>
+        <input type="hidden" name="id" value="<?= (int)$id ?>">
+    </form>
+    <?php endif; ?>
+
+    <form id="shr-main-form" method="post" action="<?= h(url('/inventory_shiprcpt.php?action=save')) ?>"
+          class="shr-form">
+        <?= csrf_field() ?>
+        <?php if ($id): ?><input type="hidden" name="id" value="<?= (int)$id ?>"><?php endif; ?>
+        <?php if ($isAmending): ?>
+            <!-- Phase D1 — amendment banner + flag. The save handler
+                 reads is_amending and, on success, creates a NEW PO
+                 version (po_create_amendment_for_shipment) instead of
+                 the idempotent ensure call used on first save. -->
+            <input type="hidden" name="is_amending" value="1">
+            <?php
+                $latestPo = po_latest_for_shipment((int)$id);
+                $nextVer  = $latestPo ? ((int)$latestPo['version'] + 1) : 1;
+            ?>
+            <div class="alert alert-warn" style="margin-bottom: 16px;">
+                <strong>Amending this shipment.</strong>
+                Saving will create a new PO version
+                <?php if ($latestPo): ?>
+                    (current: <code><?= h(po_label_with_version($latestPo)) ?></code>, next: <strong>v<?= (int)$nextVer ?></strong>)
+                <?php endif; ?>.
+                The original PO stays unchanged for audit purposes.
+                Lifecycle status remains <strong><?= h($sh['status']) ?></strong>.
+            </div>
+        <?php endif; ?>
+
+        <!-- ============================================================
+             STEP 1 — Shipment basics
+             ============================================================ -->
+        <section class="shr-step">
+            <div class="shr-step-head">
+                <span class="shr-step-num">1</span>
+                <div>
+                    <h3 class="shr-step-title">Shipment basics</h3>
+                    <p class="shr-step-help">Pick the vendor and due dates. The direction is set automatically based on the lines you add below.</p>
+                </div>
+            </div>
+            <div class="shr-step-body">
+                <div class="grid-2col">
+                    <div class="field">
+                        <label>Direction</label>
+                        <?php
+                          $hasShipLine = $hasRecvLine = false;
+                          foreach ($lines as $L) {
+                              if (!$L) continue;
+                              if (($L['line_kind'] ?? '') === 'ship')    $hasShipLine = true;
+                              if (($L['line_kind'] ?? '') === 'receive') $hasRecvLine = true;
+                          }
+                          if ($hasShipLine && $hasRecvLine) { $derivedMode = 'both';    $derivedLabel = '⇅ Ship & receive'; $pillCls = 'pill-info'; }
+                          else if ($hasShipLine)            { $derivedMode = 'ship';    $derivedLabel = '↑ Ship only';     $pillCls = 'pill-warning'; }
+                          else if ($hasRecvLine)            { $derivedMode = 'receive'; $derivedLabel = '↓ Receive only';  $pillCls = 'pill-success'; }
+                          else                              { $derivedMode = '';        $derivedLabel = 'No lines yet';    $pillCls = 'pill-neutral'; }
+                        ?>
+                        <div style="margin-top: 4px;">
+                            <span class="pill <?= $pillCls ?>" id="shr-mode-pill" data-mode="<?= h($derivedMode) ?>"><?= h($derivedLabel) ?></span>
+                        </div>
+                        <span class="muted small">Auto-determined from the lines below.</span>
+                    </div>
+                    <div class="field">
+                        <label for="f_vendor">Vendor <span class="required">*</span></label>
+                        <select id="f_vendor" name="vendor_id" required>
+                            <option value="">— pick a vendor —</option>
+                            <?php foreach ($vendors as $v):
+                                if (!$v['is_active'] && (int)$v['id'] !== $vVendorId) continue; ?>
+                                <option value="<?= (int)$v['id'] ?>"
+                                        <?= (int)$v['id'] === $vVendorId ? 'selected' : '' ?>>
+                                    <?= h($v['code']) ?> — <?= h($v['name']) ?>
+                                    <?= !$v['is_active'] ? ' (disabled)' : '' ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <!-- Phase C2 — vendor contact & address selects.
+                         Default to the primary contact / address on
+                         vendor change (PRD §2.1). PRD calls for the
+                         contact field to be a multi-select; the
+                         backing column inv_shipments.vendor_contact_id
+                         is a single FK right now, so for v1 we keep
+                         it single-select and pre-select the primary.
+                         Phase D will lift to a join table if
+                         multi-recipient handling needs to persist on
+                         the shipment row itself. -->
+                    <div class="field">
+                        <label for="f_vendor_contact">Vendor contact</label>
+                        <select id="f_vendor_contact" name="vendor_contact_id">
+                            <option value="">— primary —</option>
+                            <?php foreach ($vendorContacts as $c): ?>
+                                <option value="<?= (int)$c['id'] ?>"
+                                        <?= (int)$c['id'] === $vContactId ? 'selected' : '' ?>>
+                                    <?= h(trim(($c['designation'] ?? '') . ' ' . $c['name'])) ?>
+                                    <?= !empty($c['is_primary']) ? ' (primary)' : '' ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="f_vendor_address">Vendor address</label>
+                        <select id="f_vendor_address" name="vendor_address_id">
+                            <option value="">— primary —</option>
+                            <?php foreach ($vendorAddresses as $a): ?>
+                                <option value="<?= (int)$a['id'] ?>"
+                                        <?= (int)$a['id'] === $vAddressId ? 'selected' : '' ?>>
+                                    <?= h(($a['label'] ?: $a['line1']) . ($a['city'] ? ' · ' . $a['city'] : '')) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label>Due dates</label>
+                        <div class="shr-due-pair">
+                            <div id="shr-due-ship-wrap">
+                                <input id="f_ship_due" name="ship_due_date" type="date" value="<?= h($vShipDue) ?>">
+                                <div class="muted small">Ship due — required if ship lines.</div>
+                            </div>
+                            <div id="shr-due-recv-wrap">
+                                <input id="f_recv_due" name="receive_due_date" type="date" value="<?= h($vRecvDue) ?>">
+                                <div class="muted small">Receive due — required if receive lines.</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label for="f_ref">Reference doc</label>
+                        <input id="f_ref" name="ref_doc" type="text" maxlength="64"
+                               value="<?= h($vRefDoc) ?>" placeholder="PO / WO / etc.">
+                    </div>
+                    <div class="field">
+                        <label class="inline" style="margin-top: 22px;">
+                            <input type="checkbox" name="is_rework" value="1" <?= $vIsRework ? 'checked' : '' ?>>
+                            This shipment is for rework
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Phase C — PRD §2.2 header fields. Sit after vendor /
+                 address per PRD requirement. Most are free-text;
+                 Courier comes from the shipping_couriers lookup;
+                 Terms & Conditions is a read-only snapshot pulled
+                 from Settings (frozen at save time on this row). -->
+            <div class="shr-step-body" style="border-top: 1px solid var(--border); padding-top: 16px; margin-top: 8px;">
+                <h4 style="margin: 0 0 12px 0; font-size: 13px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em;">Commercial details</h4>
+                <div class="shr-grid">
+                    <div class="field">
+                        <label for="f_courier">Shipping courier</label>
+                        <select id="f_courier" name="courier_id">
+                            <option value="">— pick a courier —</option>
+                            <?php foreach ($couriers as $cr): ?>
+                                <option value="<?= (int)$cr['id'] ?>" <?= (int)$cr['id'] === $vCourierId ? 'selected' : '' ?>>
+                                    <?= h($cr['name']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="f_reference">Reference</label>
+                        <input id="f_reference" name="reference" type="text" maxlength="190"
+                               value="<?= h($vReference) ?>" placeholder="e.g. vendor's quotation no. / tracking no.">
+                    </div>
+                    <div class="field">
+                        <label for="f_payment_terms">Payment terms</label>
+                        <input id="f_payment_terms" name="payment_terms" type="text" maxlength="255"
+                               value="<?= h($vPaymentTerms) ?>" placeholder="e.g. Net 30 / 50% advance + 50% on delivery">
+                    </div>
+                    <div class="field">
+                        <label for="f_packing_forwarding">Packing &amp; forwarding</label>
+                        <input id="f_packing_forwarding" name="packing_forwarding" type="text" maxlength="255"
+                               value="<?= h($vPackForw) ?>" placeholder="e.g. As actuals">
+                    </div>
+                    <div class="field">
+                        <label for="f_freight_insurance">Freight &amp; insurance</label>
+                        <input id="f_freight_insurance" name="freight_insurance" type="text" maxlength="255"
+                               value="<?= h($vFreightIns) ?>" placeholder="e.g. To-pay / Pre-paid">
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label for="f_special_instructions">Special instructions</label>
+                        <textarea id="f_special_instructions" name="special_instructions" rows="2"
+                                  placeholder="Visible on the PO"><?= h($vSpecialInstr) ?></textarea>
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label for="f_internal_notes">Notes for internal use</label>
+                        <textarea id="f_internal_notes" name="internal_notes" rows="2"
+                                  placeholder="Not shown on the PO"><?= h($vInternalNotes) ?></textarea>
+                    </div>
+                    <div class="field" style="grid-column: span 2;">
+                        <label>Terms &amp; Conditions <span class="muted small">(non-editable — change in Settings → defaults)</span></label>
+                        <textarea readonly rows="5"
+                                  style="background: var(--surface-alt, #f5f6f8); color: var(--text-muted); font-size: 11.5px; white-space: pre-wrap;"><?= h($vTermsConditions) ?></textarea>
+                        <div class="muted small">Snapshotted onto this shipment when first saved. The PO print shows this exact text.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============================================================
+             STEP 2 — Add items (BOM-driven, primary path)
+             ============================================================ -->
+        <section class="shr-step">
+            <div class="shr-step-head">
+                <span class="shr-step-num">2</span>
+                <div>
+                    <h3 class="shr-step-title">Add items</h3>
+                    <p class="shr-step-help">Pick a finished good or sub-assembly to <strong>receive</strong>. Its BOM children appear as a checklist — tick the ones to ship to the vendor and click <em>Add to list</em>. Repeat for multiple items. The whole list is saved when you click <em>Create shipment</em> at the bottom.</p>
+                </div>
+            </div>
+            <div class="shr-step-body">
+
+        <?php if ($sh === null || shr_is_editable($sh['status'])): ?>
+            <!--
+              "Add a receive item" panel. Two modes:
+                - Existing draft ($id > 0): POSTs to add_from_bom_checklist
+                - New (unsaved): JS appends rows to the table below
+            -->
+            <div class="shr-add-panel">
+                <div class="shr-add-row">
+                    <div class="field" style="margin: 0; flex: 1; min-width: 240px;">
+                        <label>Item to receive (finished good OR sub-assembly)</label>
+                        <select id="shr-recv-item">
+                            <option value="">— pick an item —</option>
+                            <?php foreach ($itemOpts as $opt): ?>
+                                <option value="<?= (int)$opt['id'] ?>"><?= h($opt['label']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field" style="margin: 0; width: 100px;">
+                        <label>Qty</label>
+                        <input id="shr-recv-mult" type="number" value="1" min="0.001" step="0.001">
+                    </div>
+                    <button type="button" id="shr-load-bom" class="btn btn-primary">Load BOM →</button>
+                </div>
+                <div id="shr-bom-checklist" style="margin-top: 14px; display: none;"></div>
+            </div>
+
+            <?php if ($id > 0): ?>
+            <div style="margin-top: 10px;">
+                <button type="submit" form="shr-suggest-form" class="btn btn-ghost btn-sm"
+                        title="Scan existing ship lines and suggest parent items whose BOMs they could be producing">
+                    ⤒ Suggest receive lines from existing ship items
+                </button>
+            </div>
+            <?php endif; ?>
+        <?php endif; ?>
+
+        <!-- Manual line entry — collapsed by default. Most users add
+             items via BOM checklist above; manual entry is the escape
+             hatch for one-off ship-only or receive-only shipments. -->
+        <details class="shr-manual" id="shr-manual-toggle" <?= count($lines) > 1 ? 'open' : '' ?>>
+            <summary>
+                Manual line entry
+                <span class="shr-manual-hint muted small">— for one-off shipments without a BOM</span>
+            </summary>
+
+        <style>
+            .shr-lines-table th { padding: 8px; font-size: 12px; }
+            .shr-lines-table td { padding: 6px 8px; vertical-align: middle; }
+            .shr-lines-table input[type="text"],
+            .shr-lines-table input[type="number"],
+            .shr-lines-table select {
+                width: 100%;
+                box-sizing: border-box;
+                font-size: 13px;
+                padding: 7px 10px;
+                line-height: 1.3;
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                background: var(--surface);
+                color: var(--text);
+            }
+            .shr-lines-table select { padding-right: 24px; }
+        </style>
+
+        <table class="data-table shr-lines-table" id="shr-lines-tbl">
+            <thead>
+                <tr>
+                    <th style="width: 100px;">Direction</th>
+                    <th style="width: 100px;">Type</th>
+                    <th>Item / Asset</th>
+                    <th class="r" style="width: 90px;">Qty</th>
+                    <th style="width: 130px;">Source (ship only)</th>
+                    <th style="width: 130px;">Before date</th>
+                    <th style="width: 130px;">Delivery date</th>
+                    <th>Notes</th>
+                    <th style="width: 44px;"></th>
+                </tr>
+            </thead>
+            <tbody id="shr-lines-body">
+            <?php foreach ($lines as $L):
+                $isExisting = is_array($L);
+                $lKind   = $isExisting ? $L['line_kind']         : 'receive';
+                $lLineId = $isExisting ? (int)$L['id']           : 0;
+                $lItemId = $isExisting ? (int)$L['item_id']      : 0;
+                $lQty    = $isExisting ? rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.') : '';
+                $lSrc    = $isExisting ? (int)($L['src_location_id'] ?? 0) : 0;
+                $lNote   = $isExisting ? ($L['notes'] ?? '') : '';
+                // Phase C — extra per-line state
+                $lEntity   = $isExisting ? (string)($L['entity_type']   ?? 'inv_item') : 'inv_item';
+                $lAssetId  = $isExisting ? (int)($L['asset_id']         ?? 0) : 0;
+                $lPending  = $isExisting ? (string)($L['pending_name']  ?? '') : '';
+                $lPendUom  = $isExisting ? (int)($L['pending_uom_id']   ?? 0) : 0;
+                $lBefore   = $isExisting ? (string)($L['before_date']   ?? '') : '';
+                $lDelivery = $isExisting ? (string)($L['delivery_date'] ?? '') : '';
+                // Derive UI sub-type: 'item' (existing), 'asset', or 'pending'.
+                $lSubType = $lEntity === 'asset'
+                          ? 'asset'
+                          : (!$lItemId && $lPending !== '' ? 'pending' : 'item');
+            ?>
+                <tr class="shr-line-row" data-subtype="<?= h($lSubType) ?>">
+                    <!-- Phase D1 fix — line_id[] lets the save handler do a
+                         UPDATE/INSERT/DELETE diff instead of wipe-and-reinsert.
+                         Wipe-and-reinsert cascade-deletes receipts (FK has
+                         ON DELETE CASCADE), which destroys audit history when
+                         the operator amends. 0 means "new row, INSERT". -->
+                    <input type="hidden" name="line_id[]" value="<?= (int)$lLineId ?>">
+                    <td>
+                        <select name="line_kind[]" class="no-combobox shr-line-kind">
+                            <option value="receive" <?= $lKind === 'receive' ? 'selected' : '' ?>>Receive</option>
+                            <option value="ship"    <?= $lKind === 'ship'    ? 'selected' : '' ?>>Ship</option>
+                        </select>
+                    </td>
+                    <td>
+                        <!-- Type drives which of the next-cell slots is
+                             visible. The hidden line_entity_type[] feeds
+                             the save handler's branching logic. -->
+                        <select class="no-combobox shr-line-subtype">
+                            <option value="item"    <?= $lSubType === 'item'    ? 'selected' : '' ?>>Item</option>
+                            <option value="asset"   <?= $lSubType === 'asset'   ? 'selected' : '' ?>>Asset</option>
+                            <option value="pending" <?= $lSubType === 'pending' ? 'selected' : '' ?>>New item</option>
+                        </select>
+                        <input type="hidden" name="line_entity_type[]"
+                               value="<?= $lSubType === 'asset' ? 'asset' : 'inv_item' ?>">
+                    </td>
+                    <td>
+                        <?php if ($lSubType === 'item'): ?>
+                            <select name="line_item_id[]" class="shr-line-item">
+                                <option value="">— pick an item —</option>
+                                <?php foreach ($itemOpts as $opt): ?>
+                                    <option value="<?= (int)$opt['id'] ?>"
+                                            <?= (int)$opt['id'] === $lItemId ? 'selected' : '' ?>>
+                                        <?= h($opt['label']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        <?php else: ?>
+                            <span class="shr-slot shr-slot-item" style="display:none;">
+                                <select name="line_item_id[]" class="shr-line-item">
+                                    <option value="">— pick an item —</option>
+                                    <?php foreach ($itemOpts as $opt): ?>
+                                        <option value="<?= (int)$opt['id'] ?>">
+                                            <?= h($opt['label']) ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </span>
+                        <?php endif; ?>
+
+                        <?php if ($lSubType === 'asset'): ?>
+                            <select name="line_asset_id[]" class="shr-line-asset">
+                                <option value="">— pick an asset —</option>
+                                <?php foreach ($allAssets as $A): ?>
+                                    <option value="<?= (int)$A['id'] ?>"
+                                            <?= (int)$A['id'] === $lAssetId ? 'selected' : '' ?>>
+                                        <?= h($A['asset_tag']) ?><?php if ($A['model_name']): ?> — <?= h($A['model_name']) ?><?php endif; ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        <?php else: ?>
+                            <span class="shr-slot shr-slot-asset" style="display:none;">
+                                <select name="line_asset_id[]" class="shr-line-asset">
+                                    <option value="">— pick an asset —</option>
+                                    <?php foreach ($allAssets as $A): ?>
+                                        <option value="<?= (int)$A['id'] ?>">
+                                            <?= h($A['asset_tag']) ?><?php if ($A['model_name']): ?> — <?= h($A['model_name']) ?><?php endif; ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </span>
+                        <?php endif; ?>
+
+                        <?php if ($lSubType === 'pending'): ?>
+                            <span class="shr-slot shr-slot-pending" style="display: flex; gap: 6px;">
+                                <input type="text" name="line_pending_name[]" maxlength="190"
+                                       class="shr-line-pending"
+                                       placeholder="Name of new item (created on receipt)"
+                                       value="<?= h($lPending) ?>" style="flex: 1;">
+                                <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom" style="flex: 0 0 110px;">
+                                    <option value="">UOM</option>
+                                    <?php foreach ($allUoms as $U): ?>
+                                        <option value="<?= (int)$U['id'] ?>" <?= (int)$U['id'] === $lPendUom ? 'selected' : '' ?>>
+                                            <?= h($U['code']) ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </span>
+                        <?php else: ?>
+                            <span class="shr-slot shr-slot-pending" style="display:none; gap: 6px;">
+                                <input type="text" name="line_pending_name[]" maxlength="190"
+                                       class="shr-line-pending"
+                                       placeholder="Name of new item (created on receipt)"
+                                       value="" style="flex: 1;">
+                                <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom" style="flex: 0 0 110px;">
+                                    <option value="">UOM</option>
+                                    <?php foreach ($allUoms as $U): ?>
+                                        <option value="<?= (int)$U['id'] ?>"><?= h($U['code']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </span>
+                        <?php endif; ?>
+                    </td>
+                    <td class="r">
+                        <input type="number" step="0.001" min="0" class="r"
+                               name="line_qty[]" value="<?= h($lQty) ?>" placeholder="0">
+                    </td>
+                    <td>
+                        <select name="line_src_location_id[]" class="shr-line-src">
+                            <option value="">— pick a source —</option>
+                            <?php foreach ($locations as $loc): ?>
+                                <option value="<?= (int)$loc['id'] ?>"
+                                        <?= (int)$loc['id'] === $lSrc ? 'selected' : '' ?>>
+                                    <?= h($loc['name']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                    <td>
+                        <input type="date" name="line_before_date[]" value="<?= h($lBefore) ?>">
+                    </td>
+                    <td>
+                        <input type="date" name="line_delivery_date[]" value="<?= h($lDelivery) ?>">
+                    </td>
+                    <td>
+                        <input type="text" maxlength="255" name="line_notes[]"
+                               value="<?= h($lNote) ?>">
+                    </td>
+                    <td class="r">
+                        <button type="button" class="btn btn-icon btn-danger shr-line-remove" title="Remove">🗑</button>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        <div style="margin-top: 8px;">
+            <button type="button" class="btn btn-ghost btn-sm" id="shr-line-add">+ Add blank line</button>
+        </div>
+
+        </details><!-- /.shr-manual -->
+
+            </div><!-- /.shr-step-body -->
+        </section><!-- /STEP 2 -->
+
+        <!-- ============================================================
+             STEP 3 — Notes & submit
+             ============================================================ -->
+        <section class="shr-step">
+            <div class="shr-step-head">
+                <span class="shr-step-num">3</span>
+                <div>
+                    <h3 class="shr-step-title">Notes <span class="muted small">(optional)</span></h3>
+                    <p class="shr-step-help">Any context for whoever processes this shipment.</p>
+                </div>
+            </div>
+            <div class="shr-step-body">
+                <div class="field" style="margin: 0;">
+                    <label for="f_notes" class="visually-hidden">Notes</label>
+                    <textarea id="f_notes" name="notes" rows="3" placeholder="e.g. handle with care, expected freight by 3 PM, etc."><?= h($vNotes) ?></textarea>
+                </div>
+            </div>
+        </section>
+
+        <?php
+            // Phase C — surface the blank-price system note on the
+            // shipment form itself so the operator sees it BEFORE save,
+            // not just on the printed PO. We check the receive-side
+            // table (where prices live) for any blank/zero entries.
+            // Only meaningful for an existing shipment ($id > 0).
+            if ($id > 0 && po_has_blank_priced_lines($id)):
+                $blankNote = magdyn_setting('shiprcpt.system_note_blank_price', '');
+                if ($blankNote !== ''):
+        ?>
+            <div class="alert alert-warn" style="margin: 16px 0;">
+                <strong>Heads-up:</strong> <?= h($blankNote) ?>
+                <div class="muted small" style="margin-top:4px;">
+                    The same note will print on the PO if line prices are not entered before the PO is shared.
+                </div>
+            </div>
+        <?php endif; endif; ?>
+
+        <div class="form-actions" style="margin-top: 16px;">
+            <button type="submit" class="btn btn-primary btn-lg">
+                <?= $id ? '💾 Save changes' : '✓ Create shipment' ?>
+            </button>
+        </div>
+    </form>
+
+    <script>
+    (function () {
+        var body = document.getElementById('shr-lines-body');
+        if (!body) return;
+
+        var stockUrl = <?= json_encode(url('/inventory_shiprcpt.php?action=stock_by_location')) ?>;
+
+        // Per-item cache so a user editing several rows with the same
+        // item doesn't trigger redundant HTTP. Cleared on page reload.
+        var stockCache = {};
+
+        function fetchStockByLocation(itemId, cb) {
+            if (!itemId) { cb([]); return; }
+            if (stockCache[itemId]) { cb(stockCache[itemId]); return; }
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', stockUrl + '&item_id=' + itemId, true);
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+                if (xhr.status !== 200) { cb([]); return; }
+                try {
+                    var data = JSON.parse(xhr.responseText);
+                    var locs = (data.ok ? data.locations : []) || [];
+                    stockCache[itemId] = locs;
+                    cb(locs);
+                } catch (e) { cb([]); }
+            };
+            xhr.send();
+        }
+
+        function fmtQty(n) {
+            return (Math.round(n * 1000) / 1000).toString();
+        }
+
+        // Rebuild a row's Source select options from the stock-by-loc
+        // response. Preserves the current selection if it's still in the
+        // new option set; clears otherwise.
+        function rebuildSourceOptions(row, locs) {
+            var srcSel = row.querySelector('.shr-line-src');
+            if (!srcSel) return;
+            var prevVal = srcSel.value;
+            // If a combobox enhancement wrapped the select, unwrap it
+            // so we can rebuild and re-init cleanly.
+            var wrap = srcSel.closest('.cb-wrap');
+            if (wrap && wrap.parentNode) {
+                wrap.parentNode.insertBefore(srcSel, wrap);
+                wrap.parentNode.removeChild(wrap);
+            }
+            srcSel.classList.remove('cb-bound', 'cb-native');
+            srcSel.innerHTML = '';
+
+            var placeholderOpt = document.createElement('option');
+            placeholderOpt.value = '';
+            if (locs.length === 0) {
+                placeholderOpt.textContent = '— no stock available —';
+                placeholderOpt.disabled = true;
+            } else {
+                placeholderOpt.textContent = '— pick a source —';
+            }
+            srcSel.appendChild(placeholderOpt);
+
+            locs.forEach(function (loc) {
+                var opt = document.createElement('option');
+                opt.value = loc.id;
+                opt.textContent = loc.name + ' (' + fmtQty(loc.qty) + ')';
+                if (String(loc.id) === String(prevVal)) opt.selected = true;
+                srcSel.appendChild(opt);
+            });
+            // Re-enhance with combobox if available
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                window.MagDynCombobox.initAll(row);
+            }
+        }
+
+        // Refresh a row's source dropdown to reflect the current item + kind.
+        // For receive lines we leave the dropdown empty (it's ignored).
+        function refreshRowSource(row) {
+            var kind   = row.querySelector('.shr-line-kind').value;
+            var itemEl = row.querySelector('.shr-line-item');
+            var itemId = itemEl ? parseInt(itemEl.value || '0', 10) : 0;
+            if (kind !== 'ship') {
+                // Restore the full list of active locations (server-rendered)
+                // OR leave as-is. Simpler: do nothing — the field is greyed
+                // by syncRow and the server ignores it.
+                return;
+            }
+            if (!itemId) {
+                rebuildSourceOptions(row, []);
+                return;
+            }
+            fetchStockByLocation(itemId, function (locs) {
+                rebuildSourceOptions(row, locs);
+            });
+        }
+
+        // Source-location field is only meaningful for ship lines. We
+        // grey it out for receive lines so the user understands it's
+        // optional; the server enforces presence on ship rows.
+        function syncRow(row) {
+            var kind = row.querySelector('.shr-line-kind').value;
+            var srcSel = row.querySelector('.shr-line-src');
+            // DO NOT use disabled — disabled form fields are NOT submitted,
+            // which silently shifts the parallel-arrays alignment on the
+            // server (receive rows' src slot goes missing, ship rows end
+            // up reading the WRONG row's src). Instead, mimic disabled
+            // visually via opacity + pointer-events:none on the COMBOBOX
+            // wrap (NOT the underlying select — that select is positioned
+            // absolutely with opacity:0 to stay hidden; any inline opacity
+            // we set on it would make the 1x1px hidden select visible at
+            // the top-left corner of the wrap, which is exactly the bug
+            // this comment is here to prevent recurring).
+            var isShip = (kind === 'ship');
+            srcSel.disabled = false;   // always enabled so POST includes it
+            if (!isShip) {
+                srcSel.value = '';      // ensure value is empty for non-ship rows
+            }
+            srcSel.tabIndex = isShip ? 0 : -1;
+            // Combobox wrap holds the visible input + chevron. Style it
+            // (not the hidden underlying select) for the greyed-out look.
+            var wrap = srcSel.closest('.cb-wrap');
+            if (wrap) {
+                wrap.style.opacity = isShip ? '' : '0.5';
+                wrap.style.pointerEvents = isShip ? '' : 'none';
+                // Also make the visible input itself untabbable when greyed
+                var visibleInput = wrap.querySelector('input.cb-input');
+                if (visibleInput) visibleInput.tabIndex = isShip ? 0 : -1;
+            }
+            // If the field is a plain (non-enhanced) select, fall back
+            // to styling the select itself — but DO NOT touch opacity
+            // (see comment above). Use a class instead for visual cue.
+            if (!wrap) {
+                srcSel.style.pointerEvents = isShip ? '' : 'none';
+                srcSel.classList.toggle('shr-src-disabled', !isShip);
+            }
+            // After value/options changes, tell combobox to refresh its
+            // visible input text.
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.resync === 'function') {
+                window.MagDynCombobox.resync(srcSel);
+            }
+        }
+        function wireRow(row) {
+            if (row._wired) return;
+            row._wired = true;
+            syncRow(row);
+            // If row loads with item + ship kind already set (edit mode),
+            // refresh the source dropdown to reflect stock.
+            var kindNow = row.querySelector('.shr-line-kind').value;
+            var itemEl  = row.querySelector('.shr-line-item');
+            if (kindNow === 'ship' && itemEl && parseInt(itemEl.value || '0', 10) > 0) {
+                refreshRowSource(row);
+            }
+            row.querySelector('.shr-line-kind').addEventListener('change', function () {
+                syncRow(row);
+                refreshRowSource(row);
+            });
+            if (itemEl) {
+                itemEl.addEventListener('change', function () { refreshRowSource(row); });
+            }
+            row.querySelector('.shr-line-remove').addEventListener('click', function () {
+                if (body.querySelectorAll('tr.shr-line-row').length <= 1) return;
+                row.parentNode.removeChild(row);
+                if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
+            });
+            // Phase C2 — subtype switcher. Toggles which slot is visible
+            // (item / asset / pending) and updates the hidden
+            // line_entity_type[] so the save handler branches correctly.
+            var subSel = row.querySelector('.shr-line-subtype');
+            if (subSel) {
+                var entHidden = row.querySelector('input[name="line_entity_type[]"]');
+                var slots = {
+                    item:    row.querySelector('.shr-slot-item'),
+                    asset:   row.querySelector('.shr-slot-asset'),
+                    pending: row.querySelector('.shr-slot-pending')
+                };
+                function applySubtype() {
+                    var v = subSel.value;
+                    Object.keys(slots).forEach(function (k) {
+                        if (!slots[k]) return;
+                        slots[k].style.display = (k === v) ? '' : 'none';
+                    });
+                    if (entHidden) entHidden.value = (v === 'asset') ? 'asset' : 'inv_item';
+                    row.setAttribute('data-subtype', v);
+                }
+                subSel.addEventListener('change', applySubtype);
+                applySubtype();   // ensure consistency on first wire
+            }
+        }
+        function cloneEmptyRow() {
+            var rows = body.querySelectorAll('tr.shr-line-row');
+            var tmpl = rows[rows.length - 1].cloneNode(true);
+            tmpl.querySelectorAll('input').forEach(function (inp) {
+                if (inp.type === 'number' || inp.type === 'text') inp.value = '';
+            });
+            // Phase D1 fix — cloned rows are NEW rows; clear any inherited
+            // line_id so the save handler routes them through INSERT, not
+            // UPDATE-by-someone-else's-id.
+            var lidInput = tmpl.querySelector('input[name="line_id[]"]');
+            if (lidInput) lidInput.value = '0';
+            tmpl.querySelectorAll('select').forEach(function (sel) {
+                sel.classList.remove('cb-bound', 'cb-native');
+                sel.disabled = false;
+                sel.style.opacity = '';
+                sel.selectedIndex = 0;
+            });
+            tmpl.querySelectorAll('.cb-wrap').forEach(function (wrap) {
+                var sel = wrap.querySelector('select');
+                if (sel) { wrap.parentNode.insertBefore(sel, wrap); wrap.parentNode.removeChild(wrap); }
+            });
+            tmpl._wired = false;
+            body.appendChild(tmpl);
+            wireRow(tmpl);
+            return tmpl;
+        }
+        document.getElementById('shr-line-add').addEventListener('click', function () {
+            cloneEmptyRow();
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                window.MagDynCombobox.initAll();
+            }
+            if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
+        });
+
+        // Programmatic line-append helper used by the receive-item panel
+        // when operating in client-buffered mode (new unsaved shipment).
+        // Spec: { kind: 'ship'|'receive', itemId, qty, srcId }
+        // Fills a freshly-cloned empty row with those values. Returns the
+        // appended <tr> element.
+        function setRowField(row, selector, value) {
+            var el = row.querySelector(selector);
+            if (!el) {
+                console.warn('[shr setRowField] element not found:', selector);
+                return;
+            }
+            if (el.tagName === 'SELECT') {
+                el.value = String(value);
+                if (el.value !== String(value)) {
+                    // Value didn't match any existing option. This can
+                    // happen if the source location came from the BOM
+                    // checklist's stock-by-loc list (which can theoretically
+                    // include locations not in the manual-row's render of
+                    // $locations). Append the option on the fly so the
+                    // value actually sticks AND the user sees a reasonable
+                    // label.
+                    console.warn('[shr setRowField] adding missing option', value, 'to', selector);
+                    var opt = document.createElement('option');
+                    opt.value = String(value);
+                    opt.textContent = 'Loc #' + value;
+                    el.appendChild(opt);
+                    el.value = String(value);
+                } else {
+                    console.log('[shr setRowField] set', selector, '=', value);
+                }
+                // If this select has been enhanced by combobox, the visible
+                // input won't reflect the new value (combobox doesn't watch
+                // programmatic .value = X assignments unless we dispatch a
+                // change event OR call resync explicitly). Do both so we're
+                // covered either way.
+                if (window.MagDynCombobox && typeof window.MagDynCombobox.resync === 'function') {
+                    window.MagDynCombobox.resync(el);
+                }
+            } else {
+                el.value = String(value);
+                console.log('[shr setRowField] set', selector, '=', value);
+            }
+        }
+        window.__shrAppendLineRow = function (spec) {
+            var row = cloneEmptyRow();
+            // Initialize combobox on the cloned row FIRST. cloneEmptyRow
+            // strips the cb-wrap so the clone starts as raw selects;
+            // initAll(row) re-enhances them. setRowField below then sets
+            // values, and its built-in resync updates the visible
+            // combobox input text accordingly.
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                window.MagDynCombobox.initAll(row);
+            }
+            // IMPORTANT ordering: src must be set BEFORE item, otherwise
+            // changing the item triggers an async refreshRowSource() that
+            // rebuilds the source dropdown — and our later setRowField
+            // call wouldn't find the option anymore (it gets clobbered
+            // by the rebuild). By setting src first, rebuildSourceOptions
+            // sees our chosen srcId as prevVal and preserves it when the
+            // new option set arrives (it WILL be in the new set since it
+            // came from the stock list for this item).
+            setRowField(row, '.shr-line-kind', spec.kind || 'receive');
+            if (spec.srcId) setRowField(row, '.shr-line-src', spec.srcId);
+            setRowField(row, '.shr-line-item', spec.itemId || '');
+            setRowField(row, 'input[name="line_qty[]"]', spec.qty || '');
+            // syncRow needs to re-run after the kind change so the source
+            // dropdown state matches (greys out for receive lines).
+            syncRow(row);
+            return row;
+        };
+
+        body.querySelectorAll('tr.shr-line-row').forEach(wireRow);
+
+        // Pre-submit diagnostic. Logs the parallel-array contents to the
+        // browser console right before the form POSTs, so we can see
+        // what's actually being sent. Mirrored on the server side via
+        // error_log() so both sides can be cross-checked.
+        var mainForm = document.getElementById('shr-main-form');
+        if (mainForm) {
+            mainForm.addEventListener('submit', function () {
+                var k = mainForm.querySelectorAll('select[name="line_kind[]"]');
+                var i = mainForm.querySelectorAll('select[name="line_item_id[]"]');
+                var q = mainForm.querySelectorAll('input[name="line_qty[]"]');
+                var s = mainForm.querySelectorAll('select[name="line_src_location_id[]"]');
+                console.log('[shiprcpt submit] inputs in form:',
+                            'kinds=' + k.length,
+                            'items=' + i.length,
+                            'qtys=' + q.length,
+                            'srcs=' + s.length);
+                console.log('[shiprcpt submit] values:',
+                    Array.from(k).map(function (e) { return e.value; }).join(','),
+                    '|',
+                    Array.from(i).map(function (e) { return e.value; }).join(','),
+                    '|',
+                    Array.from(q).map(function (e) { return e.value; }).join(','),
+                    '|',
+                    Array.from(s).map(function (e) { return e.value; }).join(','));
+            });
+        }
+    })();
+
+    // Mode pill at top of form is auto-derived from the kinds of lines
+    // currently in the lines table. Re-run whenever a row is added,
+    // removed, or its kind dropdown changes.
+    (function () {
+        function recomputeModePill() {
+            var pill = document.getElementById('shr-mode-pill');
+            if (!pill) return;
+            var hasShip = false, hasRecv = false;
+            document.querySelectorAll('.shr-line-row .shr-line-kind').forEach(function (sel) {
+                // Skip rows that have no item selected — they're empty
+                // starter rows, not real lines and shouldn't influence
+                // mode derivation.
+                var row = sel.closest('tr');
+                var itemSel = row && row.querySelector('.shr-line-item');
+                if (itemSel && !itemSel.value) return;
+                var v = (sel.value || '').toLowerCase();
+                if (v === 'ship')    hasShip = true;
+                if (v === 'receive') hasRecv = true;
+            });
+            var label, cls, mode;
+            if (hasShip && hasRecv) { mode='both';    label='⇅ Ship & receive'; cls='pill pill-info'; }
+            else if (hasShip)       { mode='ship';    label='↑ Ship only';      cls='pill pill-warning'; }
+            else if (hasRecv)       { mode='receive'; label='↓ Receive only';   cls='pill pill-success'; }
+            else                    { mode='';        label='No lines yet';     cls='pill pill-neutral'; }
+            pill.textContent = label;
+            pill.className = cls;
+            pill.setAttribute('data-mode', mode);
+
+            // Toggle due-date visibility based on derived mode:
+            //   ship    → ship-due only
+            //   receive → recv-due only
+            //   both    → both
+            //   (none)  → show both as a default so user can still fill
+            //             them before adding lines, hidden again as soon
+            //             as the first line is added
+            var shipWrap = document.getElementById('shr-due-ship-wrap');
+            var recvWrap = document.getElementById('shr-due-recv-wrap');
+            if (shipWrap && recvWrap) {
+                if (mode === 'ship') {
+                    shipWrap.style.display = '';
+                    recvWrap.style.display = 'none';
+                } else if (mode === 'receive') {
+                    shipWrap.style.display = 'none';
+                    recvWrap.style.display = '';
+                } else {
+                    // 'both' or '' — show both
+                    shipWrap.style.display = '';
+                    recvWrap.style.display = '';
+                }
+            }
+        }
+        // Initial paint + listeners
+        recomputeModePill();
+        document.addEventListener('change', function (ev) {
+            if (ev.target && ev.target.classList && (
+                ev.target.classList.contains('shr-line-kind') ||
+                ev.target.classList.contains('shr-line-item')
+            )) {
+                recomputeModePill();
+            }
+        });
+        // Expose so the line-add/remove handlers can call us too.
+        window.__shrRecomputeModePill = recomputeModePill;
+    })();
+
+    // -----------------------------------------------------------------
+    // Phase C2 — vendor cascade.
+    // When the operator changes the vendor select, fetch the new
+    // vendor's contacts + addresses and rebuild the dropdowns, with
+    // the primary entries pre-selected per PRD §2.1.
+    // -----------------------------------------------------------------
+    (function () {
+        var vendorSel  = document.getElementById('f_vendor');
+        var contactSel = document.getElementById('f_vendor_contact');
+        var addressSel = document.getElementById('f_vendor_address');
+        if (!vendorSel || !contactSel || !addressSel) return;
+        var fetchUrl = <?= json_encode(url('/inventory_shiprcpt.php?action=vendor_data')) ?>;
+
+        function repopulate(sel, items, labelFn, autoPickPrimary) {
+            // Tear down any existing combobox wrapper first; combobox.js
+            // will re-attach when MagDynCombobox.initAll() runs.
+            sel.classList.remove('cb-bound', 'cb-native');
+            var wrap = sel.parentNode && sel.parentNode.classList && sel.parentNode.classList.contains('cb-wrap')
+                     ? sel.parentNode : null;
+            if (wrap && wrap.parentNode) { wrap.parentNode.insertBefore(sel, wrap); wrap.parentNode.removeChild(wrap); }
+
+            sel.innerHTML = '';
+            var ph = document.createElement('option');
+            ph.value = ''; ph.textContent = '— primary —';
+            sel.appendChild(ph);
+            var picked = null;
+            items.forEach(function (it) {
+                var o = document.createElement('option');
+                o.value = String(it.id);
+                o.textContent = labelFn(it);
+                if (autoPickPrimary && it.is_primary && picked === null) {
+                    o.selected = true; picked = it.id;
+                }
+                sel.appendChild(o);
+            });
+        }
+
+        vendorSel.addEventListener('change', function () {
+            var vid = parseInt(vendorSel.value || '0', 10);
+            if (!vid) {
+                repopulate(contactSel, [], function () { return ''; }, false);
+                repopulate(addressSel, [], function () { return ''; }, false);
+                return;
+            }
+            fetch(fetchUrl + '&vendor_id=' + vid, { credentials: 'same-origin' })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    var contacts  = (data && data.contacts)  || [];
+                    var addresses = (data && data.addresses) || [];
+                    repopulate(contactSel, contacts, function (c) {
+                        var label = (c.designation ? c.designation + ' ' : '') + (c.name || '');
+                        return label.trim() + (c.is_primary ? ' (primary)' : '');
+                    }, true);
+                    repopulate(addressSel, addresses, function (a) {
+                        var lbl = a.label || a.line1 || '';
+                        return lbl + (a.city ? ' · ' + a.city : '');
+                    }, true);
+                    if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                        window.MagDynCombobox.initAll();
+                    }
+                })
+                .catch(function (err) {
+                    console.warn('[shr vendor cascade] fetch failed:', err);
+                });
+        });
+    })();
+
+    // -----------------------------------------------------------------
+    // Add-receive-item panel logic.
+    //   1. User picks an item + qty (multiplier) + optional default src
+    //   2. Click "Load BOM →" → AJAX GET /inventory_shiprcpt.php?action=bom_for_receive_item
+    //   3. We render a small form (POST) with a checklist of BOM children
+    //   4. On submit, server appends one receive line for the parent + N
+    //      ship lines for the checked children; redirects back to edit.
+    // -----------------------------------------------------------------
+    (function () {
+        var btnLoad   = document.getElementById('shr-load-bom');
+        var itemSel   = document.getElementById('shr-recv-item');
+        var multInput = document.getElementById('shr-recv-mult');
+        var listHost  = document.getElementById('shr-bom-checklist');
+        if (!btnLoad || !itemSel || !listHost) return;
+
+        var shipmentId = <?= (int)$id ?>;
+        var csrfToken  = <?= json_encode(csrf_token()) ?>;
+        var commitUrl  = <?= json_encode(url('/inventory_shiprcpt.php?action=add_from_bom_checklist')) ?>;
+        var fetchUrl   = <?= json_encode(url('/inventory_shiprcpt.php?action=bom_for_receive_item')) ?>;
+
+        function fmt(n) {
+            // Trim trailing zeros and decimal point for display
+            return (Math.round(n * 1000) / 1000).toString();
+        }
+
+        function renderChecklist(data, multiplier) {
+            if (!data.ok) {
+                listHost.style.display = 'block';
+                listHost.innerHTML = '<p class="muted small" style="color:#b3261e;">Could not load BOM: '
+                                   + (data.reason || 'unknown error') + '</p>';
+                return;
+            }
+            var p = data.parent;
+            var kids = data.children || [];
+            if (!kids.length) {
+                // Parent has no BOM. Still allow adding a receive-only line.
+                // Render as <div> (not <form>) for the same nested-form
+                // reason as the main checklist below.
+                listHost.style.display = 'block';
+                listHost.innerHTML =
+                    '<p class="muted small">This item has no BOM. A receive line will still be added; no ship lines.</p>' +
+                    '<div id="shr-bom-form-noBom" style="margin-top:8px;">' +
+                    '<button type="button" class="btn btn-primary btn-sm" id="shr-bom-add-noBom">Add to list</button> ' +
+                    '<button type="button" class="btn btn-ghost btn-sm" id="shr-bom-cancel">Cancel</button>' +
+                    '</div>';
+                document.getElementById('shr-bom-cancel').addEventListener('click', function () {
+                    listHost.style.display = 'none';
+                    listHost.innerHTML = '';
+                });
+                document.getElementById('shr-bom-add-noBom').addEventListener('click', function () {
+                    var panel = document.getElementById('shr-bom-form-noBom');
+                    if (shipmentId === 0) {
+                        bufferLinesClientSide(p, [], multiplier, panel);
+                    } else {
+                        submitChecklistToServer(p, [], multiplier, panel);
+                    }
+                });
+                return;
+            }
+            // Render the checklist as a <div> (NOT a <form>) so the
+            // browser doesn't auto-close the parent main-form at the
+            // checklist's opening tag — HTML disallows nested forms,
+            // and nesting orphans every element after the inner </form>
+            // from the parent form, breaking the eventual save POST.
+            // The "Add to list" button is type=button; the click handler
+            // either runs the client-side buffer (new shipments) or
+            // builds a hidden form on the fly and submits it (existing
+            // drafts).
+            var html = '';
+            html += '<p class="muted small">BOM of <strong>' + p.code + '</strong> — ' + p.label
+                  + ' &nbsp;(receive qty <strong>' + fmt(multiplier) + '</strong> ' + (p.uom_label || '') + ')</p>';
+            html += '<div id="shr-bom-form">';
+            html += '<table class="data-table" style="margin:6px 0;">';
+            html += '<thead><tr>'
+                  + '<th style="width:40px;">Ship</th>'
+                  + '<th>Code</th><th>Name</th>'
+                  + '<th class="r" style="width:90px;">BOM qty</th>'
+                  + '<th class="r" style="width:110px;">Ship qty</th>'
+                  + '<th style="width:60px;">UoM</th>'
+                  + '<th style="width:220px;">Source location</th>'
+                  + '</tr></thead><tbody>';
+            kids.forEach(function (c) {
+                var shipQty = c.bom_qty * multiplier;
+                var srcHtml = '';
+                var stockLocs = c.stock_by_loc || [];
+                if (stockLocs.length === 0) {
+                    srcHtml = '<span class="pill pill-warn" title="No stock available for this item">⚠ no stock</span>'
+                            + '<input type="hidden" name="child_src_' + c.id + '" value="0">';
+                } else {
+                    srcHtml += '<select name="child_src_' + c.id + '" class="shr-bom-src" '
+                             + 'style="width:100%;">';
+                    srcHtml += '<option value="">— pick source —</option>';
+                    stockLocs.forEach(function (loc) {
+                        srcHtml += '<option value="' + loc.location_id + '">'
+                                 + loc.name + ' (' + fmt(loc.qty) + ' ' + (c.uom_label || '') + ')'
+                                 + '</option>';
+                    });
+                    srcHtml += '</select>';
+                }
+                var disabledHint = stockLocs.length === 0
+                    ? ' title="No stock anywhere — uncheck to skip this ship line"'
+                    : '';
+                html += '<tr data-bom-row="' + c.id + '">';
+                html += '<td><input type="checkbox" name="child_include[]" value="' + c.id + '"'
+                      + (stockLocs.length === 0 ? '' : ' checked') + disabledHint + '></td>';
+                html += '<td><code>' + c.code + '</code></td>';
+                html += '<td>' + c.label + '</td>';
+                html += '<td class="r">' + fmt(c.bom_qty) + '</td>';
+                html += '<td class="r"><input type="number" name="child_qty_' + c.id + '" value="' + fmt(shipQty)
+                      +    '" step="0.001" min="0" style="width:100%;"></td>';
+                html += '<td class="muted small">' + (c.uom_label || '') + '</td>';
+                html += '<td>' + srcHtml + '</td>';
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            html += '<div style="margin-top:6px; display:flex; gap:8px;">';
+            html += '<button type="button" class="btn btn-primary btn-sm" id="shr-bom-add">Add to list</button> ';
+            html += '<button type="button" class="btn btn-ghost btn-sm" id="shr-bom-cancel">Cancel</button>';
+            html += '<span class="muted small" style="margin-left:auto; align-self:center;">'
+                  + 'Uncheck rows to skip · pick a source location for each ship line (only locations with stock are shown).</span>';
+            html += '</div>';
+            html += '</div>';
+            listHost.style.display = 'block';
+            listHost.innerHTML = html;
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                window.MagDynCombobox.initAll(listHost);
+            }
+            document.getElementById('shr-bom-cancel').addEventListener('click', function () {
+                listHost.style.display = 'none';
+                listHost.innerHTML = '';
+            });
+            // "Add to list" click handler. Two paths:
+            //   - New shipment (shipmentId === 0): buffer rows client-side
+            //     into the manual lines table; nothing posts yet.
+            //   - Existing draft (shipmentId > 0): build a temp <form>
+            //     OUTSIDE the main form, mirror this panel's inputs onto
+            //     it, submit. Server adds rows + redirects back to edit.
+            document.getElementById('shr-bom-add').addEventListener('click', function () {
+                var panel = document.getElementById('shr-bom-form');
+                if (shipmentId === 0) {
+                    bufferLinesClientSide(p, kids, multiplier, panel);
+                } else {
+                    submitChecklistToServer(p, kids, multiplier, panel);
+                }
+            });
+        }
+
+        // Existing-draft submit path. Constructs a hidden <form> as a
+        // sibling of the main shipment form (NOT inside it), populates
+        // it with the checklist's current state, and submits to the
+        // server's add_from_bom_checklist endpoint. Must be a sibling
+        // because nesting forms breaks the main shipment form.
+        function submitChecklistToServer(parent, kids, multiplier, panel) {
+            var f = document.createElement('form');
+            f.method = 'post';
+            f.action = commitUrl;
+            f.style.display = 'none';
+            // Append BEFORE the main form so it's a sibling, not nested.
+            var mainForm = document.getElementById('shr-main-form');
+            if (mainForm && mainForm.parentNode) {
+                mainForm.parentNode.insertBefore(f, mainForm);
+            } else {
+                document.body.appendChild(f);
+            }
+            function addHidden(name, value) {
+                var i = document.createElement('input');
+                i.type = 'hidden'; i.name = name; i.value = String(value);
+                f.appendChild(i);
+            }
+            addHidden('csrf_token', csrfToken);
+            addHidden('id', shipmentId);
+            addHidden('parent_item_id', parent.id);
+            addHidden('parent_qty', multiplier);
+            // Mirror every named input in the panel onto the temp form
+            // (checkboxes, qty inputs, src selects). querySelectorAll
+            // returns elements in document order so parallel arrays
+            // align correctly.
+            panel.querySelectorAll('[name]').forEach(function (el) {
+                if (el.type === 'checkbox') {
+                    if (el.checked) addHidden(el.name, el.value);
+                } else {
+                    addHidden(el.name, el.value);
+                }
+            });
+            f.submit();
+        }
+
+        // Client-side buffering path (new shipments). Reads the checklist
+        // state from the rendered panel, calls __shrAppendLineRow for the
+        // parent + each checked child, then clears the panel.
+        //
+        // Each ship line gets its source location from the per-row
+        // child_src_<id> select that the checklist renders — only
+        // locations with positive stock for THAT child are offered.
+        function bufferLinesClientSide(parent, kids, multiplier, form) {
+            if (!window.__shrAppendLineRow) {
+                listHost.innerHTML = '<p class="muted small" style="color:#b3261e;">'
+                                   + 'Lines table not ready. Reload the page and try again.</p>';
+                return;
+            }
+            // 1. Receive line for the parent
+            window.__shrAppendLineRow({
+                kind:   'receive',
+                itemId: parent.id,
+                qty:    multiplier,
+            });
+            // 2. Ship lines for each CHECKED child
+            var checkedIds = {};
+            form.querySelectorAll('input[name="child_include[]"]:checked').forEach(function (cb) {
+                checkedIds[cb.value] = true;
+            });
+            var shipLinesAdded = 0;
+            var missingSrc = [];
+            kids.forEach(function (c) {
+                if (!checkedIds[String(c.id)]) return;
+                var qtyInput = form.querySelector('input[name="child_qty_' + c.id + '"]');
+                var srcInput = form.querySelector('[name="child_src_' + c.id + '"]');
+                var qty   = qtyInput ? parseFloat(qtyInput.value || '0') : (c.bom_qty * multiplier);
+                var srcId = srcInput ? parseInt(srcInput.value || '0', 10) : 0;
+                console.log('[shr buffer] child', c.id, c.code,
+                            'srcInput=', srcInput,
+                            'srcInput.value=', srcInput ? srcInput.value : '(no input)',
+                            'parsed srcId=', srcId);
+                if (!qty || qty <= 0) return;
+                if (!srcId) {
+                    missingSrc.push(c.code);
+                    return;
+                }
+                window.__shrAppendLineRow({
+                    kind:   'ship',
+                    itemId: c.id,
+                    qty:    qty,
+                    srcId:  srcId,
+                });
+                shipLinesAdded++;
+            });
+            if (missingSrc.length > 0) {
+                listHost.style.display = 'block';
+                var existingForm = document.getElementById('shr-bom-form');
+                if (existingForm) {
+                    // Restore the form and show an error banner above it
+                    var msg = document.createElement('p');
+                    msg.className = 'muted small';
+                    msg.style.color = '#b3261e';
+                    msg.textContent = '⚠ Pick a source location for: ' + missingSrc.join(', ');
+                    existingForm.parentNode.insertBefore(msg, existingForm);
+                }
+                return;
+            }
+            // 3. Sync mode pill + finalize: reset panel + flash feedback
+            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                window.MagDynCombobox.initAll();
+            }
+            if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
+            listHost.style.display = 'block';
+            listHost.innerHTML = '<p class="muted small" style="color:var(--success, #1e7b30);">'
+                               + '✓ Added receive line for <strong>' + parent.code + '</strong>'
+                               + (shipLinesAdded > 0
+                                   ? ' along with ' + shipLinesAdded + ' ship line' + (shipLinesAdded === 1 ? '' : 's')
+                                   : '')
+                               + '. They\'ll save when you click Create shipment.</p>';
+            // Reset the picker so the user can add another receive item
+            itemSel.selectedIndex = 0;
+            multInput.value = '1';
+            // Auto-hide the success message after 4s
+            setTimeout(function () {
+                if (listHost.innerHTML.indexOf('✓ Added') !== -1) {
+                    listHost.style.display = 'none';
+                    listHost.innerHTML = '';
+                }
+            }, 4000);
+        }
+
+        btnLoad.addEventListener('click', function () {
+            var itemId = parseInt(itemSel.value || '0', 10);
+            var mult   = parseFloat(multInput.value || '0');
+            if (!itemId) { itemSel.focus(); return; }
+            if (!mult || mult <= 0) { multInput.focus(); return; }
+            listHost.style.display = 'block';
+            listHost.innerHTML = '<p class="muted small">Loading BOM…</p>';
+            var url = fetchUrl + '&item_id=' + itemId;
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+                if (xhr.status !== 200) {
+                    listHost.innerHTML = '<p class="muted small" style="color:#b3261e;">Failed to load BOM (HTTP '
+                                       + xhr.status + '). URL: <code>' + url + '</code></p>';
+                    return;
+                }
+                try {
+                    var data = JSON.parse(xhr.responseText);
+                    renderChecklist(data, mult);
+                } catch (e) {
+                    var snippet = (xhr.responseText || '').slice(0, 200);
+                    listHost.innerHTML = '<p class="muted small" style="color:#b3261e;">Bad JSON response: '
+                                       + e.message + '<br>Response starts with: <code>'
+                                       + snippet.replace(/</g, '&lt;') + '</code></p>';
+                }
+            };
+            xhr.send();
+        });
+    })();
+    </script>
+
+    <?php require __DIR__ . '/includes/footer.php'; exit; }
+
+// ----------------------------------------------------------------
+// VIEW — detail page
+// ----------------------------------------------------------------
+if ($action === 'view') {
+    $id = (int)input('id', 0);
+    $sh = db_one('SELECT * FROM inv_shipments WHERE id = ?', [$id]);
+    if (!$sh) {
+        flash_set('error', 'Shipment not found.');
+        redirect(url('/inventory_shiprcpt.php'));
+    }
+    $vendor   = db_one('SELECT code, name FROM vendors WHERE id = ?', [(int)$sh['vendor_id']]);
+    $approver = $sh['approved_by'] ? db_one('SELECT full_name FROM users WHERE id = ?', [(int)$sh['approved_by']]) : null;
+    $shipper  = $sh['shipped_by']  ? db_one('SELECT full_name FROM users WHERE id = ?', [(int)$sh['shipped_by']])  : null;
+    $lines = db_all(
+        'SELECT sl.*, i.code AS item_code,
+                COALESCE(NULLIF(i.short_description, ""), i.name) AS item_label,
+                i.uom AS item_uom,
+                l.name AS src_location_name
+           FROM inv_shipment_lines sl
+      LEFT JOIN inv_items i ON i.id = sl.item_id
+      LEFT JOIN locations l ON l.id = sl.src_location_id
+          WHERE sl.shipment_id = ?
+          ORDER BY sl.line_kind, sl.sort_order, sl.id',
+        [$id]
+    );
+    $receipts = db_all(
+        'SELECT r.*, sl.item_id, i.code AS item_code,
+                COALESCE(NULLIF(i.short_description, ""), i.name) AS item_label,
+                l.name AS loc_name, u.full_name AS rcvd_by
+           FROM inv_receipts r
+      LEFT JOIN inv_shipment_lines sl ON sl.id = r.shipment_line_id
+      LEFT JOIN inv_items i           ON i.id  = sl.item_id
+      LEFT JOIN locations l           ON l.id  = r.dst_location_id
+      LEFT JOIN users u               ON u.id  = r.created_by
+          WHERE r.shipment_id = ?
+          ORDER BY r.receipt_date DESC, r.id DESC',
+        [$id]
+    );
+    $locations = db_all('SELECT id, name FROM locations WHERE is_active = 1 ORDER BY name');
+
+    $hasShipSide    = in_array($sh['mode'], shr_modes_with_ship(), true);
+    $hasReceiveSide = in_array($sh['mode'], shr_modes_with_receive(), true);
+
+    $statusPill = '<span class="pill pill-'
+        . ($sh['status'] === 'closed' ? 'active'
+            : ($sh['status'] === 'cancelled' ? 'danger'
+                : ($sh['status'] === 'shipped' ? 'info' : 'neutral')))
+        . '">' . h($sh['status']) . '</span>';
+
+    $page_title  = 'Shipment ' . $sh['ship_no'];
+    $page_module = 'inventory_shiprcpt';
+    require __DIR__ . '/includes/header.php';
+
+    // Header action bar
+    $actions = '';
+    if ($canManage) {
+        if ($sh['status'] === 'draft') {
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=approve')) . '">'
+                      . csrf_field() . '<input type="hidden" name="id" value="' . (int)$id . '">'
+                      . '<button type="submit" class="btn btn-primary btn-sm">✓ Approve</button></form> ';
+            $actions .= '<a class="btn btn-ghost btn-sm" href="' . h(url('/inventory_shiprcpt.php?action=edit&id=' . $id)) . '">✎ Edit</a> ';
+        }
+        if ($sh['status'] === 'approved' && $hasShipSide) {
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=ship')) . '"'
+                      . ' onsubmit="var d = prompt(\'Actual ship date (YYYY-MM-DD)?\', \'' . date('Y-m-d') . '\');'
+                      . ' if (d === null) return false; this.elements.actual_ship_date.value = d; return confirm(\'Post ship-out? Stock will leave the source locations.\');">'
+                      . csrf_field() . '<input type="hidden" name="id" value="' . (int)$id . '">'
+                      . '<input type="hidden" name="actual_ship_date" value="">'
+                      . '<button type="submit" class="btn btn-primary btn-sm">📦 Mark shipped</button></form> ';
+        }
+        if (in_array($sh['status'], ['approved', 'shipped'], true)) {
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=close')) . '"'
+                      . ' onsubmit="return confirm(\'Close this shipment? No further movements will be allowed.\');">'
+                      . csrf_field() . '<input type="hidden" name="id" value="' . (int)$id . '">'
+                      . '<button type="submit" class="btn btn-ghost btn-sm">🔒 Close</button></form> ';
+        }
+        // Phase D1 — Amend opens the form unlocked + flagged so save
+        // creates a new PO version. Available on any past-draft, non-
+        // cancelled shipment. (Drafts use Edit instead.)
+        if (in_array($sh['status'], ['approved', 'shipped', 'closed'], true)) {
+            $actions .= '<a class="btn btn-ghost btn-sm" href="'
+                      . h(url('/inventory_shiprcpt.php?action=amend&id=' . $id))
+                      . '" title="Edit the shipment and issue a new PO version. The previous PO stays intact for audit.">✎ Amend</a> ';
+        }
+        if (in_array($sh['status'], ['draft', 'approved'], true)) {
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=cancel')) . '"'
+                      . ' onsubmit="return confirm(\'Cancel this shipment?\');">'
+                      . csrf_field() . '<input type="hidden" name="id" value="' . (int)$id . '">'
+                      . '<button type="submit" class="btn btn-ghost btn-sm">✗ Cancel</button></form> ';
+        }
+        if (in_array($sh['status'], ['draft', 'cancelled'], true)) {
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=delete')) . '"'
+                      . ' onsubmit="return confirm(\'Delete this shipment permanently?\');">'
+                      . csrf_field() . '<input type="hidden" name="id" value="' . (int)$id . '">'
+                      . '<button type="submit" class="btn btn-danger btn-sm">🗑 Delete</button></form>';
+        }
+    }
+    ?>
+    <?= form_toolbar([
+        'back_href'    => url('/inventory_shiprcpt.php'),
+        'back_label'   => 'Back to list',
+        'title'        => 'Shipment ' . h($sh['ship_no']),
+        'actions_html' => $actions,
+    ]) ?>
+
+    <?php
+    // Phase D1 — Purchase Order chain card. Shows every PO version
+    // issued against this shipment. v1 from the first save; vN from
+    // subsequent Amend actions. The print and (Phase D2) email
+    // buttons are per-version since each PO is a distinct artifact.
+    $poChain = po_version_chain((int)$id);
+    if ($poChain):
+        $canPrintPo = permission_check('purchase_orders', 'print');
+    ?>
+        <div class="card" style="padding: 14px 18px; margin-bottom: 14px;">
+            <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:8px;">
+                <strong>Purchase Orders</strong>
+                <span class="muted small"><?= count($poChain) ?> version<?= count($poChain) === 1 ? '' : 's' ?></span>
+            </div>
+            <table class="data-table" style="margin: 0;">
+                <thead><tr>
+                    <th style="width: 60px;">Ver</th>
+                    <th>PO No</th>
+                    <th>Issued</th>
+                    <th>By</th>
+                    <th class="r">Actions</th>
+                </tr></thead>
+                <tbody>
+                    <?php foreach (array_reverse($poChain) as $i => $p):
+                        $isLatest = ($i === 0);
+                    ?>
+                        <tr<?= $isLatest ? ' style="font-weight:600;"' : '' ?>>
+                            <td>
+                                v<?= (int)$p['version'] ?>
+                                <?php if ($isLatest && count($poChain) > 1): ?>
+                                    <span class="pill pill-info" style="margin-left:4px;">latest</span>
+                                <?php elseif (!$isLatest): ?>
+                                    <span class="pill pill-muted" style="margin-left:4px;">superseded</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <a href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$p['id'])) ?>">
+                                    <code><?= h($p['po_no']) ?></code>
+                                </a>
+                            </td>
+                            <td><?= h($p['created_at']) ?></td>
+                            <td><?= h($p['created_by_name'] ?: '—') ?></td>
+                            <td class="r nowrap">
+                                <a class="btn btn-icon" href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$p['id'])) ?>" title="View">👁</a>
+                                <?php if ($canPrintPo): ?>
+                                    <a class="btn btn-icon" target="_blank" href="<?= h(url('/purchase_orders.php?action=print&id=' . (int)$p['id'])) ?>" title="Print">🖨</a>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    <?php endif; ?>
+
+    <div class="card" style="padding: 18px; margin-bottom: 14px;">
+        <div class="grid-2col">
+            <div><div class="muted small">Ship #</div><strong><?= h($sh['ship_no']) ?></strong></div>
+            <div><div class="muted small">Status</div><?= $statusPill ?></div>
+            <div><div class="muted small">Mode</div>
+                <?= $sh['mode'] === 'both' ? 'Ship & receive' : ($sh['mode'] === 'ship' ? 'Ship only' : 'Receive only') ?>
+                <?= $sh['is_rework'] ? ' <span class="pill pill-warning">rework</span>' : '' ?>
+            </div>
+            <div><div class="muted small">Vendor</div><?= $vendor ? '<code>' . h($vendor['code']) . '</code> ' . h($vendor['name']) : '—' ?></div>
+            <?php if ($hasShipSide): ?>
+                <div>
+                    <div class="muted small">Ship due / actual</div>
+                    <?= h($sh['ship_due_date'] ?: '—') ?>
+                    <?php if ($sh['actual_ship_date']): ?>
+                        → <strong><?= h($sh['actual_ship_date']) ?></strong>
+                        <?php
+                        $due = $sh['ship_due_date'];
+                        $actual = $sh['actual_ship_date'];
+                        if ($due && $actual) {
+                            $delta = (strtotime($actual) - strtotime($due)) / 86400;
+                            if ($delta > 0)      echo ' <span class="pill pill-danger">' . (int)$delta . 'd late</span>';
+                            elseif ($delta < 0)  echo ' <span class="pill pill-active">' . (int)abs($delta) . 'd early</span>';
+                            else                 echo ' <span class="pill pill-active">on time</span>';
+                        }
+                        ?>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
+            <?php if ($hasReceiveSide): ?>
+                <div><div class="muted small">Receive due</div><?= h($sh['receive_due_date'] ?: '—') ?></div>
+            <?php endif; ?>
+            <?php if ($approver): ?>
+                <div><div class="muted small">Approved by</div><?= h($approver['full_name']) ?> · <?= h(substr((string)$sh['approved_at'], 0, 16)) ?></div>
+            <?php endif; ?>
+            <?php if ($shipper): ?>
+                <div><div class="muted small">Shipped by</div><?= h($shipper['full_name']) ?> · <?= h(substr((string)$sh['shipped_at'], 0, 16)) ?></div>
+            <?php endif; ?>
+            <?php if ($sh['ref_doc']): ?>
+                <div><div class="muted small">Ref</div><?= h($sh['ref_doc']) ?></div>
+            <?php endif; ?>
+        </div>
+        <?php if ($sh['notes']): ?>
+            <div style="margin-top: 14px;"><div class="muted small">Notes</div><div style="white-space: pre-wrap;"><?= h($sh['notes']) ?></div></div>
+        <?php endif; ?>
+    </div>
+
+    <!-- Lines -->
+    <div class="card" style="padding: 18px; margin-bottom: 14px;">
+        <h3 style="margin: 0 0 10px;">Line items</h3>
+        <?php if (empty($lines)): ?>
+            <p class="muted empty">No lines.</p>
+        <?php else: ?>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Direction</th>
+                        <th>Item</th>
+                        <th class="r">Planned</th>
+                        <th class="r">Shipped</th>
+                        <th class="r">Received</th>
+                        <th>Source</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($lines as $L):
+                    $kindBadge = $L['line_kind'] === 'ship'
+                        ? '<span class="pill pill-info">ship</span>'
+                        : '<span class="pill pill-neutral">receive</span>';
+                ?>
+                    <tr>
+                        <td><?= $kindBadge ?></td>
+                        <td>(<?= h($L['item_code']) ?>)-<?= h($L['item_label']) ?></td>
+                        <td class="r"><?= h(rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.')) ?></td>
+                        <td class="r">
+                            <?php if ($L['line_kind'] === 'ship'): ?>
+                                <?= h(rtrim(rtrim(number_format((float)$L['qty_shipped'], 3, '.', ''), '0'), '.')) ?>
+                            <?php else: ?>
+                                <span class="muted">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="r">
+                            <?php if ($L['line_kind'] === 'receive'): ?>
+                                <?= h(rtrim(rtrim(number_format((float)$L['qty_received'], 3, '.', ''), '0'), '.')) ?>
+                                <?php
+                                $rem = (float)$L['qty_planned'] - (float)$L['qty_received'];
+                                if ($rem > 0.0001) echo ' <span class="muted small">(' . h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) . ' open)</span>';
+                                else echo ' <span class="pill pill-active">full</span>';
+                                ?>
+                            <?php else: ?>
+                                <span class="muted">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php if ($L['line_kind'] === 'ship'): ?>
+                                <?= h($L['src_location_name'] ?: '—') ?>
+                            <?php else: ?>
+                                <span class="muted">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="muted small"><?= h($L['notes'] ?: '') ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+    </div>
+
+    <!-- Receipts -->
+    <?php if ($hasReceiveSide): ?>
+        <div class="card" style="padding: 18px; margin-bottom: 14px;">
+            <h3 style="margin: 0 0 10px;">Receipt history</h3>
+            <?php if (empty($receipts)): ?>
+                <p class="muted empty" style="text-align: left; padding: 8px 0;">No receipts recorded yet.</p>
+            <?php else: ?>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Receipt #</th>
+                            <th>Item</th>
+                            <th class="r">Qty</th>
+                            <th class="r">Linked</th>
+                            <th class="r">Unlinked</th>
+                            <th>Receipt date</th>
+                            <th>Due</th>
+                            <th class="r">Lateness</th>
+                            <th>Location</th>
+                            <th>By</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ($receipts as $R):
+                        $due = $R['due_date_snapshot'];
+                        $rd  = $R['receipt_date'];
+                        $lateness = ($due && $rd) ? (int)((strtotime($rd) - strtotime($due)) / 86400) : null;
+                        // Per-receipt linked/unlinked qty against invoices.
+                        // Helpers from includes/_invoice_links.php.
+                        $rcvLinked   = invoice_link_txn_qty_linked('inv', (int)$R['id']);
+                        $rcvUnlinked = invoice_link_txn_qty_unlinked('inv', (int)$R['id']);
+                        $fmtQty = function ($v) {
+                            return rtrim(rtrim(number_format((float)$v, 3, '.', ''), '0'), '.');
+                        };
+                        ?>
+                        <tr>
+                            <td><code><?= h($R['receipt_no']) ?></code></td>
+                            <td>(<?= h($R['item_code']) ?>)-<?= h($R['item_label']) ?></td>
+                            <td class="r"><?= h($fmtQty($R['qty_received'])) ?></td>
+                            <td class="r"><?php if ($rcvLinked > 0): ?><strong style="color:#059669"><?= h($fmtQty($rcvLinked)) ?></strong><?php else: ?><span class="muted">0</span><?php endif; ?></td>
+                            <td class="r"><?php if ($rcvUnlinked > 0): ?><strong style="color:#b45309"><?= h($fmtQty($rcvUnlinked)) ?></strong><?php else: ?><span class="muted">0</span><?php endif; ?></td>
+                            <td><?= h($rd) ?></td>
+                            <td><?= h($due ?: '—') ?></td>
+                            <td class="r">
+                                <?php if ($lateness === null): ?>
+                                    <span class="muted">—</span>
+                                <?php elseif ($lateness > 0): ?>
+                                    <span class="pill pill-danger"><?= $lateness ?>d late</span>
+                                <?php elseif ($lateness < 0): ?>
+                                    <span class="pill pill-active"><?= abs($lateness) ?>d early</span>
+                                <?php else: ?>
+                                    <span class="pill pill-active">on time</span>
+                                <?php endif; ?>
+                            </td>
+                            <td><?= h($R['loc_name'] ?: '—') ?></td>
+                            <td><?= h($R['rcvd_by'] ?: '—') ?></td>
+                            <td class="muted small"><?= h($R['notes'] ?: '') ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+
+            <?php if ($canManage && in_array($sh['status'], ['approved', 'shipped'], true)): ?>
+                <h4 style="margin: 18px 0 6px;">Record a receipt</h4>
+                <p class="muted small">
+                    Pick a receive-line, enter the qty + actual date + the bin you're putting it in. Partial
+                    receipts are fine — record additional events as more material arrives.
+                </p>
+                <form method="post" action="<?= h(url('/inventory_shiprcpt.php?action=receive_save')) ?>"
+                      style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1.5fr 2fr auto; gap: 10px; align-items: end;">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="id" value="<?= (int)$id ?>">
+                    <div class="field">
+                        <label>Receive line</label>
+                        <select name="shipment_line_id" required>
+                            <option value="">—</option>
+                            <?php foreach ($lines as $L):
+                                if ($L['line_kind'] !== 'receive') continue;
+                                $rem = (float)$L['qty_planned'] - (float)$L['qty_received'];
+                            ?>
+                                <option value="<?= (int)$L['id'] ?>">
+                                    <?= h($L['item_code']) ?> — open: <?= h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) ?> <?= h($L['item_uom']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label>Qty</label>
+                        <input type="number" step="0.001" min="0.001" name="qty_received" required placeholder="0">
+                    </div>
+                    <div class="field">
+                        <label>Price (each)</label>
+                        <input type="number" step="0.01" min="0" name="price" placeholder="0.00">
+                    </div>
+                    <div class="field">
+                        <label>GST %</label>
+                        <input type="number" step="0.01" min="0" max="100" name="gst_pct" placeholder="18">
+                    </div>
+                    <div class="field">
+                        <label>Receipt date</label>
+                        <input type="date" name="receipt_date" value="<?= h(date('Y-m-d')) ?>" required>
+                    </div>
+                    <div class="field">
+                        <label>Destination</label>
+                        <div class="muted small" style="padding: 6px 0;">
+                            All receipts land at <strong>LOC-QCH</strong> (Quality Check Hold)
+                            pending inspection. The store team routes from there once the
+                            inspection is approved.
+                        </div>
+                        <input type="hidden" name="dst_location_id" value="">
+                    </div>
+                    <div class="field">
+                        <label>Notes</label>
+                        <input type="text" name="notes" maxlength="255">
+                    </div>
+                    <div>
+                        <button type="submit" class="btn btn-primary">Record</button>
+                    </div>
+                </form>
+            <?php endif; ?>
+        </div>
+    <?php endif; ?>
+
+    <?php
+    if (function_exists('notes_render')) {
+        notes_render('shiprcpt', $id, 'inline');
+    }
+    if (function_exists('notes_attachment_preview_assets')) {
+        notes_attachment_preview_assets();
+    }
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+// ----------------------------------------------------------------
+// SHIPMENTS LIST — one row per inv_shipments header
+// ----------------------------------------------------------------
+// Browse view at the shipment-header granularity. Useful for finding
+// drafts awaiting approval, in-flight shipments, completed batches.
+// Sibling to the txn-history (event-level) view; both are reachable
+// from the sidebar.
+// ----------------------------------------------------------------
+if ($action === 'shipments_list') {
+    // Legacy URL — the dedicated shipment-header list has been folded
+    // into the default unified feed. Keep the action understood so
+    // bookmarks / sidebar links don't 404, just redirect.
+    redirect(url('/inventory_shiprcpt.php'));
+}
+
+
+
+// ----------------------------------------------------------------
+// UNIFIED LIST (default) — one row per event AND per zero-event shipment
+// ----------------------------------------------------------------
+// Combines the previous event-level view with the previous shipments
+// list into a single feed. Each row is one of:
+//
+//   1. Receipt event    — inv_receipts row (material arrived).
+//      direction='receive'.
+//   2. Ship-out event   — inv_shipment_lines line_kind='ship', on a
+//      shipment in status shipped/closed. direction='ship_out'.
+//   3. Planned (no event yet) — a shipment row that has no receipt
+//      rows and no posted ship lines yet. One row per such shipment.
+//      direction='planned'. Lets drafts and approved-but-not-shipped
+//      shipments appear in the same feed; previously they were only
+//      visible via the dedicated shipments_list page that this view
+//      replaces.
+//
+// All three branches project a uniform column set including shipment
+// header context (status, mode, ship/receive dues, line count,
+// receipt count). The header columns repeat across event rows that
+// belong to the same shipment — that's expected, and the operator
+// can hide any column they don't need via the Phase A datatable
+// preferences.
+// ----------------------------------------------------------------
+
+$baseUnion = "
+    (
+      -- Branch 1: receipt events
+      SELECT
+          CONCAT('R', r.id)                    AS event_uid,
+          'receive'                            AS direction,
+          r.receipt_date                       AS event_date,
+          r.created_at                         AS event_at,
+          r.id                                 AS receipt_id,
+          NULL                                 AS ship_line_id,
+          sh.id                                AS shipment_id,
+          sh.ship_no                           AS ship_no,
+          sh.status                            AS sh_status,
+          sh.mode                              AS sh_mode,
+          sh.ship_due_date                     AS sh_ship_due,
+          sh.receive_due_date                  AS sh_recv_due,
+          sh.is_rework                         AS sh_is_rework,
+          v.code                               AS vendor_code,
+          v.name                               AS vendor_name,
+          i.id                                 AS item_id,
+          i.code                               AS item_code,
+          COALESCE(NULLIF(i.short_description, ''), i.name) AS item_name,
+          r.qty_received                       AS qty,
+          sl.qty_planned                       AS line_qty_planned,
+          l.name                               AS location_name,
+          l.code                               AS location_code,
+          u.full_name                          AS actor_name,
+          r.notes                              AS notes,
+          COALESCE(
+              (SELECT SUM(il.qty) FROM invoice_lines il WHERE il.inv_receipt_id = r.id),
+              0
+          )                                    AS inv_linked_qty,
+          (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+        FROM inv_receipts r
+        JOIN inv_shipments sh        ON sh.id = r.shipment_id
+        JOIN inv_shipment_lines sl   ON sl.id = r.shipment_line_id
+   LEFT JOIN inv_items i             ON i.id  = sl.item_id
+   LEFT JOIN vendors v               ON v.id  = sh.vendor_id
+   LEFT JOIN locations l             ON l.id  = r.dst_location_id
+   LEFT JOIN users u                 ON u.id  = r.created_by
+
+      UNION ALL
+
+      -- Branch 2: ship-out events
+      SELECT
+          CONCAT('S', sl.id)                   AS event_uid,
+          'ship_out'                           AS direction,
+          sh.actual_ship_date                  AS event_date,
+          sh.shipped_at                        AS event_at,
+          NULL                                 AS receipt_id,
+          sl.id                                AS ship_line_id,
+          sh.id                                AS shipment_id,
+          sh.ship_no                           AS ship_no,
+          sh.status                            AS sh_status,
+          sh.mode                              AS sh_mode,
+          sh.ship_due_date                     AS sh_ship_due,
+          sh.receive_due_date                  AS sh_recv_due,
+          sh.is_rework                         AS sh_is_rework,
+          v.code                               AS vendor_code,
+          v.name                               AS vendor_name,
+          i.id                                 AS item_id,
+          i.code                               AS item_code,
+          COALESCE(NULLIF(i.short_description, ''), i.name) AS item_name,
+          sl.qty_shipped                       AS qty,
+          sl.qty_planned                       AS line_qty_planned,
+          l.name                               AS location_name,
+          l.code                               AS location_code,
+          u.full_name                          AS actor_name,
+          sl.notes                             AS notes,
+          0                                    AS inv_linked_qty,
+          (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+        FROM inv_shipment_lines sl
+        JOIN inv_shipments sh        ON sh.id = sl.shipment_id
+   LEFT JOIN inv_items i             ON i.id  = sl.item_id
+   LEFT JOIN vendors v               ON v.id  = sh.vendor_id
+   LEFT JOIN locations l             ON l.id  = sl.src_location_id
+   LEFT JOIN users u                 ON u.id  = sh.shipped_by
+       WHERE sl.line_kind = 'ship'
+         AND sl.qty_shipped > 0
+         AND sh.status IN ('shipped', 'closed')
+
+      UNION ALL
+
+      -- Branch 3: per-line planned rows. One row for each shipment
+      -- LINE that has no events recorded against it yet:
+      --   - receive lines with zero receipts posted
+      --   - ship lines with qty_shipped = 0
+      -- Once a line accrues an event, it disappears from this branch
+      -- and surfaces via branch 1 (receipt) or branch 2 (ship-out).
+      -- This way a 3-line shipment with no activity emits 3 rows,
+      -- not one collapsed N-more entry.
+      SELECT
+          CONCAT('P', sl.id)                   AS event_uid,
+          'planned'                            AS direction,
+          NULL                                 AS event_date,
+          sh.created_at                        AS event_at,
+          NULL                                 AS receipt_id,
+          NULL                                 AS ship_line_id,
+          sh.id                                AS shipment_id,
+          sh.ship_no                           AS ship_no,
+          sh.status                            AS sh_status,
+          sh.mode                              AS sh_mode,
+          sh.ship_due_date                     AS sh_ship_due,
+          sh.receive_due_date                  AS sh_recv_due,
+          sh.is_rework                         AS sh_is_rework,
+          v.code                               AS vendor_code,
+          v.name                               AS vendor_name,
+          sl.item_id                           AS item_id,
+          i.code                               AS item_code,
+          COALESCE(NULLIF(i.short_description, ''), i.name, sl.pending_name) AS item_name,
+          NULL                                 AS qty,
+          sl.qty_planned                       AS line_qty_planned,
+          NULL                                 AS location_name,
+          NULL                                 AS location_code,
+          uc.full_name                         AS actor_name,
+          sl.notes                             AS notes,
+          0                                    AS inv_linked_qty,
+          (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+        FROM inv_shipment_lines sl
+        JOIN inv_shipments sh    ON sh.id = sl.shipment_id
+   LEFT JOIN inv_items i         ON i.id  = sl.item_id
+   LEFT JOIN vendors v           ON v.id  = sh.vendor_id
+   LEFT JOIN users uc            ON uc.id = sh.created_by
+       WHERE sh.status <> 'cancelled'
+         AND (
+                (sl.line_kind = 'receive'
+                    AND NOT EXISTS (SELECT 1 FROM inv_receipts r3 WHERE r3.shipment_line_id = sl.id))
+                OR
+                (sl.line_kind = 'ship' AND sl.qty_shipped = 0)
+             )
+    ) AS e";
+
+$dtCfg = [
+    'id'       => 'shiprcpt_txn_history',
+    'base_sql' => 'SELECT * FROM ' . $baseUnion,
+    'columns'  => [
+        ['key'=>'event_at',      'label'=>'When',         'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.event_at',  'td_class'=>'nowrap'],
+        ['key'=>'event_date',    'label'=>'Event date',   'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.event_date'],
+        ['key'=>'direction',     'label'=>'Direction',    'sortable'=>true, 'sql_col'=>'e.direction',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>[
+             ['value'=>'receive',  'label'=>'Receipt (incoming)'],
+             ['value'=>'ship_out', 'label'=>'Ship out (outgoing)'],
+             ['value'=>'planned',  'label'=>'Planned (no event yet)'],
+         ]]],
+        ['key'=>'sh_status',     'label'=>'Status',       'sortable'=>true, 'sql_col'=>'e.sh_status',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>[
+             ['value'=>'draft',     'label'=>'Draft'],
+             ['value'=>'approved',  'label'=>'Approved'],
+             ['value'=>'shipped',   'label'=>'Shipped'],
+             ['value'=>'closed',    'label'=>'Closed'],
+             ['value'=>'cancelled', 'label'=>'Cancelled'],
+         ]]],
+        ['key'=>'sh_mode',       'label'=>'Mode',         'sortable'=>true, 'sql_col'=>'e.sh_mode',
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>[
+             ['value'=>'receive', 'label'=>'Receive only'],
+             ['value'=>'ship',    'label'=>'Ship only'],
+             ['value'=>'both',    'label'=>'Both'],
+         ]]],
+        ['key'=>'ship_no',       'label'=>'Ship #',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.ship_no'],
+        ['key'=>'vendor',        'label'=>'Vendor',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.vendor_name'],
+        ['key'=>'item_label',    'label'=>'Item',         'sortable'=>true, 'searchable'=>true,
+         // Searchable on both code and name; displayed as (CODE)-Name
+         // per the app-wide convention. Use COALESCE so the planned
+         // branch (NULL code) doesn't blow up the CONCAT result.
+         'sql_col'=>"CONCAT('(', COALESCE(e.item_code,''), ')-', COALESCE(e.item_name,''))"],
+        ['key'=>'qty',           'label'=>'Qty',          'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.qty',          'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'line_qty_planned', 'label'=>'Planned',    'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.line_qty_planned', 'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'sh_ship_due',   'label'=>'Ship due',     'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.sh_ship_due'],
+        ['key'=>'sh_recv_due',   'label'=>'Receive due',  'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.sh_recv_due'],
+        ['key'=>'line_count',    'label'=>'Lines',        'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.line_count',    'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'receipt_count', 'label'=>'Receipts',     'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.receipt_count', 'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'inv_linked',    'label'=>'Linked',       'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'inv_unlinked',  'label'=>'Unlinked',     'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
+        ['key'=>'location_name', 'label'=>'Location',     'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.location_name'],
+        ['key'=>'actor_name',    'label'=>'By',           'sortable'=>false,'searchable'=>false],
+        ['key'=>'notes',         'label'=>'Notes',        'sortable'=>false,'searchable'=>true,  'sql_col'=>'e.notes', 'td_class'=>'muted small'],
+        ['key'=>'_actions',      'label'=>'Actions',      'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r nowrap'],
+    ],
+    // Sort by the captured server-side timestamp (event_at) so events
+    // ordered within a single business day still come out in real
+    // chronological order. Planned rows fall back to sh.created_at
+    // (aliased into event_at) so drafts surface near the top too.
+    'default_sort' => ['event_at', 'desc'],
+];
+
+$rowRenderer = function ($r) use ($canManage) {
+    // Direction pill — three flavors now.
+    //   receive  → green: material arrived
+    //   ship_out → amber: material dispatched
+    //   planned  → muted: shipment exists, no event yet (draft / approved / etc.)
+    if ($r['direction'] === 'receive') {
+        $dirPill = '<span class="pill pill-active" title="Material arrived">↓ receipt</span>';
+    } elseif ($r['direction'] === 'ship_out') {
+        $dirPill = '<span class="pill pill-warn" title="Material dispatched">↑ ship out</span>';
+    } else {
+        $dirPill = '<span class="pill pill-muted" title="Shipment exists but no event posted yet">◌ planned</span>';
+    }
+
+    // Shipment status pill (header context).
+    $sStatus = (string)($r['sh_status'] ?? '');
+    $statusCls = ($sStatus === 'closed' ? 'active'
+        : ($sStatus === 'cancelled' ? 'danger'
+            : ($sStatus === 'shipped' ? 'info'
+                : ($sStatus === 'approved' ? 'info' : 'muted'))));
+    $statusPill = $sStatus !== ''
+        ? '<span class="pill pill-' . $statusCls . '">' . h($sStatus) . '</span>'
+        : '<span class="muted">—</span>';
+
+    // Mode label (compact).
+    $modeRaw = (string)($r['sh_mode'] ?? '');
+    $modeLabel = $modeRaw === 'both' ? 'Ship & rcv'
+                : ($modeRaw === 'ship' ? 'Ship only'
+                    : ($modeRaw === 'receive' ? 'Receive only' : '—'));
+
+    $vendor = !empty($r['vendor_name'])
+        ? '<code>' . h($r['vendor_code']) . '</code> ' . h($r['vendor_name'])
+        : '<span class="muted">—</span>';
+
+    // Item cell. Event rows link the item to its ledger; planned rows
+    // don't have a specific event item, so we show the first line's
+    // code-name without a link (or '—' if there are no lines yet).
+    if ($r['direction'] === 'planned') {
+        // Per-line planned rows — each row IS one line, so no
+        // "+N more" suffix. Link the item to its ledger when an
+        // item_id exists; pending lines (no item yet) just show
+        // the typed pending_name plain.
+        if (!empty($r['item_id'])) {
+            $itemCell = '<a href="' . h(url('/inventory.php?action=ledger&id=' . (int)$r['item_id'])) . '">'
+                      . '(' . h($r['item_code']) . ')-' . h($r['item_name'])
+                      . '</a>';
+        } elseif (!empty($r['item_name'])) {
+            $itemCell = h($r['item_name']) . ' <span class="muted small">(pending)</span>';
+        } else {
+            $itemCell = '<span class="muted">—</span>';
+        }
+    } else {
+        $itemCell = '<a href="' . h(url('/inventory.php?action=ledger&id=' . (int)$r['item_id'])) . '">'
+                  . '(' . h($r['item_code']) . ')-' . h($r['item_name'])
+                  . '</a>';
+    }
+
+    $shipLink = '<a href="' . h(url('/inventory_shiprcpt.php?action=view&id=' . (int)$r['shipment_id'])) . '">'
+              . '<code>' . h($r['ship_no']) . '</code></a>';
+
+    // Qty formatting — trim trailing zeros. Planned rows have no qty.
+    $fmtQ = function ($v) {
+        return rtrim(rtrim(number_format((float)$v, 3, '.', ''), '0'), '.');
+    };
+    $qtyCell = ($r['direction'] === 'planned' || $r['qty'] === null)
+             ? '<span class="muted">—</span>'
+             : h($fmtQ($r['qty']));
+
+    // Planned qty — the line's CURRENT qty_planned. After an amendment,
+    // this may differ from the event qty (e.g. receipt was 1, plan now 2).
+    // Highlight that mismatch in amber so the operator can see at a glance
+    // which event rows have a planned amendment behind them.
+    $planned = $r['line_qty_planned'];
+    if ($planned === null || $planned === '') {
+        $plannedCell = '<span class="muted">—</span>';
+    } else {
+        $plannedFmt = $fmtQ($planned);
+        if ($r['direction'] !== 'planned' && $r['qty'] !== null
+            && (float)$planned !== (float)$r['qty']) {
+            $plannedCell = '<strong style="color:#b45309" title="Differs from event qty — likely amended">'
+                         . h($plannedFmt) . ' ⚑</strong>';
+        } else {
+            $plannedCell = h($plannedFmt);
+        }
+    }
+
+    // Invoice linked/unlinked. Only meaningful for receipts. The
+    // ship-out and planned branches both render '—' here so the
+    // operator distinguishes "not invoice-eligible" from "zero
+    // linked yet" (the latter only shows on receipts).
+    if ($r['direction'] === 'receive') {
+        $linked   = (float)$r['inv_linked_qty'];
+        $unlinked = (float)$r['qty'] - $linked;
+        if ($unlinked < 0) $unlinked = 0.0;
+        $invLinkedCell   = $linked > 0
+            ? '<strong style="color:#059669">' . h($fmtQ($linked)) . '</strong>'
+            : '<span class="muted">0</span>';
+        $invUnlinkedCell = $unlinked > 0
+            ? '<strong style="color:#b45309">' . h($fmtQ($unlinked)) . '</strong>'
+            : '<span class="muted">0</span>';
+    } else {
+        $invLinkedCell   = '<span class="muted">—</span>';
+        $invUnlinkedCell = '<span class="muted">—</span>';
+    }
+
+    $actions = '<a class="btn btn-icon" title="View shipment" aria-label="View shipment" href="'
+             . h(url('/inventory_shiprcpt.php?action=view&id=' . (int)$r['shipment_id']))
+             . '">👁 <span class="dt-action-label">View</span></a>';
+    // Edit button — only on draft shipments and only for users who
+    // can manage. Inherited from the (now-removed) shipments_list
+    // page so power users keep that affordance.
+    if ($canManage && $sStatus === 'draft') {
+        $actions .= ' <a class="btn btn-icon" title="Edit shipment" aria-label="Edit shipment" href="'
+                  . h(url('/inventory_shiprcpt.php?action=edit&id=' . (int)$r['shipment_id']))
+                  . '">✎ <span class="dt-action-label">Edit</span></a>';
+    }
+
+    $lineCount    = (int)($r['line_count'] ?? 0);
+    $receiptCount = (int)($r['receipt_count'] ?? 0);
+
+    return [
+        'event_at'      => h(dt_display($r['event_at'])),
+        'event_date'    => h($r['event_date'] ?: '—'),
+        'direction'     => $dirPill,
+        'sh_status'     => $statusPill,
+        'sh_mode'       => h($modeLabel),
+        'ship_no'       => $shipLink,
+        'vendor'        => $vendor,
+        'item_label'    => $itemCell,
+        'qty'           => $qtyCell,
+        'line_qty_planned' => $plannedCell,
+        'sh_ship_due'   => h($r['sh_ship_due'] ?: '—'),
+        'sh_recv_due'   => h($r['sh_recv_due'] ?: '—'),
+        'line_count'    => $lineCount   ?: '<span class="muted">—</span>',
+        'receipt_count' => $receiptCount ?: '<span class="muted">—</span>',
+        'inv_linked'    => $invLinkedCell,
+        'inv_unlinked'  => $invUnlinkedCell,
+        'location_name' => h($r['location_name'] ?: '—'),
+        'actor_name'    => h($r['actor_name'] ?: '—'),
+        'notes'         => h($r['notes'] ?: ''),
+        '_actions'      => dt_actions_wrap($actions),
+    ];
+};
+$dt = data_table_run($dtCfg, $rowRenderer);
+
+$newBtnHtml = $canManage
+    ? '<a class="btn btn-primary" href="' . h(url('/inventory_shiprcpt.php?action=new')) . '"'
+      . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New shipment', 'N') . '</a>'
+    : '';
+$dtCfg['title']        = 'Ship & Receipt';
+$dtCfg['description']  = 'Unified feed: one row per event (receipts, ship-outs) plus one row per shipment line that has no event posted yet (direction = Planned). Each line on a draft / approved shipment appears as its own Planned row. Use the column controls (⚙) to hide what you don\'t need.';
+$dtCfg['actions_html'] = $newBtnHtml;
+
+$page_title  = 'Ship & Receipt';
+$page_module = 'inventory_shiprcpt';
+require __DIR__ . '/includes/header.php';
+data_table_render($dtCfg, $dt, $rowRenderer);
+require __DIR__ . '/includes/footer.php';
