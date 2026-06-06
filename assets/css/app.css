@@ -310,7 +310,11 @@ body[data-chord-first] [data-shortcut].chord-match {
 /* The .dt-scroll container handles overflow; .dt-wrap remains a flex
    column that includes the scroll area + the page-size/pager footer. */
 .dt-table { width: 100%; }
-.dt-table th, .dt-table td { vertical-align: middle; }
+.dt-table th { vertical-align: middle; }
+.dt-table tbody td { vertical-align: top; }
+/* Keep header cells middle-aligned; data cells top-aligned so category,
+   description, and other text starts flush at the top of every row
+   regardless of row height. */
 
 /* ============================================================
    SPA shell loading state
@@ -707,6 +711,8 @@ body.spa-loading::after {
     cursor: pointer;
     font-size: 13px;
     text-decoration: none;
+    margin-bottom: 20px;
+    margin-top: 10px;
 }
 .bom-tab.active {
     background: var(--surface);
@@ -758,27 +764,32 @@ body.spa-loading::after {
 
 .bom-grid {
     width: 100%;
+    min-width: 900px;       /* below this the scroll wrapper shows h-scroll */
+    table-layout: fixed;    /* ALWAYS fixed — columns never grow from content */
     border-collapse: collapse;
     background: var(--surface);
     border: 1px solid var(--border);
     font-size: 13px;
 }
-/* Flipped on by the resize JS as soon as the user starts dragging a
-   handle (or if there are saved widths in localStorage from a prior
-   session). In this mode columns enforce their explicit widths and
-   the table's total width is also pinned via inline style by the JS
-   — that pinning is what prevents sibling columns from auto-shrinking
-   when one grows. The .bom-grid-scroll wrapper provides horizontal
-   scroll for the overflow. */
-.bom-grid.bgrid-fixed-layout {
-    table-layout: fixed;
-}
-.bom-grid.bgrid-fixed-layout th,
-.bom-grid.bgrid-fixed-layout td {
+/* All cells clip long content — applies universally with fixed layout */
+.bom-grid th,
+.bom-grid td {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* bgrid-fixed-layout retained for JS resize-handle compatibility;
+   it's a no-op now (table is always fixed) but toggling it is harmless. */
+.bom-grid.bgrid-fixed-layout { table-layout: fixed; }
+
+/* ── Fixed column widths (via <colgroup>) ───────────────────────────
+   Product Name gets no width → takes all remaining space.
+   Every other column is pinned so content can never push them. */
+.bom-grid .bom-col-name    { /* fills remainder */ }
+.bom-grid .bom-col-cat     { width: 130px; }
+.bom-grid .bom-col-num     { width: 75px;  }
+.bom-grid .bom-col-rework  { width: 85px;  }
+.bom-grid .bom-col-actions { width: 65px;  }
 .bom-grid thead th {
     background: #8a8c93;          /* match screenshot's gray header */
     color: white;
@@ -837,9 +848,8 @@ body.spa-loading::after {
 .bom-grid tbody tr:nth-child(even) { background: #f7f7f9; }
 .bom-grid tbody tr.highlighted { background: #e5e5ea; }
 
-.bom-grid .bom-name-cell {
-    white-space: nowrap;
-}
+/* .bom-grid .bom-name-cell — white-space:nowrap / overflow / ellipsis
+   now handled by the global .bom-grid td rule (table-layout:fixed). */
 .bom-grid .bom-toggle-btn {
     display: inline-block;
     width: 18px; height: 18px;
@@ -879,6 +889,25 @@ body.spa-loading::after {
     border-radius: 10px;
     white-space: nowrap;
     cursor: help;
+}
+
+/* Category badge in BOM grid rows — small muted chip inside the
+   dedicated .bom-cat-col column. Shows the inventory category
+   (Finished Goods, Sub Assembly, Raw Material, etc.).
+   Full name in the title="" tooltip. */
+.bom-grid .bom-cat-badge {
+    display: inline-block;
+    padding: 0 6px;
+    font-size: 10px;
+    line-height: 16px;
+    color: #374151;
+    background: #f3f4f6;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    white-space: nowrap;
+    cursor: help;
+    vertical-align: middle;
+    opacity: 0.85;
 }
 
 /* Compact icon buttons used in datatable action cells. Wider than a
@@ -2398,19 +2427,22 @@ ul.bd-children:empty {
 .bom-grid-wrap .bom-grid tbody tr:nth-child(even) { background: transparent; }
 .bom-grid-wrap .bom-grid tbody tr:hover { background: var(--surface-alt, #fafbfc); }
 
-/* Ellipsis on the name cell (the longest one); narrower truncation on
-   the detail cell. Numeric columns stay short anyway. */
+/* Name cell — overflow/ellipsis/nowrap already applied by the global
+   .bom-grid th,.bom-grid td rule. No max-width:0 needed (that was an
+   auto-layout hack; fixed layout + colgroup handles it correctly). */
 .bom-grid-wrap .bom-grid .bom-name-cell {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 0;
+    /* intentionally empty — inherits from global .bom-grid td rule */
+}
+/* Category column — centred badge, padding tightened */
+.bom-grid-wrap .bom-grid .bom-cat-col {
+    text-align: center;
+    padding: 4px 6px;
 }
 
 /* Toolbar buttons are slightly tighter to match */
 .bom-grid-wrap .dt-toolbar .btn-sm { padding: 4px 9px; font-size: 11.5px; min-height: 26px; }
 
-/* Toggle button + spacer inside the tighter BOM grid rows */
+/* Toggle button + spacer inside the BOM grid name cell */
 .bom-grid-wrap .bom-grid .bom-toggle-btn {
     width: 15px; height: 15px;
     line-height: 11px;

@@ -1,45 +1,39 @@
 <?php
 /**
- * MagDyn — Old Inventory Asset Import Service
+ * MagDyn — Old Inventory Asset Import Service (API version)
  *
- * Reads asset records from the legacy inventory_live database and
+ * Fetches asset records from the legacy inventory_live system via the
+ * HTTP API (api_export_assets.php deployed on the old server) and
  * imports them into the new MagDyn assets system.
  *
  * Field mapping (old → new):
- *   asset.asset_code                    → assets.asset_tag          (migration key)
- *   asset_model.asset_model_code        → asset_models.code
- *   asset_model.short_description       → asset_models.name
- *   category.short_description          → asset_models.category
- *   location.short_description          → locations.name  (matched by name)
- *   asset_transaction_checkout.due_date → assets.checkout_due_on    (most recent)
- *   asset_custom_field_helper.cfv_22    → stored as note (no direct column)
- *   asset_custom_field_helper.cfv_23    → assets.next_cal_due_on
- *   (status hardcoded)                  → assets.status = 'active'
- *   inv_notes where class='A'           → notes (entity_type='asset')
- *   notes_attachments                   → note body (files listed; not physically copied)
+ *   asset.asset_code             → assets.asset_tag       (upsert key)
+ *   asset_model.asset_model_code → asset_models.code      (created if missing)
+ *   asset_model.short_description→ asset_models.name
+ *   category.short_description   → asset_models.category
+ *   location.short_description   → locations.name         (matched by name)
+ *   checkout_due  (API field)    → assets.checkout_due_on (most recent)
+ *   cfv_22 / due_back (API)      → informational note
+ *   cfv_23 / next_cal_due (API)  → assets.next_cal_due_on
+ *   inv_notes class='A' (API)    → notes (entity_type='asset')
+ *   notes_attachments filenames  → appended to note body (not physically copied)
  *
  * Duplicate handling:
- *   asset.asset_code already in assets.asset_tag → UPDATE existing record.
- *   Otherwise → INSERT new record.
+ *   asset_code already in assets.asset_tag → UPDATE. Otherwise → INSERT.
  *
  * Usage:
- *   $svc    = new OldInventoryAssetImportService($actorUserId);
+ *   require_once __DIR__ . '/../includes/old_inventory_api.php';
+ *   require_once __DIR__ . '/../services/OldInventoryAssetImportService.php';
+ *   $svc    = new OldInventoryAssetImportService(current_user_id());
  *   $result = $svc->run();
- *   // $result = ['total'=>N,'imported'=>N,'updated'=>N,'failed'=>N,'skipped'=>N,'errors'=>[...]]
  */
 
-require_once __DIR__ . '/../includes/old_inventory_db.php';
+require_once __DIR__ . '/../includes/old_inventory_api.php';
 
 class OldInventoryAssetImportService
 {
-    /** Records per DB transaction batch */
+    /** Records per API call / DB transaction batch */
     private const BATCH_SIZE = 100;
-
-    /** @var PDO  New (MagDyn) database */
-    private PDO $new;
-
-    /** @var PDO  Old (inventory_live) database */
-    private PDO $old;
 
     /** @var int  User ID credited as creator/editor for imported records */
     private int $actorId;
@@ -50,7 +44,7 @@ class OldInventoryAssetImportService
     /** @var array<string,int>  model code → new asset_models.id cache */
     private array $modelCache = [];
 
-    /** @var array  Accumulated import log entries */
+    /** @var array  Accumulated log entries */
     private array $errors = [];
 
     /** @var array{total:int,imported:int,updated:int,failed:int,skipped:int} */
@@ -72,29 +66,32 @@ class OldInventoryAssetImportService
     // ----------------------------------------------------------------
 
     /**
-     * Run the full import.  Returns a summary array.
+     * Run the full import.
      *
      * @return array{total:int,imported:int,updated:int,failed:int,skipped:int,errors:array}
      */
     public function run(): array
     {
-        // Open both connections.  Propagate connection errors to caller.
-        $this->new = db();
-        $this->old = old_inventory_db();
-
-        $this->counts['total'] = $this->countSourceAssets();
+        $countData = old_inventory_api('count');
+        $this->counts['total'] = (int) ($countData['count'] ?? 0);
         $this->log("Starting import — {$this->counts['total']} active assets found in source.");
 
         $offset = 0;
 
         while (true) {
-            $batch = $this->fetchBatch($offset, self::BATCH_SIZE);
+            $data  = old_inventory_api('assets', ['offset' => $offset, 'limit' => self::BATCH_SIZE]);
+            $batch = $data['assets'] ?? [];
+
             if (empty($batch)) {
                 break;
             }
 
             $this->processBatch($batch);
             $offset += self::BATCH_SIZE;
+
+            if (count($batch) < self::BATCH_SIZE) {
+                break;  // last page
+            }
         }
 
         $this->log(
@@ -109,74 +106,20 @@ class OldInventoryAssetImportService
     }
 
     // ----------------------------------------------------------------
-    // Batch fetching from old DB
-    // ----------------------------------------------------------------
-
-    /** Count total active (non-archived) assets in old system. */
-    private function countSourceAssets(): int
-    {
-        $stmt = $this->old->query(
-            "SELECT COUNT(*) FROM asset
-              WHERE archived_flag IS NULL OR archived_flag = 0"
-        );
-        return (int) $stmt->fetchColumn();
-    }
-
-    /**
-     * Fetch one batch of assets from the old DB with all needed joins.
-     *
-     * @return array[]
-     */
-    private function fetchBatch(int $offset, int $limit): array
-    {
-        $sql = "
-            SELECT
-                a.asset_id          AS old_asset_id,
-                a.asset_code,
-                am.asset_model_code,
-                am.short_description AS model_name,
-                cat.short_description AS category_name,
-                loc.short_description AS location_name,
-                acfh.cfv_22          AS due_back,
-                acfh.cfv_23          AS next_cal_due
-            FROM asset a
-            LEFT JOIN asset_model am
-                   ON am.asset_model_id = a.asset_model_id
-            LEFT JOIN category cat
-                   ON cat.category_id  = am.category_id
-            LEFT JOIN location loc
-                   ON loc.location_id  = a.location_id
-            LEFT JOIN asset_custom_field_helper acfh
-                   ON acfh.asset_id    = a.asset_id
-            WHERE (a.archived_flag IS NULL OR a.archived_flag = 0)
-            ORDER BY a.asset_id
-            LIMIT :lim OFFSET :off
-        ";
-
-        $stmt = $this->old->prepare($sql);
-        $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
-        $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
-        $stmt->execute();
-
-        return $stmt->fetchAll();
-    }
-
-    // ----------------------------------------------------------------
-    // Batch processing — wrapped in a single transaction per batch
+    // Batch processing — each batch in a single DB transaction
     // ----------------------------------------------------------------
 
     private function processBatch(array $batch): void
     {
-        $this->new->beginTransaction();
+        db()->beginTransaction();
 
         try {
             foreach ($batch as $row) {
                 $this->processOneAsset($row);
             }
-            $this->new->commit();
+            db()->commit();
         } catch (Throwable $e) {
-            $this->new->rollBack();
-            // Log batch-level failure and continue with next batch
+            db()->rollBack();
             $this->log("Batch transaction rolled back: " . $e->getMessage(), 'error');
             $this->counts['failed'] += count($batch);
         }
@@ -190,28 +133,22 @@ class OldInventoryAssetImportService
     {
         $assetCode = trim((string) ($row['asset_code'] ?? ''));
 
-        // Skip records with no identifier
         if ($assetCode === '') {
             $this->counts['skipped']++;
-            $this->log("Skipped record old_id={$row['old_asset_id']}: empty asset_code.", 'warn');
+            $this->log("Skipped record old_id={$row['asset_id']}: empty asset_code.", 'warn');
             return;
         }
 
         try {
-            // Resolve FK dependencies
-            $modelId    = $this->resolveModel($row);
-            $locationId = $this->resolveLocation($row['location_name'] ?? '');
+            $modelId     = $this->resolveModel($row);
+            $locationId  = $this->resolveLocation((string) ($row['location_name'] ?? ''));
+            $nextCalDue  = $this->parseOldDate((string) ($row['next_cal_due'] ?? ''));
+            $dueBack     = $this->parseOldDate((string) ($row['due_back']     ?? ''));
+            $checkoutDue = $row['checkout_due'] ?? null;   // already YYYY-MM-DD from API
 
-            // Parse dates
-            $checkoutDue = $this->fetchLatestCheckoutDue((int) $row['old_asset_id']);
-            $nextCalDue  = $this->parseOldDate($row['next_cal_due'] ?? '');
-            $dueBack     = $this->parseOldDate($row['due_back'] ?? '');  // cfv_22
-
-            // Check for existing record (duplicate detection by asset_tag)
             $existing = $this->findExistingAsset($assetCode);
 
             if ($existing) {
-                // UPDATE existing record
                 $this->updateAsset($existing['id'], [
                     'model_id'        => $modelId,
                     'location_id'     => $locationId,
@@ -222,7 +159,6 @@ class OldInventoryAssetImportService
                 $newAssetId = $existing['id'];
                 $this->counts['updated']++;
             } else {
-                // INSERT new record
                 $newAssetId = $this->insertAsset([
                     'asset_tag'       => $assetCode,
                     'model_id'        => $modelId,
@@ -234,16 +170,15 @@ class OldInventoryAssetImportService
                 $this->counts['imported']++;
             }
 
-            // Migrate notes and file references from inv_notes (class='A')
-            $this->migrateNotes((int) $row['old_asset_id'], $newAssetId, $dueBack);
+            // Notes come pre-fetched from API
+            $this->migrateNotes($row['notes'] ?? [], $newAssetId, $dueBack);
 
         } catch (Throwable $e) {
             $this->counts['failed']++;
             $this->log(
-                "Failed asset_code={$assetCode} (old_id={$row['old_asset_id']}): " . $e->getMessage(),
+                "Failed asset_code={$assetCode} (old_id={$row['asset_id']}): " . $e->getMessage(),
                 'error'
             );
-            // Re-throw so the batch transaction catches it
             throw $e;
         }
     }
@@ -303,7 +238,8 @@ class OldInventoryAssetImportService
 
     /**
      * Find a matching location in the new system by name (case-insensitive).
-     * Returns null when no match — asset will be imported with null location_id.
+     * If no match is found, a new location record is created automatically
+     * so vendor names and other locations from the old system are preserved.
      */
     private function resolveLocation(string $oldName): ?int
     {
@@ -316,51 +252,26 @@ class OldInventoryAssetImportService
             return $this->locationCache[$name];
         }
 
+        // Try to find an existing active location (case-insensitive)
         $row = db_one(
             'SELECT id FROM locations WHERE LOWER(name) = LOWER(?) AND is_active = 1 LIMIT 1',
             [$name]
         );
 
-        $id = $row ? (int) $row['id'] : null;
-        $this->locationCache[$name] = $id;
-
-        if ($id === null) {
-            $this->log("Location not matched: '{$name}' — asset imported with no location.", 'warn');
+        if ($row) {
+            return $this->locationCache[$name] = (int) $row['id'];
         }
+
+        // Not found — create it so vendor names and other locations are preserved
+        db_exec(
+            'INSERT INTO locations (name, is_active) VALUES (?, 1)',
+            [$name]
+        );
+        $id = (int) db_val('SELECT LAST_INSERT_ID()', [], 0);
+        $this->locationCache[$name] = $id;
+        $this->log("Created new location: '{$name}'");
 
         return $id;
-    }
-
-    // ----------------------------------------------------------------
-    // Checkout due date
-    // ----------------------------------------------------------------
-
-    /**
-     * Fetch the most recent checkout due_date for the given old asset_id.
-     * Joins asset_transaction → asset_transaction_checkout.
-     */
-    private function fetchLatestCheckoutDue(int $oldAssetId): ?string
-    {
-        $sql = "
-            SELECT atc.due_date
-            FROM asset_transaction_checkout atc
-            JOIN asset_transaction atr
-                ON atr.asset_transaction_id = atc.asset_transaction_id
-            WHERE atr.asset_id = :aid
-              AND atc.due_date IS NOT NULL
-            ORDER BY atc.creation_date DESC
-            LIMIT 1
-        ";
-        $stmt = $this->old->prepare($sql);
-        $stmt->execute([':aid' => $oldAssetId]);
-        $val = $stmt->fetchColumn();
-
-        if (!$val) {
-            return null;
-        }
-
-        // due_date is a datetime in old DB — take date part only
-        return substr((string) $val, 0, 10);
     }
 
     // ----------------------------------------------------------------
@@ -464,75 +375,60 @@ class OldInventoryAssetImportService
     // ----------------------------------------------------------------
 
     /**
-     * Import inv_notes records (class='A') for one asset into the new
-     * notes table.  Physical files are NOT copied (remote FS inaccessible);
-     * instead their filenames are appended to the note body so no data is lost.
-     *
+     * Import notes pre-fetched from the API into the new notes table.
+     * Physical files are NOT copied; filenames are appended to the note body.
      * $dueBack (cfv_22) is added as an informational note if set.
+     *
+     * @param array[]   $oldNotes  Notes array from the API response
+     * @param int       $newAssetId
+     * @param string|null $dueBack  Parsed cfv_22 date or null
      */
-    private function migrateNotes(int $oldAssetId, int $newAssetId, ?string $dueBack): void
+    private function migrateNotes(array $oldNotes, int $newAssetId, ?string $dueBack): void
     {
-        // Write cfv_22 (Due Back) as a note if it has a meaningful value
         if ($dueBack !== null) {
             $this->createNote(
                 $newAssetId,
-                "<p><strong>[Migration]</strong> Due Back (cfv_22): " . htmlspecialchars($dueBack) . "</p>"
+                '<p><strong>[Migration]</strong> Due Back (cfv_22): ' . htmlspecialchars($dueBack) . '</p>'
             );
         }
 
-        // Fetch all asset notes from old system
-        $sql = "
-            SELECT n.noteid, n.notes, n.priority, n.created_date, n.files
-            FROM inv_notes n
-            WHERE n.class = 'A'
-              AND n.id    = :aid
-              AND n.redact = 0
-            ORDER BY n.noteid ASC
-        ";
-        $stmt = $this->old->prepare($sql);
-        $stmt->execute([':aid' => $oldAssetId]);
-        $oldNotes = $stmt->fetchAll();
-
         foreach ($oldNotes as $on) {
-            $noteHtml = $this->buildNoteHtml($on);
-            if ($noteHtml === '') {
-                continue;
+            $html = $this->buildNoteHtml($on);
+            if ($html !== '') {
+                $this->createNote($newAssetId, $html);
             }
-            $this->createNote($newAssetId, $noteHtml);
         }
     }
 
     /**
-     * Build HTML body for a migrated note, appending any file references
-     * from notes_attachments that cannot be physically transferred.
+     * Build HTML body for a migrated note.
+     * Attachments are already embedded in the API response — no extra DB call needed.
      */
     private function buildNoteHtml(array $on): string
     {
         $text = trim((string) ($on['notes'] ?? ''));
-
-        // Start with the note text (convert newlines to <br>)
         $html = '';
+
         if ($text !== '') {
             $html .= '<p>' . nl2br(htmlspecialchars($text)) . '</p>';
         }
 
-        // Append priority as a tag if set
         $priority = trim((string) ($on['priority'] ?? ''));
         if ($priority !== '' && $priority !== 'General') {
             $html .= '<p><em>Priority: ' . htmlspecialchars($priority) . '</em></p>';
         }
 
-        // Append file attachment names from notes_attachments table
-        $attachments = $this->fetchOldAttachments((int) $on['noteid']);
+        // Attachment filenames from API (physical files not copied)
+        $attachments = $on['attachments'] ?? [];
         if (!empty($attachments)) {
             $html .= '<p><strong>[Migration] Attached files (not physically transferred):</strong><br>';
             foreach ($attachments as $att) {
-                $html .= '• ' . htmlspecialchars($att['filename']) . '<br>';
+                $html .= '• ' . htmlspecialchars((string) ($att['filename'] ?? '')) . '<br>';
             }
             $html .= '</p>';
         }
 
-        // Also check the inline `files` JSON column in inv_notes
+        // Inline files JSON column
         $filesJson = trim((string) ($on['files'] ?? ''));
         if ($filesJson !== '' && $filesJson !== '[]' && $filesJson !== 'null') {
             $filePaths = @json_decode($filesJson, true);
@@ -546,18 +442,6 @@ class OldInventoryAssetImportService
         }
 
         return $html;
-    }
-
-    /**
-     * Fetch file attachment records from old notes_attachments for one note.
-     */
-    private function fetchOldAttachments(int $noteId): array
-    {
-        $stmt = $this->old->prepare(
-            'SELECT filename, type FROM notes_attachments WHERE noteid = ? AND redact = 0'
-        );
-        $stmt->execute([$noteId]);
-        return $stmt->fetchAll();
     }
 
     /**

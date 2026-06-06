@@ -3694,9 +3694,10 @@ if ($action === 'view') {
                     .ir-view .col-sample  { width: 72px;  font-variant-numeric: tabular-nums; }
                     .ir-view tr.is-note td { background: #f9fafb; }
                     .ir-view tr.is-note td.note-span { text-align: left; font-style: italic; }
-                    .ir-view td.cell-pass { background: #f0fdf4; }
-                    .ir-view td.cell-fail { background: #fee2e2; color: #991b1b; font-weight: 600; }
-                    .ir-view td.cell-pending { background: #fef9c3; color: #854d0e; }
+                    /* Pass → black text, no background; Fail → red text only, no background */
+                    .ir-view td.cell-pass    { color: #000; }
+                    .ir-view td.cell-fail    { color: #dc2626; font-weight: 600; }
+                    .ir-view td.cell-pending { color: #854d0e; }
                     .ir-view tfoot td { background: #f9fafb; font-weight: 600; }
                     .ir-view tfoot td.tf-label { text-align: right; }
                 </style>
@@ -4043,11 +4044,11 @@ if ($action === 'execute') {
                     .ir-exec tfoot td { background: #f9fafb; }
                     .ir-exec tfoot td.tf-label { text-align: right; font-weight: 600; }
                     .ir-exec select.logic-sel { width: 100%; border: none; background: transparent; font: inherit; text-align: center; }
-                    .ir-exec .live-pf-badge { display: block; font-size: 10px; font-weight: 700; letter-spacing: .02em; }
-                    .ir-exec .live-pf-badge.lp-pass { color: #16a34a; }
-                    .ir-exec .live-pf-badge.lp-fail { color: #dc2626; }
-                    .ir-exec td.col-sample:has(.live-pf-badge.lp-pass) { background: #f0fdf4; }
-                    .ir-exec td.col-sample:has(.live-pf-badge.lp-fail) { background: #fee2e2; }
+                    /* live-pf-badge is hidden — kept only for CSS :has() targeting */
+                    .ir-exec .live-pf-badge { display: none; }
+                    /* Pass → value text in black (default); Fail → value text in red, no background */
+                    .ir-exec td.col-sample:has(.live-pf-badge.lp-pass) input { color: #000; }
+                    .ir-exec td.col-sample:has(.live-pf-badge.lp-fail)  input { color: #dc2626; font-weight: 600; }
                 </style>
 
                 <div class="ir-exec-wrap">
@@ -4217,7 +4218,7 @@ if ($action === 'execute') {
                         var badge = inp.nextElementSibling;
                         if (!badge || !badge.classList.contains('live-pf-badge')) return;
                         var v = inp.value.trim();
-                        if (v === '') { badge.textContent = ''; badge.className = 'live-pf-badge'; inp.parentNode.style.background = ''; return; }
+                        if (v === '') { badge.className = 'live-pf-badge'; return; }
                         var mn = parseFloat(inp.dataset.rmin), mx = parseFloat(inp.dataset.rmax);
                         var hasMn = inp.dataset.rmin !== '', haMx = inp.dataset.rmax !== '';
                         var pf = 'pass';
@@ -4229,9 +4230,9 @@ if ($action === 'execute') {
                             var tl = v.toLowerCase();
                             if (tl === 'pass' || tl === 'ok') pf = 'pass';
                             else if (tl === 'fail' || tl.indexOf('not ok') === 0 || tl.indexOf('ng') !== -1) pf = 'fail';
-                            else { badge.textContent = ''; badge.className = 'live-pf-badge'; inp.parentNode.style.background = ''; return; }
+                            else { badge.className = 'live-pf-badge'; return; }
                         }
-                        badge.textContent = pf.toUpperCase();
+                        // Only update class — no text label shown (text colour handled by CSS :has())
                         badge.className = 'live-pf-badge lp-' + pf;
                     }
                     document.querySelectorAll('.ir-exec input[data-live-pf]').forEach(function (inp) {

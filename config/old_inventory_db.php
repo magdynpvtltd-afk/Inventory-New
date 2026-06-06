@@ -8,7 +8,7 @@
  * Change host / credentials here if the remote server moves.
  */
 return [
-    'host'    => '192.168.1.73',
+    'host'    => '192.168.1.249',
     'port'    => 3306,
     'name'    => 'inventory_live',
     'user'    => 'root',

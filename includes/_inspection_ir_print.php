@@ -230,7 +230,9 @@ function ir_render_print_html($inspectionId, array $opts = [])
                 $cell = isset($grid[$tid][$s]) ? $grid[$tid][$s] : null;
                 $val  = $cell ? (string)($cell['measured_value'] ?? '') : '';
 
-                $bg = '';
+                // Text colour only — no background colours in PDF
+                // Pass → black; Fail → red; empty → default
+                $cellStyle = '';
                 if ($val !== '') {
                     $colHasValue[$s] = true;
                     if (is_numeric($val) && ($minV !== null || $maxV !== null)) {
@@ -238,22 +240,20 @@ function ir_render_print_html($inspectionId, array $opts = [])
                         $inRange = true;
                         if ($minV !== null && $numVal < (float)$minV) $inRange = false;
                         if ($maxV !== null && $numVal > (float)$maxV) $inRange = false;
-                        if ($inRange) {
-                            $bg = 'background:#d4edda;';
-                        } else {
-                            $bg = 'background:#f8d7da;';
+                        if (!$inRange) {
+                            $cellStyle = 'color:#dc2626; font-weight:bold;';
                             $colFailed[$s] = true;
                         }
+                        // pass: no extra style (black text, transparent bg)
                     } elseif ($cell && ($cell['pass_fail'] ?? '') === 'fail') {
-                        $bg = 'background:#f8d7da;';
+                        $cellStyle = 'color:#dc2626; font-weight:bold;';
                         $colFailed[$s] = true;
-                    } elseif ($cell && ($cell['pass_fail'] ?? '') === 'pass') {
-                        $bg = 'background:#d4edda;';
                     }
+                    // pass_fail==='pass': no extra style
                 }
 
                 $dispVal = $val !== '' ? h($val) : '&nbsp;';
-                $t .= '<td style="border:1px solid #000; border-right:0; padding:3px 4px; text-align:center; ' . $bg . '">' . $dispVal . '</td>';
+                $t .= '<td style="border:1px solid #000; border-right:0; padding:3px 4px; text-align:center; ' . $cellStyle . '">' . $dispVal . '</td>';
             }
 
             // Notes column (from the last sample's cell notes if present, else blank)

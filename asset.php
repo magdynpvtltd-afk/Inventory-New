@@ -2330,14 +2330,16 @@ if ($action === 'txn') {
 
     // Auto-select the transaction type when arriving from the view-page
     // Check In / Check Out button (preset= query param). Fall back to a
-    // sensible default based on current asset status.
+    // sensible default based on current asset status:
+    //   • at a location  → Move (location → location)
+    //   • with a vendor  → Receive from vendor   (check-in)
+    //   • with a user    → Receive back from user (check-in)
     $validPresets = ['move', 'send_vendor', 'receive_vendor', 'send_user', 'receive_user'];
     $txnPreset = (string)input('preset', '');
     if (!in_array($txnPreset, $validPresets, true)) {
-        // Derive from asset status when no preset given
         if ($a['status'] === 'with_vendor')   $txnPreset = 'receive_vendor';
         elseif ($a['status'] === 'with_user') $txnPreset = 'receive_user';
-        else                                  $txnPreset = 'send_vendor';
+        else                                  $txnPreset = 'move'; // asset is at a location
     }
     $locations = db_all('SELECT id, code, name FROM locations WHERE is_active = 1 ORDER BY sort_order, name');
     $vendors   = db_all('SELECT id, code, name FROM vendors   WHERE is_active = 1 ORDER BY name');
@@ -2392,37 +2394,52 @@ if ($action === 'txn') {
                     </select>
                 </div>
 
-                <div class="field js-loc-target">
+                <?php
+                    // ── Destination fields ───────────────────────────────────
+                    // Each txn type shows exactly one destination selector:
+                    //   move            → location list
+                    //   send_vendor     → vendor list  + due date
+                    //   send_user       → user list    + due date
+                    //   receive_vendor  → location list (where asset goes back to)
+                    //   receive_user    → location list (where asset goes back to)
+                    // JS hide/show mirrors this logic on type change.
+                    $showLoc = in_array($txnPreset, ['move','receive_vendor','receive_user']);
+                    $showVen = ($txnPreset === 'send_vendor');
+                    $showUsr = ($txnPreset === 'send_user');
+                    $showDue = in_array($txnPreset, ['send_vendor','send_user']);
+                ?>
+
+                <div class="field js-loc-target"<?= $showLoc ? '' : ' style="display:none;"' ?>>
                     <label>Destination location</label>
                     <select name="to_location_id" tabindex="2">
-                        <option value="">— Select One —</option>
+                        <option value="">— Select location —</option>
                         <?php foreach ($locations as $l): ?>
                             <option value="<?= (int)$l['id'] ?>"><?= h($l['name']) ?> (<?= h($l['code']) ?>)</option>
                         <?php endforeach; ?>
                     </select>
                 </div>
 
-                <div class="field js-vendor-target" style="display:none;">
+                <div class="field js-vendor-target"<?= $showVen ? '' : ' style="display:none;"' ?>>
                     <label>Vendor</label>
                     <select name="to_vendor_id" tabindex="3">
-                        <option value="">— Select One —</option>
+                        <option value="">— Select vendor —</option>
                         <?php foreach ($vendors as $v): ?>
-                            <option value="<?= (int)$v['id'] ?>"><?= h($v['name']) ?></option>
+                            <option value="<?= (int)$v['id'] ?>"><?= h($v['name']) ?> (<?= h($v['code']) ?>)</option>
                         <?php endforeach; ?>
                     </select>
                 </div>
 
-                <div class="field js-user-target" style="display:none;">
+                <div class="field js-user-target"<?= $showUsr ? '' : ' style="display:none;"' ?>>
                     <label>User</label>
                     <select name="to_user_id" tabindex="4">
-                        <option value="">— Select One —</option>
+                        <option value="">— Select user —</option>
                         <?php foreach ($users as $u): ?>
-                            <option value="<?= (int)$u['id'] ?>"><?= h($u['full_name']) ?></option>
+                            <option value="<?= (int)$u['id'] ?>"><?= h($u['full_name']) ?> (<?= h($u['username']) ?>)</option>
                         <?php endforeach; ?>
                     </select>
                 </div>
 
-                <div class="field js-due-target" style="display:none;">
+                <div class="field js-due-target"<?= $showDue ? '' : ' style="display:none;"' ?>>
                     <label for="f_txn_due">Due date <span class="muted small">(expected return)</span></label>
                     <input id="f_txn_due" name="due_date" type="date" tabindex="5">
                 </div>
@@ -2442,30 +2459,31 @@ if ($action === 'txn') {
         var ven = document.querySelector('.js-vendor-target');
         var usr = document.querySelector('.js-user-target');
         var due = document.querySelector('.js-due-target');
+
+        // ── Destination visibility rules ─────────────────────────────────
+        // move            → location list  (location → location)
+        // send_vendor     → vendor list    + due date
+        // send_user       → user list      + due date
+        // receive_vendor  → location list  (asset comes back, goes to a location)
+        // receive_user    → location list  (asset comes back, goes to a location)
         function apply() {
             var t = sel.value;
-            // Destination location is shown for all types:
-            // required for move/receive, optional for send types (records expected return-to location).
-            loc.style.display = '';
-            var locLbl = loc.querySelector('label');
-            if (locLbl) {
-                if (t === 'send_vendor' || t === 'send_user') {
-                    locLbl.textContent = 'Destination Location (optional)';
-                } else {
-                    locLbl.textContent = 'Destination location';
-                }
-            }
-            ven.style.display = (t === 'send_vendor') ? '' : 'none';
-            usr.style.display = (t === 'send_user') ? '' : 'none';
-            // Due date only applies when handing the asset out.
-            due.style.display = (t === 'send_vendor' || t === 'send_user') ? '' : 'none';
+            var wantsLoc = (t === 'move' || t === 'receive_vendor' || t === 'receive_user');
+            var wantsVen = (t === 'send_vendor');
+            var wantsUsr = (t === 'send_user');
+            var wantsDue = (t === 'send_vendor' || t === 'send_user');
+            loc.style.display = wantsLoc ? '' : 'none';
+            ven.style.display = wantsVen ? '' : 'none';
+            usr.style.display = wantsUsr ? '' : 'none';
+            due.style.display = wantsDue ? '' : 'none';
         }
+
         sel.addEventListener('change', apply);
-        // Apply preset immediately (synchronous pass)
+        // Apply preset immediately (server-rendered preset value).
         var preset = '<?= h($txnPreset) ?>';
         if (preset) { sel.value = preset; apply(); }
         // Re-apply after a tick to beat browser session-autofill which
-        // fires asynchronously after DOMContentLoaded on some browsers.
+        // may fire asynchronously after DOMContentLoaded on some browsers.
         if (preset) {
             setTimeout(function () { sel.value = preset; apply(); }, 0);
         }
@@ -2943,7 +2961,7 @@ if ($action === 'list') {
                     </select>
                 </div>
 
-                <div class="field" id="modal-loc-field">
+                <div class="field" id="modal-loc-field" style="display:none;">
                     <label>Destination location</label>
                     <select name="to_location_id">
                         <option value="">— Select —</option>
@@ -3007,22 +3025,18 @@ if ($action === 'list') {
         var dueInp  = document.getElementById('modal-txn-due');
         var notesInp= document.getElementById('modal-txn-notes');
 
-        function applyType() {
-            var ts = document.getElementById('modal-txn-type');
-            var t  = ts ? ts.value : 'move';
-            // Destination location shown for all types; label changes for send types.
-            locF.style.display = '';
-            var locLbl = locF.querySelector('label');
-            if (locLbl) {
-                locLbl.textContent = (t === 'send_vendor' || t === 'send_user')
-                    ? 'Destination Location (optional)'
-                    : 'Destination location';
+        function applyType(t) {
+            if (t === undefined) {
+                var ts = document.getElementById('modal-txn-type');
+                t = ts ? ts.value : 'move';
             }
-            venF.style.display = (t === 'send_vendor') ? '' : 'none';
-            usrF.style.display = (t === 'send_user')   ? '' : 'none';
-            dueF.style.display = (t === 'send_vendor' || t === 'send_user') ? '' : 'none';
+            var isSend = (t === 'send_vendor' || t === 'send_user');
+            locF.style.display  = isSend ? 'none' : 'block';
+            venF.style.display  = (t === 'send_vendor') ? 'block' : 'none';
+            usrF.style.display  = (t === 'send_user')   ? 'block' : 'none';
+            dueF.style.display  = isSend ? 'block' : 'none';
         }
-        typeSel.addEventListener('change', applyType);
+        typeSel.addEventListener('change', function () { applyType(this.value); });
 
         function openModal(id, tag, preset, label) {
             idInp.value         = id;
@@ -3041,17 +3055,13 @@ if ($action === 'list') {
             var targetType = preset || 'move';
 
             function forcePreset() {
-                // Always re-query — never rely on the closure reference which
-                // could be stale if the page has re-rendered any containing element.
                 var ts = document.getElementById('modal-txn-type');
                 if (!ts) return;
-                // Set via .value AND option.selected on each option — the most
-                // compatible combination across all browsers.
                 ts.value = targetType;
                 for (var i = 0; i < ts.options.length; i++) {
                     ts.options[i].selected = (ts.options[i].value === targetType);
                 }
-                applyType();
+                applyType(targetType);
             }
 
             forcePreset();                          // synchronous pass
@@ -3247,14 +3257,12 @@ require __DIR__ . '/includes/header.php';
 if ($action === 'import_old_preview'):
     require_permission('asset', 'create');
 
-    // Test connection to old DB so we can warn early if unreachable
+    // Test connection to old inventory API so we can warn early if unreachable
     $oldDbError = null;
     try {
-        require_once __DIR__ . '/includes/old_inventory_db.php';
-        $testPdo  = old_inventory_db();
-        $oldCount = (int) $testPdo->query(
-            "SELECT COUNT(*) FROM asset WHERE archived_flag IS NULL OR archived_flag = 0"
-        )->fetchColumn();
+        require_once __DIR__ . '/includes/old_inventory_api.php';
+        $countData = old_inventory_api('count');
+        $oldCount  = (int) ($countData['count'] ?? 0);
     } catch (Throwable $e) {
         $oldDbError = $e->getMessage();
         $oldCount   = 0;
@@ -3276,17 +3284,16 @@ if ($action === 'import_old_preview'):
 
         <?php if ($oldDbError): ?>
         <div class="alert alert-error" style="margin-bottom:16px;">
-            <strong>Cannot connect to old inventory database.</strong><br>
+            <strong>Cannot reach the old inventory API.</strong><br>
             <code style="font-size:12px;"><?= h($oldDbError) ?></code><br><br>
-            Make sure the server at <strong>192.168.1.73</strong> allows connections from this machine,
-            and that the <code>inventory_live</code> database exists.<br>
-            On the remote server run:<br>
-            <code style="font-size:12px;">GRANT ALL ON inventory_live.* TO 'root'@'%'; FLUSH PRIVILEGES;</code>
+            Make sure <code>api_export_assets.php</code> is deployed and accessible on the old server
+            at <strong>192.168.1.249</strong>, and that the token in
+            <code>config/old_inventory_api.php</code> matches <code>API_TOKEN</code> in that file.
         </div>
         <?php else: ?>
         <div class="alert alert-info" style="margin-bottom:16px;">
-            Connected to <strong>inventory_live @ 192.168.1.73</strong> —
-            <strong><?= number_format($oldCount) ?></strong> active asset(s) found.
+            Old inventory API reachable —
+            <strong><?= number_format($oldCount) ?></strong> active asset(s) ready to import.
         </div>
         <?php endif; ?>
 
@@ -3325,7 +3332,7 @@ if ($action === 'import_old_run'):
     require_permission('asset', 'create');
     csrf_check();
 
-    require_once __DIR__ . '/includes/old_inventory_db.php';
+    require_once __DIR__ . '/includes/old_inventory_api.php';
     require_once __DIR__ . '/services/OldInventoryAssetImportService.php';
 
     $page_title  = 'Import Old Inventory — Results';

@@ -3196,7 +3196,18 @@ if ($action === 'view') {
                     <tr>
                         <td><?= $kindBadge ?></td>
                         <td>(<?= h($L['item_code']) ?>)-<?= h($L['item_label']) ?></td>
-                        <td class="r"><?= h(rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.')) ?></td>
+                        <td class="r">
+                            <?php
+                            if ($L['line_kind'] === 'receive') {
+                                // Show remaining (planned − received) so the column reflects
+                                // how much is still outstanding, not the original planned qty.
+                                $remaining = max(0, (float)$L['qty_planned'] - (float)$L['qty_received']);
+                                echo h(rtrim(rtrim(number_format($remaining, 3, '.', ''), '0'), '.'));
+                            } else {
+                                echo h(rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.'));
+                            }
+                            ?>
+                        </td>
                         <td class="r">
                             <?php if ($L['line_kind'] === 'ship'): ?>
                                 <?= h(rtrim(rtrim(number_format((float)$L['qty_shipped'], 3, '.', ''), '0'), '.')) ?>
@@ -3209,7 +3220,7 @@ if ($action === 'view') {
                                 <?= h(rtrim(rtrim(number_format((float)$L['qty_received'], 3, '.', ''), '0'), '.')) ?>
                                 <?php
                                 $rem = (float)$L['qty_planned'] - (float)$L['qty_received'];
-                                if ($rem > 0.0001) echo ' <span class="muted small">(' . h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) . ' open)</span>';
+                                if ($rem > 0.0001) echo ' <span class="pill pill-warn" style="font-size:11px;">' . h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) . ' open</span>';
                                 else echo ' <span class="pill pill-active">full</span>';
                                 ?>
                             <?php else: ?>
@@ -3302,16 +3313,17 @@ if ($action === 'view') {
                     receipts are fine — record additional events as more material arrives.
                 </p>
                 <form method="post" action="<?= h(url('/inventory_shiprcpt.php?action=receive_save')) ?>"
-                      style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1.5fr 2fr auto; gap: 10px; align-items: end;">
+                      style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1.5fr 2fr auto; gap: 10px; align-items: end;">
                     <?= csrf_field() ?>
                     <input type="hidden" name="id" value="<?= (int)$id ?>">
-                    <div class="field">
+                    <!-- Receive line spans full width on its own row -->
+                    <div class="field" style="grid-column: 1 / -1;">
                         <label>Receive line</label>
                         <select name="shipment_line_id" required>
                             <option value="">—</option>
                             <?php foreach ($lines as $L):
                                 if ($L['line_kind'] !== 'receive') continue;
-                                $rem = (float)$L['qty_planned'] - (float)$L['qty_received'];
+                                $rem = max(0, (float)$L['qty_planned'] - (float)$L['qty_received']);
                             ?>
                                 <option value="<?= (int)$L['id'] ?>">
                                     <?= h($L['item_code']) ?> — open: <?= h(rtrim(rtrim(number_format($rem, 3, '.', ''), '0'), '.')) ?> <?= h($L['item_uom']) ?>
@@ -3494,14 +3506,13 @@ $baseUnion = "
 
       UNION ALL
 
-      -- Branch 3: per-line planned rows. One row for each shipment
-      -- LINE that has no events recorded against it yet:
-      --   - receive lines with zero receipts posted
-      --   - ship lines with qty_shipped = 0
-      -- Once a line accrues an event, it disappears from this branch
-      -- and surfaces via branch 1 (receipt) or branch 2 (ship-out).
-      -- This way a 3-line shipment with no activity emits 3 rows,
-      -- not one collapsed N-more entry.
+      -- Branch 3: per-line planned rows.
+      --   - receive lines that still have qty left to receive
+      --     (qty_planned > qty_received — persists until fully received)
+      --   - ship lines with qty_shipped = 0 (no shipment event yet)
+      -- For partially-received lines this row shows the REMAINING qty
+      -- alongside the individual receipt rows from Branch 1, so the
+      -- operator always sees how much is still outstanding.
       SELECT
           CONCAT('P', sl.id)                   AS event_uid,
           'planned'                            AS direction,
@@ -3520,7 +3531,9 @@ $baseUnion = "
           i.code                               AS item_code,
           COALESCE(NULLIF(i.short_description, ''), i.name, sl.pending_name) AS item_name,
           NULL                                 AS qty,
-          sl.qty_planned                       AS line_qty_planned,
+          -- Show remaining (planned − received) so the planned row always
+          -- reflects what is still outstanding, not the original total.
+          GREATEST(0, sl.qty_planned - sl.qty_received) AS line_qty_planned,
           NULL                                 AS location_name,
           NULL                                 AS location_code,
           uc.full_name                         AS actor_name,
@@ -3538,7 +3551,7 @@ $baseUnion = "
        WHERE sh.status <> 'cancelled'
          AND (
                 (sl.line_kind = 'receive'
-                    AND NOT EXISTS (SELECT 1 FROM inv_receipts r3 WHERE r3.shipment_line_id = sl.id))
+                    AND sl.qty_planned > sl.qty_received)
                 OR
                 (sl.line_kind = 'ship' AND sl.qty_shipped = 0)
              )

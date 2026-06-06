@@ -1124,9 +1124,10 @@ if ($action === 'bom_grid') {
     // ----------------------------------------------------------------
     $allItems = [];
     foreach (db_all(
-        "SELECT i.*, u.label AS uom_label
+        "SELECT i.*, u.label AS uom_label, c.name AS category_name, c.code AS category_code
            FROM inv_items i
-           LEFT JOIN inv_uom u ON u.id = i.uom_id"
+           LEFT JOIN inv_uom u ON u.id = i.uom_id
+           LEFT JOIN categories c ON c.id = i.category_id"
     ) as $r) {
         $allItems[(int)$r['id']] = $r;
     }
@@ -1419,13 +1420,30 @@ if ($action === 'bom_grid') {
                 </details>
             </div>
         <?php endif; ?>
-        <table class="bom-grid dt-table" id="bomGrid">
+        <table class="bom-grid dt-table bgrid-fixed-layout" id="bomGrid">
+            <?php /* <colgroup> pins every column to a fixed width.
+                     Combined with table-layout:fixed this guarantees the
+                     layout never changes based on cell content — long product
+                     names clip with "..." instead of expanding the column.
+                     bom-col-name has no width so it takes all remaining space.
+                     JS resize handles may override individual th.style.width
+                     at runtime; that's fine — colgroup is just the default. */ ?>
+            <colgroup>
+                <col class="bom-col-name">
+                <col class="bom-col-cat">
+                <col class="bom-col-num">
+                <col class="bom-col-num">
+                <col class="bom-col-num">
+                <col class="bom-col-rework">
+                <col class="bom-col-actions">
+            </colgroup>
             <caption style="caption-side:top; text-align:right; padding:2px 4px;">
                 <span class="muted small" title="Renderer build — confirms which version is live">grid renderer build 2026-05-28d (two-row header)</span>
             </caption>
             <thead>
                 <tr>
                     <th data-bgrid-col="name">Product Name <span class="bom-cog" title="Column settings (coming soon)">⚙</span><span class="bgrid-resize-handle"></span></th>
+                    <th class="bom-cat-col" data-bgrid-col="cat">Category</th>
                     <th class="r" data-bgrid-col="avb">Avb <span class="bom-cog">⚙</span><span class="bgrid-resize-handle"></span></th>
                     <th class="r" data-bgrid-col="rej">REJ <span class="bom-cog">⚙</span><span class="bgrid-resize-handle"></span></th>
                     <th class="r" data-bgrid-col="tbr">TBR <span class="bom-cog">⚙</span><span class="bgrid-resize-handle"></span></th>
@@ -1435,7 +1453,7 @@ if ($action === 'bom_grid') {
             </thead>
         <tbody id="bom-grid-body">
             <?php if (!$products): ?>
-                <tr><td colspan="6" class="empty">No finished goods<?= $divFilter === 'all' ? '' : ' in this division' ?>.</td></tr>
+                <tr><td colspan="7" class="empty">No finished goods<?= $divFilter === 'all' ? '' : ' in this division' ?>.</td></tr>
             <?php else: foreach ($products as $p):
                 $flat = [];
                 // Root row: depth 0, no parent_line, no line_id, qty 1.
@@ -1447,7 +1465,7 @@ if ($action === 'bom_grid') {
                     if (!empty($row['_truncated'])) {
                         ?>
                         <tr class="bom-grid-row bom-truncated-row" data-depth="<?= (int)$row['depth'] ?>">
-                            <td class="bom-name-cell" colspan="6" style="padding-left: <?= 10 + $row['depth'] * 24 ?>px;">
+                            <td class="bom-name-cell" colspan="7" style="padding-left: <?= 10 + $row['depth'] * 24 ?>px;">
                                 <span class="bom-toggle-spacer"></span>
                                 <span class="pill pill-warn" title="BOM tree truncated at depth 50">⚠ tree truncated (depth&nbsp;&gt;&nbsp;50)</span>
                             </td>
@@ -1485,14 +1503,7 @@ if ($action === 'bom_grid') {
                             (<?= h($item['code']) ?>)-<?= h($item['short_description'] ?: $item['name']) ?>
                         </a>
                         <?php
-                            // Pending-SO badge driven by the local
-                            // inv_so_pending_summary table (pushed in
-                            // from the external SO app — see
-                            // /api/so_pending.php and
-                            // docs/SO_INTEGRATION_API.md). Suppressed
-                            // when the part has no open SOs so a clean
-                            // tree reads naturally; full description
-                            // in the title="" tooltip.
+                            // Pending-SO badge (open sales orders for this part).
                             $soE = $soPending[$item['code']] ?? null;
                             if ($soE && ($soE['so_count'] > 0 || $soE['qty_pending'] > 0)):
                                 $soQ = rtrim(rtrim(number_format((float)$soE['qty_pending'], 3, '.', ''), '0'), '.');
@@ -1510,6 +1521,15 @@ if ($action === 'bom_grid') {
                         <?php endif; ?>
                         <?php if ($row['depth'] === 0 && (int)$item['stock_on_hand']): ?>
                             <span class="muted" style="color: #b00; margin-left: 6px;">(<?= (int)$item['stock_on_hand'] ?>)</span>
+                        <?php endif; ?>
+                    </td>
+                    <?php
+                        // Dedicated category column — always aligned regardless of name length.
+                        $catName = $item['category_name'] ?? '';
+                    ?>
+                    <td class="bom-cat-col">
+                        <?php if ($catName !== ''): ?>
+                            <span class="bom-cat-badge" title="<?= h($catName) ?>"><?= h($catName) ?></span>
                         <?php endif; ?>
                     </td>
                     <?php
@@ -1576,6 +1596,7 @@ if ($action === 'bom_grid') {
         <tfoot class="bom-filter-foot">
             <tr class="bom-filter-row">
                 <th><div class="dt-filter-pill"><span class="dt-filter-icon">🔍</span><input type="text" data-bgcol="name" placeholder="Product Name…"></div></th>
+                <th class="bom-cat-col"></th>
                 <th><div class="dt-filter-pill"><span class="dt-filter-icon">🔍</span><input type="text" data-bgcol="avb"  placeholder="Avb…"></div></th>
                 <th><div class="dt-filter-pill"><span class="dt-filter-icon">🔍</span><input type="text" data-bgcol="rej"  placeholder="REJ…"></div></th>
                 <th><div class="dt-filter-pill"><span class="dt-filter-icon">🔍</span><input type="text" data-bgcol="tbr"  placeholder="TBR…"></div></th>
@@ -1877,7 +1898,7 @@ if ($action === 'bom_grid') {
             // Collect every active filter (column -> query string).
             // We look up inputs by data-bgcol, which is stable whether
             // the filter row lives in <thead> or <tfoot>.
-            var colIdx = { name:0, avb:1, rej:2, tbr:3, mb:4 };
+            var colIdx = { name:0, avb:2, rej:3, tbr:4, mb:5 }; // col 1 = category (no filter)
             var queries = [];
             Object.keys(colIdx).forEach(function (col) {
                 var el = document.querySelector('.bom-filter-row input[data-bgcol="' + col + '"]');
