@@ -44,13 +44,8 @@ function po_render_print_html($poId, array $opts = [])
     $lines    = $full['lines'];
     $recv     = $full['receive_lines'];
 
-    $priceByItem = [];
-    foreach ($recv as $r) {
-        $priceByItem[(int)$r['item_id']] = [
-            'price'   => $r['price'],
-            'gst_pct' => $r['gst_pct'],
-        ];
-    }
+    // Price and GST come directly from inv_shipment_lines (unit_price, gst_rate).
+    // The old inv_shipment_receive_lines approach is removed — that table does not exist.
     $blankPrice = po_has_blank_priced_lines((int)$po['shipment_id']);
     $blankNote  = magdyn_setting('shiprcpt.system_note_blank_price', '');
     $terms      = (string)($shipment['terms_conditions'] ?? '') !== ''
@@ -179,19 +174,23 @@ function po_render_print_html($poId, array $opts = [])
     <thead>
         <tr>
             <th style="width: 3.5%;">#</th>
-            <th style="width: 14%;">Code / Tag</th>
+            <th style="width: 12%;">Code / Tag</th>
             <th>Description</th>
-            <th style="width: 7%;">UOM</th>
-            <th class="num" style="width: 9%;">Qty</th>
-            <th style="width: 9.5%;">Before</th>
-            <th style="width: 9.5%;">Delivery</th>
-            <th class="num" style="width: 10%;">Price</th>
+            <th style="width: 6%;">UOM</th>
+            <th class="num" style="width: 7%;">Qty</th>
+            <th style="width: 8%;">Before</th>
+            <th style="width: 8%;">Delivery</th>
+            <th class="num" style="width: 9%;">Unit Price</th>
             <th class="num" style="width: 6%;">GST %</th>
+            <th class="num" style="width: 9%;">Line Total</th>
         </tr>
     </thead>
     <tbody>
-        <?php if (!$lines): ?>
-            <tr><td colspan="9" class="small" style="text-align:center;">No lines.</td></tr>
+        <?php
+        $subtotal = 0.0;
+        $totalGst = 0.0;
+        if (!$lines): ?>
+            <tr><td colspan="10" class="small" style="text-align:center;">No lines.</td></tr>
         <?php else: foreach ($lines as $idx => $l):
             $isAsset   = $l['entity_type'] === 'asset';
             $isPending = !$isAsset && empty($l['item_id']) && !empty($l['pending_name']);
@@ -201,10 +200,17 @@ function po_render_print_html($poId, array $opts = [])
             $desc = $isAsset
                   ? ($l['asset_model'] ?: '')
                   : ($l['item_name'] ?: ($l['pending_name'] ?? ''));
-            $price = isset($priceByItem[(int)$l['item_id']]) ? $priceByItem[(int)$l['item_id']]['price']   : null;
-            $gst   = isset($priceByItem[(int)$l['item_id']]) ? $priceByItem[(int)$l['item_id']]['gst_pct'] : null;
-            $qtyDisp = rtrim(rtrim((string)$l['qty_planned'], '0'), '.');
-            if ($qtyDisp === '') $qtyDisp = '0';
+            // Price and GST come directly from the line row (inv_shipment_lines columns).
+            $price = ($l['unit_price'] !== null && $l['unit_price'] !== '') ? (float)$l['unit_price'] : null;
+            $gst   = ($l['gst_rate']   !== null && $l['gst_rate']   !== '') ? (float)$l['gst_rate']   : null;
+            $qty   = (float)($l['qty_planned'] ?? 0);
+            $qtyDisp = rtrim(rtrim(number_format($qty, 3), '0'), '.');
+            if ($qtyDisp === '' || $qtyDisp === '.') $qtyDisp = '0';
+            // Line totals
+            $lineTotal    = $price !== null ? $price * $qty : 0.0;
+            $lineGstAmt   = ($price !== null && $gst !== null) ? ($lineTotal * $gst / 100) : 0.0;
+            $subtotal    += $lineTotal;
+            $totalGst    += $lineGstAmt;
         ?>
             <tr>
                 <td><?= $idx + 1 ?></td>
@@ -214,11 +220,30 @@ function po_render_print_html($poId, array $opts = [])
                 <td class="num"><strong><?= h($qtyDisp) ?></strong></td>
                 <td><?= h($l['before_date'] ?? '—') ?></td>
                 <td><?= h($l['delivery_date'] ?? '—') ?></td>
-                <td class="num"><?= $price !== null ? h(number_format((float)$price, 2)) : '<span class="small">—</span>' ?></td>
-                <td class="num"><?= $gst !== null ? h(rtrim(rtrim((string)$gst, '0'), '.')) : '<span class="small">—</span>' ?></td>
+                <td class="num"><?= $price !== null ? '₹ ' . number_format($price, 2) : '<span class="small">—</span>' ?></td>
+                <td class="num"><?= $gst !== null ? rtrim(rtrim(number_format($gst, 2), '0'), '.') . ' %' : '<span class="small">—</span>' ?></td>
+                <td class="num"><?= $price !== null ? '₹ ' . number_format($lineTotal + $lineGstAmt, 2) : '<span class="small">—</span>' ?></td>
             </tr>
         <?php endforeach; endif; ?>
     </tbody>
+    <?php
+    $grandTotal = $subtotal + $totalGst;
+    if ($lines): ?>
+    <tfoot>
+        <tr>
+            <td colspan="9" class="num" style="background:#f4f4f7; font-weight:bold;">Subtotal</td>
+            <td class="num" style="background:#f4f4f7; font-weight:bold;">₹ <?= number_format($subtotal, 2) ?></td>
+        </tr>
+        <tr>
+            <td colspan="9" class="num" style="background:#f4f4f7;">GST</td>
+            <td class="num" style="background:#f4f4f7;">₹ <?= number_format($totalGst, 2) ?></td>
+        </tr>
+        <tr>
+            <td colspan="9" class="num" style="background:#e8ecf4; font-weight:bold; font-size:12px;">Grand Total</td>
+            <td class="num" style="background:#e8ecf4; font-weight:bold; font-size:12px;">₹ <?= number_format($grandTotal, 2) ?></td>
+        </tr>
+    </tfoot>
+    <?php endif; ?>
 </table>
 
 <?php if ($blankPrice && $blankNote): ?>

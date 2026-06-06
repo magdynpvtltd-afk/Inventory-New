@@ -1703,12 +1703,32 @@ if ($action === 'templates') {
         'columns' => [
             ['key'=>'code',            'label'=>'Code',       'sortable'=>true, 'searchable'=>true, 'sql_col'=>'t.code'],
             ['key'=>'name',            'label'=>'Name',       'sortable'=>true, 'searchable'=>true, 'sql_col'=>'t.name'],
-            ['key'=>'inspection_type', 'label'=>'For',        'sortable'=>true, 'sql_col'=>'t.inspection_type'],
+            ['key'=>'inspection_type', 'label'=>'For', 'sortable'=>true, 'sql_col'=>'t.inspection_type',
+             'filter' => [
+                 'type' => 'select',
+                 'placeholder' => 'all types',
+                 'options' => [
+                     ['value' => 'any',            'label' => 'Any'],
+                     ['value' => 'incoming',        'label' => 'Incoming material'],
+                     ['value' => 'asset_cal',       'label' => 'Asset calibration'],
+                     ['value' => 'finished_goods',  'label' => 'Finished goods QC'],
+                     ['value' => 'first_article',   'label' => 'First article'],
+                     ['value' => 'adhoc',           'label' => 'Ad-hoc'],
+                 ],
+             ]],
             ['key'=>'item_count',      'label'=>'Items',      'sortable'=>false, 'th_class'=>'r','td_class'=>'r'],
             ['key'=>'target_count',    'label'=>'Linked to',  'sortable'=>false, 'th_class'=>'r','td_class'=>'r'],
             ['key'=>'use_count',       'label'=>'Used by',    'sortable'=>false, 'th_class'=>'r','td_class'=>'r'],
             ['key'=>'creator_name',    'label'=>'Created by','sortable'=>true,  'sql_col'=>'u.full_name'],
-            ['key'=>'is_active',       'label'=>'Status',     'sortable'=>true,  'sql_col'=>'t.is_active'],
+            ['key'=>'is_active',       'label'=>'Status',     'sortable'=>true,  'sql_col'=>'t.is_active',
+             'filter' => [
+                 'type' => 'select',
+                 'placeholder' => 'all',
+                 'options' => [
+                     ['value' => '1', 'label' => 'Active'],
+                     ['value' => '0', 'label' => 'Inactive'],
+                 ],
+             ]],
             ['key'=>'_actions',        'label'=>'',           'sortable'=>false, 'th_class'=>'r','td_class'=>'r nowrap'],
         ],
         'default_sort' => ['name', 'asc'],
@@ -2399,11 +2419,12 @@ if ($action === 'template_edit' || $action === 'template_new') {
                     <label for="f_desc">Description</label>
                     <textarea id="f_desc" name="description" rows="2"><?= h($tpl['description'] ?? '') ?></textarea>
                 </div>
-                <div class="field span-4">
-                    <label class="inline">
-                        <input type="checkbox" name="is_active" value="1" <?= ($tpl['is_active'] ?? 1) ? 'checked' : '' ?>>
-                        Active
-                    </label>
+                <div class="field">
+                    <label for="f_is_active">Status</label>
+                    <select id="f_is_active" name="is_active" class="no-combobox">
+                        <option value="1" <?= ($tpl['is_active'] ?? 1) ? 'selected' : '' ?>>Active</option>
+                        <option value="0" <?= !($tpl['is_active'] ?? 1) ? 'selected' : '' ?>>Inactive</option>
+                    </select>
                 </div>
             </div>
 

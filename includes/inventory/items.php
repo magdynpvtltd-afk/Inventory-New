@@ -1046,6 +1046,33 @@ if ($action === 'item_new' || $action === 'item_edit') {
                     <?php endif; ?>
                 </span>
             </div>
+            <?php if ($isEdit): ?>
+            <div class="field">
+                <label>Location(s)</label>
+                <?php
+                $locationStocks = db_all(
+                    'SELECT l.code AS loc_code, l.name AS loc_name, s.qty
+                       FROM inv_item_location_stock s
+                       JOIN locations l ON l.id = s.location_id
+                      WHERE s.item_id = ?
+                      ORDER BY l.name',
+                    [$id]
+                );
+                if ($locationStocks): ?>
+                    <div style="padding: 4px 0; display: flex; flex-wrap: wrap; gap: 4px;">
+                        <?php foreach ($locationStocks as $ls):
+                            $qty = rtrim(rtrim(number_format((float)$ls['qty'], 3), '0'), '.');
+                            if ($qty === '' || $qty === '.') $qty = '0';
+                        ?>
+                            <span class="pill pill-neutral" title="<?= h($ls['loc_name']) ?>"><?= h($ls['loc_code']) ?>: <?= h($qty) ?></span>
+                        <?php endforeach; ?>
+                    </div>
+                <?php else: ?>
+                    <span class="muted small">No stock at any location</span>
+                <?php endif; ?>
+                <span class="muted small">Current stock locations — read-only.</span>
+            </div>
+            <?php endif; ?>
             <div class="field">
                 <label for="f_short_desc">Short Description *</label>
                 <input id="f_short_desc" name="short_description" type="text" required tabindex="1"

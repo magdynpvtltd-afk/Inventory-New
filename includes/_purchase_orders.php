@@ -170,8 +170,8 @@ function po_has_blank_priced_lines($shipmentId)
     try {
         $n = db_val(
             "SELECT COUNT(*)
-               FROM inv_shipment_receive_lines
-              WHERE shipment_id = ? AND (price IS NULL OR price = 0)",
+               FROM inv_shipment_lines
+              WHERE shipment_id = ? AND (unit_price IS NULL OR unit_price = 0)",
             [(int)$shipmentId], 0
         );
         return (int)$n > 0;

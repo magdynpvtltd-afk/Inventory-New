@@ -53,6 +53,25 @@ if ($action === 'download_pdf') {
     exit;
 }
 
+// ============================================================
+// VIEW PDF — serve PDF inline so browser opens its built-in viewer
+// ============================================================
+if ($action === 'view_pdf') {
+    require_permission('purchase_orders', 'print');
+    require_once __DIR__ . '/includes/_po_pdf.php';
+    $id = (int)input('id', 0);
+    $pdf = po_render_pdf($id);
+    if (!$pdf) { http_response_code(404); echo 'PO not found.'; exit; }
+    header('Content-Type: application/pdf');
+    header('Content-Length: ' . filesize($pdf['path']));
+    header('Content-Disposition: inline; filename="' . addslashes($pdf['name']) . '"');
+    header('Cache-Control: private, max-age=60');
+    readfile($pdf['path']);
+    @unlink($pdf['path']);
+    @rmdir(dirname($pdf['path']));
+    exit;
+}
+
 
 // ============================================================
 // EMAIL — composer + send (shared with transmittals via _email_compose.php)

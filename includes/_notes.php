@@ -1249,6 +1249,49 @@ function notes_popup_assets()
             var modal = getModal();
             if (e.key === 'Escape' && modal && !modal.hidden) close();
         });
+
+        // Intercept redact / unredact / delete form submissions inside the modal
+        // so the popup stays open. Runs in bubble phase (after onsubmit inline
+        // handler) so e.defaultPrevented is true when user cancels a confirm.
+        document.addEventListener('submit', function (e) {
+            // Skip if the inline onsubmit already cancelled (user hit "Cancel" on confirm)
+            if (e.defaultPrevented) return;
+
+            var modal = getModal();
+            if (!modal || modal.hidden) return;
+            var body = getBody();
+            if (!body || !body.contains(e.target)) return;
+
+            var form = e.target;
+            var actionInp = form.querySelector('input[name="note_action"]');
+            if (!actionInp) return;
+            var noteAction = actionInp.value;
+            if (noteAction !== 'redact' && noteAction !== 'unredact' && noteAction !== 'delete') return;
+
+            e.preventDefault();
+
+            var fd = new FormData(form);
+            fd.set('ajax', '1');
+            fd.set('return_to', window.location.pathname + window.location.search);
+
+            fetch(form.action, { method: 'POST', body: fd, credentials: 'same-origin' })
+                .then(function (r) { return r.text(); })
+                .then(function (html) {
+                    var b = getBody();
+                    if (!b) return;
+                    b.innerHTML = html;
+                    b.querySelectorAll('script').forEach(function (oldS) {
+                        var s = document.createElement('script');
+                        if (oldS.src) s.src = oldS.src;
+                        else s.text = oldS.textContent;
+                        oldS.parentNode.replaceChild(s, oldS);
+                    });
+                })
+                .catch(function () {
+                    // Network failure — fall back to normal submit (closes modal)
+                    form.submit();
+                });
+        }, false);
     })();
     </script>
     <?php

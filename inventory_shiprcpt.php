@@ -3656,7 +3656,7 @@ $rowRenderer = function ($r) use ($canManage) {
               . '<code>' . h($r['ship_no']) . '</code></a>';
 
     $poCell = !empty($r['po_id'])
-        ? '<a href="' . h(url('/purchase_orders.php?action=download_pdf&id=' . (int)$r['po_id'])) . '" target="_blank" title="Download PO PDF">'
+        ? '<a href="' . h(url('/purchase_orders.php?action=view_pdf&id=' . (int)$r['po_id'])) . '" target="_blank" title="View PO PDF">'
           . '<code>' . h($r['po_no']) . '</code></a>'
         : '<span class="muted">—</span>';
 

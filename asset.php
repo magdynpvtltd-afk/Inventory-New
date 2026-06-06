@@ -1211,6 +1211,7 @@ if ($action === 'txn_save') {
         case 'send_vendor':
             $to_vendor = (int)input('to_vendor_id', 0) ?: null;
             if (!$to_vendor) { flash_set('error', 'Pick a vendor.'); redirect($errRedir); }
+            $to_loc = (int)input('to_location_id', 0) ?: null;  // optional: expected return-to location
             $newVendor = $to_vendor; $newStatus = 'with_vendor';
             $newLocation = null;
             break;
@@ -1222,6 +1223,7 @@ if ($action === 'txn_save') {
         case 'send_user':
             $to_user = (int)input('to_user_id', 0) ?: null;
             if (!$to_user) { flash_set('error', 'Pick a user.'); redirect($errRedir); }
+            $to_loc = (int)input('to_location_id', 0) ?: null;  // optional: expected return-to location
             $newUser = $to_user; $newStatus = 'with_user';
             $newLocation = null;
             break;
@@ -1977,7 +1979,7 @@ if ($action === 'view') {
             "SELECT n.entity_id AS tid, COUNT(na.id) AS c
                FROM notes n
                JOIN note_attachments na ON na.note_id = n.id
-              WHERE n.entity_type = 'asset_txn' AND n.is_deleted = 0
+              WHERE n.entity_type = 'asset_txn' AND n.is_deleted = 0 AND n.redacted_at IS NULL
                 AND n.entity_id IN ($inTxn)
               GROUP BY n.entity_id"
         ) as $r) {
@@ -2442,7 +2444,17 @@ if ($action === 'txn') {
         var due = document.querySelector('.js-due-target');
         function apply() {
             var t = sel.value;
-            loc.style.display = (t === 'move' || t === 'receive_vendor' || t === 'receive_user') ? '' : 'none';
+            // Destination location is shown for all types:
+            // required for move/receive, optional for send types (records expected return-to location).
+            loc.style.display = '';
+            var locLbl = loc.querySelector('label');
+            if (locLbl) {
+                if (t === 'send_vendor' || t === 'send_user') {
+                    locLbl.textContent = 'Destination Location (optional)';
+                } else {
+                    locLbl.textContent = 'Destination location';
+                }
+            }
             ven.style.display = (t === 'send_vendor') ? '' : 'none';
             usr.style.display = (t === 'send_user') ? '' : 'none';
             // Due date only applies when handing the asset out.
@@ -2732,7 +2744,7 @@ if ($action === 'list') {
                                 ORDER BY t.at DESC, t.id DESC LIMIT 1) AS checkout_issued_at,
                               (SELECT COUNT(na.id) FROM note_attachments na
                                  JOIN notes n ON n.id = na.note_id
-                                WHERE n.entity_type = "asset" AND n.entity_id = a.id AND n.is_deleted = 0) AS att_count
+                                WHERE n.entity_type = "asset" AND n.entity_id = a.id AND n.is_deleted = 0 AND n.redacted_at IS NULL) AS att_count
                          FROM assets a
                          LEFT JOIN asset_models am ON am.id = a.model_id
                          LEFT JOIN locations l     ON l.id  = a.location_id
@@ -2998,7 +3010,14 @@ if ($action === 'list') {
         function applyType() {
             var ts = document.getElementById('modal-txn-type');
             var t  = ts ? ts.value : 'move';
-            locF.style.display = (t === 'move' || t === 'receive_vendor' || t === 'receive_user') ? '' : 'none';
+            // Destination location shown for all types; label changes for send types.
+            locF.style.display = '';
+            var locLbl = locF.querySelector('label');
+            if (locLbl) {
+                locLbl.textContent = (t === 'send_vendor' || t === 'send_user')
+                    ? 'Destination Location (optional)'
+                    : 'Destination location';
+            }
             venF.style.display = (t === 'send_vendor') ? '' : 'none';
             usrF.style.display = (t === 'send_user')   ? '' : 'none';
             dueF.style.display = (t === 'send_vendor' || t === 'send_user') ? '' : 'none';
