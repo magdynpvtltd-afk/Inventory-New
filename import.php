@@ -33,6 +33,7 @@
 
 require_once __DIR__ . '/includes/bootstrap.php';
 require_once __DIR__ . '/includes/_codes.php';  // for code_next('inv_item') — admin-managed sequence
+require_once __DIR__ . '/includes/_vendor_sql_import.php';  // vendor SQL-dump import helpers
 require_once __DIR__ . '/includes/_notes.php';  // for _notes_uploads_base() used to store the XML as a note attachment
 require_once __DIR__ . '/includes/_dms.php';    // for doc_find_by_no(), doc_link_entity(), doc creation (documents_bom)
 require_once __DIR__ . '/includes/_ecn.php';    // for ecn_auto_draft_for_major_rev() — Phase 2 rev-change flow
@@ -80,14 +81,30 @@ if ($action === 'list') {
                 </a>
             <?php endif; ?>
 
+            <?php if (permission_check('import', 'vendors_sql')): ?>
+                <a href="<?= h(url('/import.php?action=vendors_sql')) ?>"
+                   style="display:block;padding:18px;border:1px solid var(--border);border-radius:8px;background:var(--surface);text-decoration:none;color:inherit;transition:border-color 0.12s,box-shadow 0.12s;"
+                   onmouseover="this.style.borderColor='var(--primary)';this.style.boxShadow='0 4px 12px rgba(29,78,216,0.08)';"
+                   onmouseout="this.style.borderColor='var(--border)';this.style.boxShadow='none';">
+                    <div style="font-size:22px;margin-bottom:8px;">🏭</div>
+                    <div style="font-weight:600;font-size:15px;margin-bottom:4px;">SQL &mdash; Vendors (legacy)</div>
+                    <div class="muted" style="font-size:12.5px;line-height:1.5;">
+                        Import vendor companies, contacts, and addresses from the old
+                        <code>inventory_live</code> MySQL dump. Maps <code>company</code>,
+                        <code>contact</code>, and <code>address</code> tables. Duplicates
+                        (same vendor name) are skipped automatically.
+                    </div>
+                </a>
+            <?php endif; ?>
+
             <?php
-            // Placeholder for future importers. Add more cards here as
-            // additional permission-gated import flows ship.
-            $hasAnyImporter = permission_check('import', 'xml_inv_items');
+            $hasAnyImporter = permission_check('import', 'xml_inv_items')
+                           || permission_check('import', 'vendors_sql');
             if (!$hasAnyImporter): ?>
                 <p class="muted">
-                    No import flows are available to you. Ask an admin to grant <code>import.xml_inv_items</code>
-                    (or another importer permission) under Admin &middot; Roles.
+                    No import flows are available to you. Ask an admin to grant an importer permission
+                    (e.g. <code>import.xml_inv_items</code> or <code>import.vendors_sql</code>)
+                    under Admin &middot; Roles.
                 </p>
             <?php endif; ?>
         </div>
@@ -1631,6 +1648,360 @@ if ($action === 'xml_inv_items_commit') {
         flash_set('info', 'Affected codes (first 8): ' . implode(', ', $sample) . (count(array_merge($insertedCodes, $updatedCodes)) > 8 ? ' …' : ''));
     }
     redirect(url('/import.php'));
+}
+
+// ============================================================
+// Vendor SQL dump: upload form
+// ============================================================
+if ($action === 'vendors_sql') {
+    require_permission('import', 'vendors_sql');
+
+    $page_title  = 'Import &middot; Vendors (legacy SQL)';
+    $page_module = 'import';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <?= form_toolbar([
+        'back_href'  => url('/import.php'),
+        'back_label' => 'Back to import',
+        'title'      => 'SQL &mdash; Vendors (legacy)',
+        'subtitle'   => 'Step 1 of 2 &mdash; upload',
+    ]) ?>
+    <div style="padding: 22px; max-width: 760px;">
+        <p class="muted" style="line-height:1.6;">
+            Upload the <code>inventory_live</code> MySQL SQL dump file. The importer reads the
+            <code>company</code>, <code>contact</code>, and <code>address</code> tables and creates
+            vendor records in the new system. Vendors whose name already exists are automatically
+            skipped to prevent duplicates.
+        </p>
+
+        <form method="post" action="<?= h(url('/import.php?action=vendors_sql_preview')) ?>"
+              enctype="multipart/form-data" style="margin-top: 18px;">
+            <?= csrf_field() ?>
+            <div style="border:1px dashed var(--border);border-radius:8px;padding:24px;background:var(--surface-alt);">
+                <label style="display:block;font-weight:600;margin-bottom:8px;">SQL dump file <span style="color:#dc2626;">*</span></label>
+                <input type="file" name="sql_file" accept=".sql,text/plain,application/sql" required
+                       style="display:block;width:100%;padding:8px;background:white;border:1px solid var(--border);border-radius:4px;">
+                <p class="muted small" style="margin:8px 0 0;">
+                    Max 80 MB. Must contain the <code>inventory_live</code> tables:
+                    <code>company</code>, <code>address</code>, <code>contact</code>.
+                    Parsing may take a few seconds for large files.
+                </p>
+            </div>
+
+            <div style="margin-top:18px;display:flex;gap:10px;">
+                <button type="submit" class="btn btn-primary">Parse &amp; preview &rarr;</button>
+                <a href="<?= h(url('/import.php')) ?>" class="btn btn-ghost">Cancel</a>
+            </div>
+        </form>
+
+        <details style="margin-top:24px;">
+            <summary style="cursor:pointer;font-weight:600;color:var(--text);font-size:13px;">Field mapping details</summary>
+            <div class="muted small" style="margin-top:10px;line-height:1.7;">
+                <p><strong>company → vendors:</strong></p>
+                <ul style="margin:4px 0 10px 18px;">
+                    <li><code>short_description</code> → <code>name</code></li>
+                    <li><code>company_custom_field.cfv_18</code> → <code>gst_no</code> (GSTIN)</li>
+                    <li><code>website</code>, <code>long_description</code>, <code>cfv_33</code> (bank details) → <code>notes</code></li>
+                    <li>All vendors are imported as active.</li>
+                </ul>
+                <p><strong>contact → vendor_contacts:</strong></p>
+                <ul style="margin:4px 0 10px 18px;">
+                    <li><code>title</code> → <code>salutation</code> (Mr / Ms / Mrs / Dr etc.)</li>
+                    <li><code>first_name</code> + <code>last_name</code> → <code>name</code></li>
+                    <li><code>phone_mobile</code> (or office / home) → <code>phone</code></li>
+                    <li><code>email</code> → <code>email</code></li>
+                    <li><code>description</code> → <code>designation</code></li>
+                    <li>First contact per vendor is marked primary.</li>
+                </ul>
+                <p><strong>address → vendor_addresses:</strong></p>
+                <ul style="margin:4px 0 10px 18px;">
+                    <li><code>short_description</code> → <code>label</code></li>
+                    <li><code>address_1</code> → <code>line1</code>, <code>address_2</code> → <code>line2</code></li>
+                    <li><code>city</code> → <code>city</code>, <code>postal_code</code> → <code>pincode</code></li>
+                    <li><code>country_id</code> → <code>country</code> (looked up from <code>country</code> table)</li>
+                    <li><code>state_province_id</code> → <code>state</code> (looked up from <code>state_province</code> table)</li>
+                    <li>The company's primary address (<code>company.address_id</code>) is marked primary.</li>
+                </ul>
+                <p><strong>Skipped:</strong> vendors whose name already exists in the system (case-insensitive match).</p>
+            </div>
+        </details>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+// ============================================================
+// Vendor SQL dump: parse + preview
+// ============================================================
+if ($action === 'vendors_sql_preview') {
+    require_permission('import', 'vendors_sql');
+    csrf_check();
+
+    // Validate upload
+    if (empty($_FILES['sql_file']) || $_FILES['sql_file']['error'] !== UPLOAD_ERR_OK) {
+        flash_set('error', 'No file uploaded or upload failed (code ' . ($_FILES['sql_file']['error'] ?? '?') . ').');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+    $tmp      = $_FILES['sql_file']['tmp_name'];
+    $origName = (string)($_FILES['sql_file']['name'] ?? 'import.sql');
+
+    if (!is_uploaded_file($tmp)) {
+        flash_set('error', 'Upload failed safety check.');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+    $maxBytes = 80 * 1024 * 1024;  // 80 MB
+    if ((int)@filesize($tmp) > $maxBytes) {
+        flash_set('error', 'File is larger than 80 MB. Please split or trim the dump first.');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+
+    // Persist the file so it survives to the commit step
+    $sqlMeta = vsql_persist_upload($tmp, $origName);
+    if (!$sqlMeta) {
+        flash_set('error', 'Could not store the uploaded file. Check that uploads/notes/import_sql is writable.');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+
+    // Parse — this may take a few seconds for large files
+    try {
+        $data = vsql_prepare_import($sqlMeta['path']);
+    } catch (\Throwable $e) {
+        flash_set('error', 'Parse failed: ' . $e->getMessage());
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+
+    // Stash parsed data + file path in session
+    $token = bin2hex(random_bytes(16));
+    if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+    $_SESSION['import_vendors_sql'][$token] = [
+        'data'       => $data,
+        'sql_path'   => $sqlMeta['path'],
+        'sql_name'   => $sqlMeta['filename'],
+        'created_at' => time(),
+        'uid'        => (int)current_user_id(),
+    ];
+    // Keep only 3 most-recent payloads to avoid session bloat
+    if (count($_SESSION['import_vendors_sql']) > 3) {
+        $all = $_SESSION['import_vendors_sql'];
+        uasort($all, function ($a, $b) { return $b['created_at'] - $a['created_at']; });
+        $_SESSION['import_vendors_sql'] = array_slice($all, 0, 3, true);
+    }
+
+    $counts   = $data['counts'];
+    $vendors  = $data['vendors'];
+    $warnings = $data['warnings'];
+
+    $page_title  = 'Import &middot; Vendors &middot; Preview';
+    $page_module = 'import';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <?= form_toolbar([
+        'back_href'  => url('/import.php?action=vendors_sql'),
+        'back_label' => 'Upload a different file',
+        'title'      => 'SQL &mdash; Vendors (legacy)',
+        'subtitle'   => 'Step 2 of 2 &mdash; preview &amp; commit',
+    ]) ?>
+    <div style="padding: 18px 22px;">
+
+        <!-- Summary pills -->
+        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;">
+            <div style="flex:1;min-width:130px;padding:14px 16px;border:1px solid var(--border);border-radius:6px;background:#f0fdf4;">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#166534;">New vendors</div>
+                <div style="font-size:22px;font-weight:600;color:#166534;"><?= (int)$counts['insert'] ?></div>
+            </div>
+            <div style="flex:1;min-width:130px;padding:14px 16px;border:1px solid var(--border);border-radius:6px;background:#f8fafc;">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#64748b;">Skipped (exist)</div>
+                <div style="font-size:22px;font-weight:600;color:#64748b;"><?= (int)$counts['skip'] ?></div>
+            </div>
+            <div style="flex:1;min-width:130px;padding:14px 16px;border:1px solid var(--border);border-radius:6px;background:#eef2ff;">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#3730a3;">Addresses</div>
+                <div style="font-size:22px;font-weight:600;color:#3730a3;"><?= (int)$counts['addresses'] ?></div>
+            </div>
+            <div style="flex:1;min-width:130px;padding:14px 16px;border:1px solid var(--border);border-radius:6px;background:#fff7ed;">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#c2410c;">Contacts</div>
+                <div style="font-size:22px;font-weight:600;color:#c2410c;"><?= (int)$counts['contacts'] ?></div>
+            </div>
+        </div>
+
+        <p class="muted small" style="margin-bottom:12px;">
+            From <code><?= h($sqlMeta['filename']) ?></code> &middot;
+            <?= count($vendors) ?> vendor<?= count($vendors) === 1 ? '' : 's' ?> parsed.
+            Green rows will be inserted; grey rows are already in the system and will be skipped.
+        </p>
+
+        <?php foreach ($warnings as $w): ?>
+            <div style="margin-bottom:12px;padding:10px 14px;background:#fef3c7;border-left:3px solid #d97706;border-radius:4px;font-size:13px;color:#78350f;">
+                ⚠ <?= h($w) ?>
+            </div>
+        <?php endforeach; ?>
+
+        <?php if ($counts['insert'] > 0): ?>
+        <form method="post" action="<?= h(url('/import.php?action=vendors_sql_commit')) ?>" style="display:inline;margin-bottom:14px;">
+            <?= csrf_field() ?>
+            <input type="hidden" name="token" value="<?= h($token) ?>">
+            <button type="submit" class="btn btn-primary"
+                    onclick="return confirm('Import <?= (int)$counts['insert'] ?> vendor<?= $counts['insert'] === 1 ? '' : 's' ?> with their contacts and addresses?');">
+                Commit <?= (int)$counts['insert'] ?> vendor<?= $counts['insert'] === 1 ? '' : 's' ?> &rarr;
+            </button>
+        </form>
+        <a class="btn btn-ghost" href="<?= h(url('/import.php?action=vendors_sql')) ?>">Upload different file</a>
+        <?php else: ?>
+            <div style="padding:14px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;color:#991b1b;font-size:13px;margin-bottom:14px;">
+                All vendors from this file already exist in the system — nothing to import.
+            </div>
+        <?php endif; ?>
+
+        <!-- Vendor preview table -->
+        <div style="margin-top:16px;overflow-x:auto;">
+        <table class="data-table" style="min-width:760px;">
+            <thead>
+                <tr>
+                    <th style="width:70px;">Status</th>
+                    <th>Vendor name</th>
+                    <th>GSTIN</th>
+                    <th style="width:60px;text-align:right;">#Contacts</th>
+                    <th style="width:60px;text-align:right;">#Addresses</th>
+                    <th>Primary contact</th>
+                    <th>Primary address</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($vendors as $v):
+                    $isInsert    = ($v['status'] === 'insert');
+                    $rowStyle    = $isInsert ? 'background:#f0fdf4;' : 'background:#f8fafc;color:#94a3b8;';
+                    $statusLabel = $isInsert
+                        ? '<span style="font-size:11px;font-weight:700;color:#166534;background:white;padding:2px 6px;border-radius:3px;">INSERT</span>'
+                        : '<span style="font-size:11px;font-weight:700;color:#94a3b8;background:white;padding:2px 6px;border-radius:3px;">SKIP</span>';
+                    $primaryContact = $v['contacts'][0] ?? null;
+                    $primaryAddress = $v['addresses'][0] ?? null;
+                    $addrDisplay = '';
+                    if ($primaryAddress) {
+                        $parts = array_filter([
+                            $primaryAddress['line1'],
+                            $primaryAddress['city'],
+                            $primaryAddress['pincode'],
+                        ]);
+                        $addrDisplay = implode(', ', $parts);
+                    }
+                ?>
+                <tr style="<?= $rowStyle ?>">
+                    <td><?= $statusLabel ?></td>
+                    <td>
+                        <strong><?= h($v['name']) ?></strong>
+                        <?php if (!$isInsert && $v['existing_id']): ?>
+                            <br><span class="muted small">
+                                exists as <a href="<?= h(url('/vendors.php?action=edit&id=' . (int)$v['existing_id'])) ?>" target="_blank">vendor #<?= (int)$v['existing_id'] ?></a>
+                            </span>
+                        <?php endif; ?>
+                    </td>
+                    <td class="small"><?= h($v['gst_no'] ?: '—') ?></td>
+                    <td style="text-align:right;"><?= count($v['contacts']) ?></td>
+                    <td style="text-align:right;"><?= count($v['addresses']) ?></td>
+                    <td class="small">
+                        <?php if ($primaryContact): ?>
+                            <?= h(trim(($primaryContact['salutation'] ? $primaryContact['salutation'] . ' ' : '') . $primaryContact['name'])) ?>
+                            <?php if ($primaryContact['phone']): ?>
+                                <br><span class="muted"><?= h($primaryContact['phone']) ?></span>
+                            <?php endif; ?>
+                        <?php else: ?>
+                            <span class="muted">—</span>
+                        <?php endif; ?>
+                    </td>
+                    <td class="small"><?= h($addrDisplay ?: '—') ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        </div>
+
+        <?php if ($counts['insert'] > 0): ?>
+        <div style="margin-top:16px;">
+            <form method="post" action="<?= h(url('/import.php?action=vendors_sql_commit')) ?>" style="display:inline;">
+                <?= csrf_field() ?>
+                <input type="hidden" name="token" value="<?= h($token) ?>">
+                <button type="submit" class="btn btn-primary"
+                        onclick="return confirm('Import <?= (int)$counts['insert'] ?> vendor<?= $counts['insert'] === 1 ? '' : 's' ?> with their contacts and addresses?');">
+                    Commit <?= (int)$counts['insert'] ?> vendor<?= $counts['insert'] === 1 ? '' : 's' ?> &rarr;
+                </button>
+            </form>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+// ============================================================
+// Vendor SQL dump: commit
+// ============================================================
+if ($action === 'vendors_sql_commit') {
+    require_permission('import', 'vendors_sql');
+    csrf_check();
+
+    // Retrieve stashed session data
+    if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+    $token   = (string)input('token', '');
+    $stashed = $_SESSION['import_vendors_sql'][$token] ?? null;
+    if (!$stashed) {
+        flash_set('error', 'Import session expired or invalid. Please re-upload the file.');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+
+    // Reject stale sessions (>1 hour)
+    if (time() - (int)$stashed['created_at'] > 3600) {
+        unset($_SESSION['import_vendors_sql'][$token]);
+        flash_set('error', 'Import session expired (>1 hour). Please re-upload the file.');
+        redirect(url('/import.php?action=vendors_sql'));
+    }
+
+    $data    = $stashed['data'];
+    $vendors = $data['vendors'];
+    $actorId = (int)current_user_id();
+
+    $inserted = 0;
+    $skipped  = 0;
+    $errors   = 0;
+    $failedNames = [];
+
+    foreach ($vendors as $v) {
+        if ($v['status'] !== 'insert') {
+            $skipped++;
+            continue;
+        }
+        // Re-check for duplicates that appeared since preview
+        $existing = db_one(
+            'SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+            [$v['name']]
+        );
+        if ($existing) {
+            $skipped++;
+            continue;
+        }
+        try {
+            vsql_commit_vendor($v, $actorId);
+            $inserted++;
+        } catch (\Throwable $e) {
+            $errors++;
+            $failedNames[] = $v['name'];
+            error_log('[import/vendors_sql_commit] ' . $v['name'] . ': ' . $e->getMessage());
+        }
+    }
+
+    // Clear session stash
+    unset($_SESSION['import_vendors_sql'][$token]);
+
+    $msg = "Vendor import complete. Inserted: $inserted.";
+    if ($skipped) $msg .= " Skipped (already exist): $skipped.";
+    if ($errors)  $msg .= " Errors: $errors (see server log for details).";
+    flash_set($errors ? 'info' : 'success', $msg);
+
+    if ($failedNames) {
+        flash_set('error', 'Failed to import: ' . implode(', ', array_map('h', array_slice($failedNames, 0, 10)))
+            . (count($failedNames) > 10 ? ' …' : ''));
+    }
+    redirect(url('/vendors.php'));
 }
 
 // Default: unknown action

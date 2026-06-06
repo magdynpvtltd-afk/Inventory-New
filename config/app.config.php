@@ -69,7 +69,7 @@ return [
 
     // ---- SSO ----
     'sso' => [
-        'enabled'        => false,           // flip to true once a mode is configured
+        'enabled'        => true,           // flip to true once a mode is configured
         'mode'           => 'oidc',          // 'oidc' | 'saml' | 'header'
         'auto_provision' => true,            // create local row on first SSO login
 

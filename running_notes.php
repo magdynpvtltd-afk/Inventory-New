@@ -34,6 +34,20 @@ $action = (string)input('action', 'list');
 // imported _notes.php. We catch them here because /running_notes.php is
 // the universal endpoint for these writes (see notes_endpoint_for()).
 if (notes_handle_action()) {
+    // AJAX composer (notes popup modal): instead of redirecting (which would
+    // navigate the host page and close the modal), respond with the refreshed
+    // notes section HTML so the client can swap it in place and keep the
+    // modal open after adding a note.
+    if (input('ajax')) {
+        require_permission('running_notes', 'view');
+        $et  = (string)input('entity_type', '');
+        $eid = (int)input('entity_id', 0);
+        $rt  = (string)input('return_to', '');
+        if (in_array($et, ['asset','asset_txn','inv_item','inv_txn','inspection','inspection_template'], true) && $eid > 0) {
+            notes_render($et, $eid, 'modal', $rt);
+        }
+        exit;
+    }
     // Where do we send the user back? The host page passes its URL as
     // `return_to`. We accept ONLY same-origin paths (must start with '/')
     // to prevent open-redirect attacks. If anything is fishy, fall back
@@ -70,6 +84,32 @@ if ($action === 'modal') {
     // permission check. The user must also have running_notes.view to
     // even reach this endpoint (require_permission above).
     notes_render($et, $id, 'modal', $rt);
+    exit;
+}
+
+// =================================================================
+// ATTACHMENTS — JSON list of attachments on an entity's notes.
+// Used by the 📎 indicator: 1 → open directly, >1 → popup of names.
+// =================================================================
+if ($action === 'attachments') {
+    header('Content-Type: application/json; charset=utf-8');
+    $et = (string)input('entity_type', '');
+    $id = (int)input('entity_id', 0);
+    if (!in_array($et, ['asset', 'asset_txn', 'inv_item', 'inv_txn', 'inspection', 'inspection_template'], true) || $id <= 0) {
+        echo '[]';
+        exit;
+    }
+    $rows = db_all(
+        "SELECT na.id, na.filename
+           FROM note_attachments na
+           JOIN notes n ON n.id = na.note_id
+          WHERE n.entity_type = ? AND n.entity_id = ? AND n.is_deleted = 0
+          ORDER BY na.id",
+        [$et, $id]
+    );
+    $out = [];
+    foreach ($rows as $r) { $out[] = ['id' => (int)$r['id'], 'name' => (string)$r['filename']]; }
+    echo json_encode($out);
     exit;
 }
 

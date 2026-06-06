@@ -564,7 +564,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
   <h3>What happens on receipt</h3>
   <div class="steps">
     <div class="step"><div class="step-num"></div><div class="step-body">
-      <p><strong>1.</strong> Inserts an <code>inv_shipments</code> row: status <code>closed</code>, mode <code>ship</code>, ref_doc set to the JC number, ship_due_date set to invoice_date.</p>
+      <p><strong>1.</strong> Inserts an <code>inv_shipments</code> row: status <code>closed</code>, mode <code>ship</code>, ref_doc set to the JC number.</p>
     </div></div>
     <div class="step"><div class="step-num"></div><div class="step-body">
       <p><strong>2.</strong> Inserts an <code>inv_shipment_lines</code> row: <code>line_kind=ship</code>, src_location=SHP, qty_planned &amp; qty_shipped both set to the produced qty.</p>

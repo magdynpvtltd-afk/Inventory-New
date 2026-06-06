@@ -552,9 +552,15 @@ if ($action === 'boms') {
     //       ("Finished Good"), which is what most users actually manage.
     // The bare is_product check missed items where the category was set
     // but the (hidden) boolean wasn't, which is the common case.
+    // Finished-good (BOM top element) predicate. An item is a top element
+    // ONLY if its CATEGORY is a Finished Good — matched by NAME (starts with
+    // "finished good", case-insensitive) or a known code, never by id, so it
+    // survives category re-imports that renumber the "Finished Good" category.
+    // Items without a Finished Good category are NOT top elements.
     $finishedGoodPred =
-        "(i.is_product = 1 OR i.category_id IN
-            (SELECT id FROM categories WHERE type='inventory' AND code='finshd'))";
+        "(i.category_id IN
+            (SELECT id FROM categories
+              WHERE LOWER(name) LIKE 'finished good%' OR code IN ('finshd','FINISHED_GOO')))";
 
     $dtCfg = [
         'id'       => 'inv_boms',
@@ -1030,9 +1036,15 @@ if ($action === 'bom_grid') {
     //       and what most people naturally manage.
     // Doing both is more forgiving than just is_product, which is a hidden
     // boolean that gets out of sync with the visible category easily.
+    // Finished-good (BOM top element) predicate. An item is a top element
+    // ONLY if its CATEGORY is a Finished Good — matched by NAME (starts with
+    // "finished good", case-insensitive) or a known code, never by id, so it
+    // survives category re-imports that renumber the "Finished Good" category.
+    // Items without a Finished Good category are NOT top elements.
     $finishedGoodPred =
-        "(i.is_product = 1 OR i.category_id IN
-            (SELECT id FROM categories WHERE type='inventory' AND code='finshd'))";
+        "(i.category_id IN
+            (SELECT id FROM categories
+              WHERE LOWER(name) LIKE 'finished good%' OR code IN ('finshd','FINISHED_GOO')))";
 
     // Per-division counts for the tabs (treat NULL division as 0 so we
     // can show a count next to each tab plus an overall total in "All").

@@ -279,8 +279,8 @@ function ir_evaluate($value, $min, $max)
     if ($value === null || $value === '') return 'na';
     if (!is_numeric($value)) {
         $t = strtolower(trim((string)$value));
-        if ($t === 'ok' || $t === 'pass')                          return 'pass';
-        if (strpos($t, 'not ok') === 0 || strpos($t, 'ng') !== false) return 'fail';
+        if ($t === 'ok' || $t === 'pass')                             return 'pass';
+        if ($t === 'fail' || strpos($t, 'not ok') === 0 || strpos($t, 'ng') !== false) return 'fail';
         return 'na';
     }
     if (($min === null || $min === '') && ($max === null || $max === '')) return 'na';
@@ -288,6 +288,37 @@ function ir_evaluate($value, $min, $max)
     if ($min !== null && is_numeric($min) && $v < (float)$min) return 'fail';
     if ($max !== null && is_numeric($max) && $v > (float)$max) return 'fail';
     return 'pass';
+}
+
+
+/**
+ * Return [min, max] bounds for a check type, interpreting stored fields
+ * according to type semantics:
+ *   NOM / LOGICAL-NOM / numeric : target ± offsets (same as ir_min_max)
+ *   MIN-MAX / LOGICAL-MIN-MAX   : tolerance_lower IS min, tolerance_upper IS max
+ *   everything else             : [null, null]
+ */
+function ir_min_max_for_type($checkType, $target, $lower, $upper)
+{
+    if ($checkType === 'nom' || $checkType === 'logical-nom' || $checkType === 'numeric') {
+        return ir_min_max($target, $lower, $upper);
+    }
+    if ($checkType === 'min-max' || $checkType === 'logical-min-max') {
+        $min = ($lower !== null && $lower !== '' && is_numeric($lower)) ? (float)$lower : null;
+        $max = ($upper !== null && $upper !== '' && is_numeric($upper)) ? (float)$upper : null;
+        return [$min, $max];
+    }
+    return [null, null];
+}
+
+
+/**
+ * Whether a check type auto-computes pass/fail from the measured value.
+ * Types that return false require a manual verdict (or have no verdict).
+ */
+function ir_auto_passfail($checkType)
+{
+    return in_array($checkType, ['numeric', 'logical-nom', 'logical-min-max'], true);
 }
 
 

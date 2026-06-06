@@ -340,7 +340,7 @@ function data_table_render(array $cfg, array $dt, callable $rowRenderer)
         <div class="dt-toolbar">
             <div class="dt-toolbar-left">
                 <span class="dt-summary muted small">
-                    Showing <strong><?= $rangeStart ?></strong> to <strong><?= $rangeEnd ?></strong>
+                    Showing <strong class="dt-range-start"><?= $rangeStart ?></strong> to <strong class="dt-range-end"><?= $rangeEnd ?></strong>
                     of <strong class="dt-total"><?= $total ?></strong> entries
                 </span>
                 <label class="dt-page-size muted small">

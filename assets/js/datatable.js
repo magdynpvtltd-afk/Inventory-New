@@ -52,6 +52,21 @@
         return state;
     }
 
+    // Immediately refresh the "Showing X to Y of Z" summary from known values.
+    // Called optimistically (before AJAX) whenever page or size changes so
+    // the display never waits for a network round-trip or full page reload.
+    function updateRangeSummary(wrap, page, size) {
+        var totalEl      = wrap.querySelector('.dt-total');
+        var rangeStartEl = wrap.querySelector('.dt-range-start');
+        var rangeEndEl   = wrap.querySelector('.dt-range-end');
+        if (!rangeStartEl || !rangeEndEl || !totalEl) return;
+        var total = parseInt(totalEl.textContent, 10) || 0;
+        var start = total === 0 ? 0 : ((page - 1) * size + 1);
+        var end   = Math.min(total, page * size);
+        rangeStartEl.textContent = String(start);
+        rangeEndEl.textContent   = String(end);
+    }
+
     // Apply client-side row filters by hiding rows that don't match.
     // Called whenever a client-side filter input changes, AND after any
     // AJAX reload (because new rows might come in that need filtering).
@@ -129,6 +144,7 @@
                 if (body)  body.innerHTML  = data.rows_html;
                 if (pager) pager.innerHTML = data.pager_html;
                 if (total) total.textContent = String(data.total);
+                updateRangeSummary(wrap, data.page, data.page_size);
 
                 // Update sort indicators on the header row
                 wrap.querySelectorAll('.dt-headers th[data-dt-sort]').forEach(function (th) {
@@ -217,6 +233,7 @@
             sizeSel.addEventListener('change', function () {
                 var s = readState(wrap);
                 s.page = 1;
+                updateRangeSummary(wrap, 1, s.size);
                 reload(wrap, s, true);
             });
         }
@@ -245,6 +262,7 @@
             if (btn.disabled) return;
             var s = readState(wrap);
             s.page = parseInt(btn.getAttribute('data-dt-page') || '1', 10);
+            updateRangeSummary(wrap, s.page, s.size);
             reload(wrap, s, true);
         });
         // ---- Column resizing ----
@@ -555,7 +573,7 @@
 (function () {
     'use strict';
 
-    var ENDPOINT = '/erp/api/dt_prefs.php';
+    var ENDPOINT = (window.MAGDYN_BASE || '').replace(/\/+$/, '') + '/api/dt_prefs.php';
 
     function buildPanel(wrap, btn) {
         var raw = wrap.getAttribute('data-dt-allcols');

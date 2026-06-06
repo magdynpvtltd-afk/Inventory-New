@@ -2135,6 +2135,21 @@ body[data-chord-first] .sidebar .nav-item u {
     line-height: 1.5;
 }
 
+/* Attachment count bubble (WhatsApp-style badge next to the 📎 icon). */
+.att-badge {
+    display: inline-block;
+    min-width: 16px;
+    padding: 0 5px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    color: #fff;
+    background: #25d366;        /* WhatsApp green */
+    border-radius: 9px;
+    vertical-align: middle;
+}
+
 /* ============================================================
    FORM DENSITY pass 3 — tighten vertical rhythm further
    Created: 20260516_141500_IST

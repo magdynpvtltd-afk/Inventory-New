@@ -6,8 +6,7 @@
  * New flow:
  *   1. CREATE. User picks a mode: 'receive' (incoming only), 'ship'
  *      (outgoing only), or 'both' (the classic process / rework cycle).
- *      Header carries vendor + due dates (ship_due_date for ship-side
- *      flows, receive_due_date for receive-side). Line items live in
+ *      Header carries vendor. Line items live in
  *      inv_shipment_lines, each tagged 'ship' or 'receive'. SOURCE
  *      LOCATION is per-line (only required on 'ship' lines — where
  *      the item is drawn from). NO destination location on the
@@ -837,8 +836,6 @@ if ($action === 'save') {
     // (new PO version) instead of po_ensure_for_shipment (idempotent v1).
     $isAmendingSave = (int)input('is_amending', 0) === 1;
     $vendorAddressId = (int)input('vendor_address_id', 0) ?: null;
-    $shipDueDate   = trim((string)input('ship_due_date', ''));
-    $recvDueDate   = trim((string)input('receive_due_date', ''));
     $refDoc        = trim((string)input('ref_doc', ''));
     $notes         = trim((string)input('notes', ''));
     $isRework      = input('is_rework') ? 1 : 0;
@@ -862,26 +859,8 @@ if ($action === 'save') {
         flash_set('error', 'Invalid mode.');
         redirect(url('/inventory_shiprcpt.php?action=' . ($id ? 'edit&id=' . $id : 'new')));
     }
-    // Empty-string dates become NULL for storage. Mode determines
-    // which dates are required: 'ship' or 'both' need ship_due_date,
-    // 'receive' or 'both' need receive_due_date.
-    $shipDueDate = $shipDueDate === '' ? null : $shipDueDate;
-    $recvDueDate = $recvDueDate === '' ? null : $recvDueDate;
-
     $errors = [];
     if ($vendorId <= 0) $errors[] = 'Vendor is required.';
-    if (in_array($mode, shr_modes_with_ship(), true) && !$shipDueDate) {
-        $errors[] = 'Ship due date is required for ship/both modes.';
-    }
-    if (in_array($mode, shr_modes_with_receive(), true) && !$recvDueDate) {
-        $errors[] = 'Receive due date is required for receive/both modes.';
-    }
-    foreach ([$shipDueDate, $recvDueDate] as $d) {
-        if ($d !== null && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $d)) {
-            $errors[] = 'Due dates must be YYYY-MM-DD.';
-            break;
-        }
-    }
 
     if ($errors) {
         flash_set('error', implode(' ', $errors));
@@ -890,6 +869,45 @@ if ($action === 'save') {
 
     $uid = (int)current_user_id();
     $isNew = ($id === 0);
+
+    // Phase D1 — snapshot the CURRENT lines BEFORE the transaction
+    // modifies them. Passed to po_create_amendment_for_shipment() after
+    // the commit so the historical PO version shows the OLD values, not
+    // the newly-saved ones.
+    $preAmendSnapshot = null;
+    if ($isAmendingSave && $id > 0) {
+        $snapLines = db_all(
+            "SELECT l.*,
+                    i.code AS item_code, i.name AS item_name,
+                    a.asset_tag AS asset_tag,
+                    am.name AS asset_model,
+                    COALESCE(lu.code, u.code, pu.code) AS uom_code,
+                    COALESCE(lu.label, u.label, pu.label) AS uom_label
+               FROM inv_shipment_lines l
+          LEFT JOIN inv_items i   ON i.id = l.item_id
+          LEFT JOIN assets    a   ON a.id = l.asset_id
+          LEFT JOIN asset_models am ON am.id = a.model_id
+          LEFT JOIN inv_uom   lu  ON lu.id = l.uom_id
+          LEFT JOIN inv_uom   u   ON u.id = i.uom_id
+          LEFT JOIN inv_uom   pu  ON pu.id = l.pending_uom_id
+              WHERE l.shipment_id = ?
+              ORDER BY l.sort_order, l.id",
+            [$id]
+        );
+        $snapReceive = [];
+        try {
+            $snapReceive = db_all(
+                "SELECT * FROM inv_shipment_receive_lines WHERE shipment_id = ? ORDER BY sort_order, id",
+                [$id]
+            );
+        } catch (\Throwable $e) { /* table may not exist yet */ }
+
+        $preAmendSnapshot = json_encode([
+            'lines'          => $snapLines,
+            'receive_lines'  => $snapReceive,
+            'snapshotted_at' => date('Y-m-d H:i:s'),
+        ], JSON_UNESCAPED_UNICODE);
+    }
 
     try {
         db()->beginTransaction();
@@ -900,15 +918,13 @@ if ($action === 'save') {
                 'INSERT INTO inv_shipments
                    (ship_no, vendor_id, courier_id, reference,
                     vendor_contact_id, vendor_address_id,
-                    mode, ship_due_date, receive_due_date,
-                    payment_terms, packing_forwarding, freight_insurance,
+                    mode, payment_terms, packing_forwarding, freight_insurance,
                     status, ref_doc, notes, notes_po, special_instructions, internal_notes,
                     terms_conditions, is_rework, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 [$shipNo, $vendorId, $courierId, $reference ?: null,
                  $vendorContactId, $vendorAddressId,
-                 $mode, $shipDueDate, $recvDueDate,
-                 $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
+                 $mode, $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
                  'draft', $refDoc ?: null, $notes ?: null,
                  $notesPo ?: null, $specialInstr ?: null, $internalNotes ?: null,
                  $termsConditions ?: null, $isRework, $uid]
@@ -935,15 +951,13 @@ if ($action === 'save') {
                 'UPDATE inv_shipments
                     SET vendor_id = ?, courier_id = ?, reference = ?,
                         vendor_contact_id = ?, vendor_address_id = ?,
-                        mode = ?, ship_due_date = ?, receive_due_date = ?,
-                        payment_terms = ?, packing_forwarding = ?, freight_insurance = ?,
+                        mode = ?, payment_terms = ?, packing_forwarding = ?, freight_insurance = ?,
                         ref_doc = ?, notes = ?, notes_po = ?,
                         special_instructions = ?, internal_notes = ?, is_rework = ?
                   WHERE id = ?',
                 [$vendorId, $courierId, $reference ?: null,
                  $vendorContactId, $vendorAddressId,
-                 $mode, $shipDueDate, $recvDueDate,
-                 $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
+                 $mode, $paymentTerms ?: null, $packingForwarding ?: null, $freightInsurance ?: null,
                  $refDoc ?: null, $notes ?: null, $notesPo ?: null,
                  $specialInstr ?: null, $internalNotes ?: null, $isRework, $id]
             );
@@ -964,6 +978,9 @@ if ($action === 'save') {
         $assetIds  = (array)input('line_asset_id', []);
         $pNames    = (array)input('line_pending_name', []);
         $pUoms     = (array)input('line_pending_uom_id', []);
+        $lineUoms  = (array)input('line_uom_id', []);
+        $linePrices= (array)input('line_unit_price', []);
+        $lineGsts  = (array)input('line_gst_rate', []);
         $beforeDts = (array)input('line_before_date', []);
         $deliveryDts = (array)input('line_delivery_date', []);
         // Phase D1 fix — line_id[] carries existing row ids (0 for new
@@ -989,6 +1006,11 @@ if ($action === 'save') {
             $assetId   = isset($assetIds[$i]) ? (int)$assetIds[$i] : 0;
             $pName     = isset($pNames[$i])   ? trim((string)$pNames[$i]) : '';
             $pUomId    = isset($pUoms[$i])    ? (int)$pUoms[$i]    : 0;
+            $lineUomId = isset($lineUoms[$i]) && $lineUoms[$i] !== '' ? (int)$lineUoms[$i] : 0;
+            // Fall back to pending_uom_id when uom_id not submitted (old BOM-populate rows)
+            if (!$lineUomId && $pUomId) $lineUomId = $pUomId;
+            $linePrice = isset($linePrices[$i]) && $linePrices[$i] !== '' ? (float)$linePrices[$i] : null;
+            $lineGst   = isset($lineGsts[$i])   && $lineGsts[$i]   !== '' ? (float)$lineGsts[$i]   : null;
             $beforeDt  = isset($beforeDts[$i])   ? trim((string)$beforeDts[$i])   : '';
             $deliveryDt= isset($deliveryDts[$i]) ? trim((string)$deliveryDts[$i]) : '';
 
@@ -1033,6 +1055,9 @@ if ($action === 'save') {
                 'pending_name'    => ($entity === 'inv_item' && $pName !== '') ? $pName : null,
                 'pending_uom_id'  => ($entity === 'inv_item' && $pName !== '' && $pUomId > 0) ? $pUomId : null,
                 'qty_planned'     => $qty,
+                'uom_id'          => $lineUomId > 0 ? $lineUomId : null,
+                'unit_price'      => $linePrice,
+                'gst_rate'        => $lineGst,
                 'src_location_id' => ($kind === 'ship' && $entity === 'inv_item' && $itemId > 0) ? $srcId : null,
                 'before_date'     => $beforeDt   !== '' ? $beforeDt   : null,
                 'delivery_date'   => $deliveryDt !== '' ? $deliveryDt : null,
@@ -1085,13 +1110,15 @@ if ($action === 'save') {
                             SET sort_order = ?, line_kind = ?, entity_type = ?,
                                 item_id = ?, asset_id = ?,
                                 pending_name = ?, pending_uom_id = ?,
-                                qty_planned = ?, src_location_id = ?,
+                                qty_planned = ?, uom_id = ?, unit_price = ?, gst_rate = ?,
+                                src_location_id = ?,
                                 before_date = ?, delivery_date = ?, notes = ?
                           WHERE id = ?',
                         [$s['sort_order'], $s['kind'], $s['entity'],
                          $s['item_id'], $s['asset_id'],
                          $s['pending_name'], $s['pending_uom_id'],
-                         $s['qty_planned'], $s['src_location_id'],
+                         $s['qty_planned'], $s['uom_id'], $s['unit_price'], $s['gst_rate'],
+                         $s['src_location_id'],
                          $s['before_date'], $s['delivery_date'], $s['notes'],
                          (int)$s['line_id']]
                     );
@@ -1100,12 +1127,14 @@ if ($action === 'save') {
                         'INSERT INTO inv_shipment_lines
                             (shipment_id, sort_order, line_kind, entity_type,
                              item_id, asset_id, pending_name, pending_uom_id,
-                             qty_planned, src_location_id, before_date, delivery_date, notes)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                             qty_planned, uom_id, unit_price, gst_rate,
+                             src_location_id, before_date, delivery_date, notes)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                         [$id, $s['sort_order'], $s['kind'], $s['entity'],
                          $s['item_id'], $s['asset_id'],
                          $s['pending_name'], $s['pending_uom_id'],
-                         $s['qty_planned'], $s['src_location_id'],
+                         $s['qty_planned'], $s['uom_id'], $s['unit_price'], $s['gst_rate'],
+                         $s['src_location_id'],
                          $s['before_date'], $s['delivery_date'], $s['notes']]
                     );
                 }
@@ -1126,12 +1155,14 @@ if ($action === 'save') {
                     'INSERT INTO inv_shipment_lines
                         (shipment_id, sort_order, line_kind, entity_type,
                          item_id, asset_id, pending_name, pending_uom_id,
-                         qty_planned, src_location_id, before_date, delivery_date, notes)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                         qty_planned, uom_id, unit_price, gst_rate,
+                         src_location_id, before_date, delivery_date, notes)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     [$id, $s['sort_order'], $s['kind'], $s['entity'],
                      $s['item_id'], $s['asset_id'],
                      $s['pending_name'], $s['pending_uom_id'],
-                     $s['qty_planned'], $s['src_location_id'],
+                     $s['qty_planned'], $s['uom_id'], $s['unit_price'], $s['gst_rate'],
+                     $s['src_location_id'],
                      $s['before_date'], $s['delivery_date'], $s['notes']]
                 );
                 $written++;
@@ -1159,7 +1190,7 @@ if ($action === 'save') {
     $newPo = null;
     try {
         if ($isAmendingSave) {
-            $newPo = po_create_amendment_for_shipment($id, $uid);
+            $newPo = po_create_amendment_for_shipment($id, $uid, $preAmendSnapshot);
         } else {
             $newPo = po_ensure_for_shipment($id, $uid);
         }
@@ -1169,7 +1200,7 @@ if ($action === 'save') {
 
     if ($isAmendingSave) {
         $msg = 'Shipment amended';
-        if ($newPo) $msg .= ' — new PO ' . po_label_with_version($newPo) . ' issued';
+        if ($newPo) $msg .= ' — PO <strong>' . h($newPo['po_no']) . '</strong> updated to v' . (int)$newPo['version'];
         $msg .= '.';
         flash_set('success', $msg);
     } else {
@@ -1425,7 +1456,7 @@ if ($action === 'receive_save') {
                 due_date_snapshot, dst_location_id, txn_id, ref_doc, notes, created_by)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [$rcptNo, $id, (int)$line['id'], $qty, $rcptDate,
-             $sh['receive_due_date'], $locId, $txnId,
+             null, $locId, $txnId,
              $sh['ref_doc'] ?: null, $notes ?: null, $uid]
         );
         shr_recompute_line_received((int)$line['id']);
@@ -1633,8 +1664,6 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
     $vVendorId    = (int)($sh['vendor_id']  ?? 0);
     $vContactId   = (int)($sh['vendor_contact_id'] ?? 0);
     $vAddressId   = (int)($sh['vendor_address_id'] ?? 0);
-    $vShipDue     = $sh['ship_due_date']    ?? '';
-    $vRecvDue     = $sh['receive_due_date'] ?? '';
     $vRefDoc      = $sh['ref_doc']          ?? '';
     $vNotes       = $sh['notes']            ?? '';
     $vIsRework    = (int)($sh['is_rework']  ?? 0);
@@ -1756,7 +1785,7 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 <span class="shr-step-num">1</span>
                 <div>
                     <h3 class="shr-step-title">Shipment basics</h3>
-                    <p class="shr-step-help">Pick the vendor and due dates. The direction is set automatically based on the lines you add below.</p>
+                    <p class="shr-step-help">Pick the vendor. The direction is set automatically based on the lines you add below.</p>
                 </div>
             </div>
             <div class="shr-step-body">
@@ -1828,19 +1857,6 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                                 </option>
                             <?php endforeach; ?>
                         </select>
-                    </div>
-                    <div class="field">
-                        <label>Due dates</label>
-                        <div class="shr-due-pair">
-                            <div id="shr-due-ship-wrap">
-                                <input id="f_ship_due" name="ship_due_date" type="date" value="<?= h($vShipDue) ?>">
-                                <div class="muted small">Ship due — required if ship lines.</div>
-                            </div>
-                            <div id="shr-due-recv-wrap">
-                                <input id="f_recv_due" name="receive_due_date" type="date" value="<?= h($vRecvDue) ?>">
-                                <div class="muted small">Receive due — required if receive lines.</div>
-                            </div>
-                        </div>
                     </div>
                     <div class="field">
                         <label for="f_ref">Reference doc</label>
@@ -1964,9 +1980,17 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             <?php endif; ?>
         <?php endif; ?>
 
-        <!-- Manual line entry — collapsed by default. Most users add
-             items via BOM checklist above; manual entry is the escape
-             hatch for one-off ship-only or receive-only shipments. -->
+        <!-- Manual line entry — two separate sections for ship and receive lines.
+             Collapsed by default; opens if there are existing lines. -->
+        <?php
+            $shipLines = [];
+            $recvLines = [];
+            foreach ($lines as $L) {
+                if (!is_array($L)) continue;
+                if (($L['line_kind'] ?? '') === 'ship') $shipLines[] = $L;
+                else                                    $recvLines[] = $L;
+            }
+        ?>
         <details class="shr-manual" id="shr-manual-toggle" <?= count($lines) > 1 ? 'open' : '' ?>>
             <summary>
                 Manual line entry
@@ -1990,60 +2014,89 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 color: var(--text);
             }
             .shr-lines-table select { padding-right: 24px; }
+            .shr-section-label {
+                display: flex; align-items: center; gap: 8px;
+                font-size: 12px; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.06em;
+                color: var(--text-muted);
+                padding: 14px 0 6px;
+                margin-top: 10px;
+                border-top: 1px solid var(--border);
+            }
+            .shr-section-label:first-of-type { border-top: none; margin-top: 6px; }
         </style>
 
-        <table class="data-table shr-lines-table" id="shr-lines-tbl">
+        <?php foreach ([
+            ['kind' => 'ship',    'bodyId' => 'shr-ship-body', 'addId' => 'shr-ship-add',
+             'icon' => '↑', 'iconColor' => 'var(--warn, #b45309)',
+             'label' => 'Ship lines', 'hint' => '— items going OUT to the vendor'],
+            ['kind' => 'receive', 'bodyId' => 'shr-recv-body', 'addId' => 'shr-recv-add',
+             'icon' => '↓', 'iconColor' => 'var(--success, #1e7b30)',
+             'label' => 'Receive lines', 'hint' => '— items coming IN from the vendor'],
+        ] as $sec):
+            $secKind  = $sec['kind'];
+            $secLines = ($secKind === 'ship' ? $shipLines : $recvLines);
+            $secLines[] = null;   // one trailing empty row for the "add" clone template
+        ?>
+
+        <div class="shr-section-label">
+            <span style="color: <?= $sec['iconColor'] ?>; font-size: 14px;"><?= $sec['icon'] ?></span>
+            <span><?= $sec['label'] ?></span>
+            <span class="muted small" style="font-weight:400; text-transform:none; letter-spacing:0;"><?= $sec['hint'] ?></span>
+        </div>
+
+        <table class="data-table shr-lines-table">
             <thead>
                 <tr>
-                    <th style="width: 100px;">Direction</th>
                     <th style="width: 100px;">Type</th>
                     <th>Item / Asset</th>
                     <th class="r" style="width: 90px;">Qty</th>
-                    <th style="width: 130px;">Source (ship only)</th>
-                    <th style="width: 130px;">Before date</th>
-                    <th style="width: 130px;">Delivery date</th>
+                    <th style="width: 90px;">UOM</th>
+                    <?php if ($secKind === 'receive'): ?>
+                        <th class="r" style="width: 110px;">Unit Price</th>
+                        <th class="r" style="width: 70px;">GST %</th>
+                    <?php endif; ?>
+                    <?php if ($secKind === 'ship'): ?>
+                        <th style="width: 150px;">Source</th>
+                        <th style="width: 130px;">Before date</th>
+                    <?php else: ?>
+                        <th style="width: 130px;">Delivery date</th>
+                    <?php endif; ?>
                     <th>Notes</th>
                     <th style="width: 44px;"></th>
                 </tr>
             </thead>
-            <tbody id="shr-lines-body">
-            <?php foreach ($lines as $L):
+            <tbody id="<?= h($sec['bodyId']) ?>">
+            <?php foreach ($secLines as $L):
                 $isExisting = is_array($L);
-                $lKind   = $isExisting ? $L['line_kind']         : 'receive';
-                $lLineId = $isExisting ? (int)$L['id']           : 0;
-                $lItemId = $isExisting ? (int)$L['item_id']      : 0;
-                $lQty    = $isExisting ? rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.') : '';
-                $lSrc    = $isExisting ? (int)($L['src_location_id'] ?? 0) : 0;
-                $lNote   = $isExisting ? ($L['notes'] ?? '') : '';
-                // Phase C — extra per-line state
-                $lEntity   = $isExisting ? (string)($L['entity_type']   ?? 'inv_item') : 'inv_item';
-                $lAssetId  = $isExisting ? (int)($L['asset_id']         ?? 0) : 0;
-                $lPending  = $isExisting ? (string)($L['pending_name']  ?? '') : '';
-                $lPendUom  = $isExisting ? (int)($L['pending_uom_id']   ?? 0) : 0;
-                $lBefore   = $isExisting ? (string)($L['before_date']   ?? '') : '';
-                $lDelivery = $isExisting ? (string)($L['delivery_date'] ?? '') : '';
-                // Derive UI sub-type: 'item' (existing), 'asset', or 'pending'.
+                $lLineId  = $isExisting ? (int)$L['id']                 : 0;
+                $lItemId  = $isExisting ? (int)$L['item_id']            : 0;
+                $lQty     = $isExisting ? rtrim(rtrim(number_format((float)$L['qty_planned'], 3, '.', ''), '0'), '.') : '';
+                $lSrc     = $isExisting ? (int)($L['src_location_id']  ?? 0) : 0;
+                $lNote    = $isExisting ? ($L['notes']                  ?? '') : '';
+                $lEntity  = $isExisting ? (string)($L['entity_type']   ?? 'inv_item') : 'inv_item';
+                $lAssetId = $isExisting ? (int)($L['asset_id']         ?? 0) : 0;
+                $lPending = $isExisting ? (string)($L['pending_name']  ?? '') : '';
+                $lPendUom = $isExisting ? (int)($L['pending_uom_id']   ?? 0) : 0;
+                $lUomId   = $isExisting ? (int)($L['uom_id']           ?? $lPendUom) : 0;
+                $lPrice   = $isExisting ? ($L['unit_price'] !== null ? rtrim(rtrim(number_format((float)$L['unit_price'], 4, '.', ''), '0'), '.') : '') : '';
+                $lGst     = $isExisting ? ($L['gst_rate']   !== null ? rtrim(rtrim(number_format((float)$L['gst_rate'],  2, '.', ''), '0'), '.') : '') : '';
+                $lBefore  = $isExisting ? (string)($L['before_date']   ?? '') : '';
+                $lDelivery= $isExisting ? (string)($L['delivery_date'] ?? '') : '';
                 $lSubType = $lEntity === 'asset'
                           ? 'asset'
                           : (!$lItemId && $lPending !== '' ? 'pending' : 'item');
             ?>
                 <tr class="shr-line-row" data-subtype="<?= h($lSubType) ?>">
-                    <!-- Phase D1 fix — line_id[] lets the save handler do a
-                         UPDATE/INSERT/DELETE diff instead of wipe-and-reinsert.
-                         Wipe-and-reinsert cascade-deletes receipts (FK has
-                         ON DELETE CASCADE), which destroys audit history when
-                         the operator amends. 0 means "new row, INSERT". -->
-                    <input type="hidden" name="line_id[]" value="<?= (int)$lLineId ?>">
+                    <!-- line_id[] for UPDATE/INSERT/DELETE diff on amendment. 0 = new row. -->
+                    <input type="hidden" name="line_id[]"   value="<?= (int)$lLineId ?>">
+                    <!-- kind is fixed per section — hidden input, not a dropdown -->
+                    <input type="hidden" name="line_kind[]" value="<?= h($secKind) ?>" class="shr-line-kind">
+                    <?php if ($secKind === 'receive'): ?>
+                        <!-- receive rows have no source; emit hidden to keep parallel arrays aligned -->
+                        <input type="hidden" name="line_src_location_id[]" value="">
+                    <?php endif; ?>
                     <td>
-                        <select name="line_kind[]" class="no-combobox shr-line-kind">
-                            <option value="receive" <?= $lKind === 'receive' ? 'selected' : '' ?>>Receive</option>
-                            <option value="ship"    <?= $lKind === 'ship'    ? 'selected' : '' ?>>Ship</option>
-                        </select>
-                    </td>
-                    <td>
-                        <!-- Type drives which of the next-cell slots is
-                             visible. The hidden line_entity_type[] feeds
-                             the save handler's branching logic. -->
                         <select class="no-combobox shr-line-subtype">
                             <option value="item"    <?= $lSubType === 'item'    ? 'selected' : '' ?>>Item</option>
                             <option value="asset"   <?= $lSubType === 'asset'   ? 'selected' : '' ?>>Asset</option>
@@ -2053,7 +2106,10 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                                value="<?= $lSubType === 'asset' ? 'asset' : 'inv_item' ?>">
                     </td>
                     <td>
-                        <?php if ($lSubType === 'item'): ?>
+                        <!-- Always wrap all three slots so applySubtype() can reliably
+                             show/hide each one. Initial display is set by $lSubType. -->
+                        <span class="shr-slot shr-slot-item"
+                              style="<?= $lSubType === 'item' ? '' : 'display:none;' ?>">
                             <select name="line_item_id[]" class="shr-line-item">
                                 <option value="">— pick an item —</option>
                                 <?php foreach ($itemOpts as $opt): ?>
@@ -2063,20 +2119,10 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                                     </option>
                                 <?php endforeach; ?>
                             </select>
-                        <?php else: ?>
-                            <span class="shr-slot shr-slot-item" style="display:none;">
-                                <select name="line_item_id[]" class="shr-line-item">
-                                    <option value="">— pick an item —</option>
-                                    <?php foreach ($itemOpts as $opt): ?>
-                                        <option value="<?= (int)$opt['id'] ?>">
-                                            <?= h($opt['label']) ?>
-                                        </option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </span>
-                        <?php endif; ?>
+                        </span>
 
-                        <?php if ($lSubType === 'asset'): ?>
+                        <span class="shr-slot shr-slot-asset"
+                              style="<?= $lSubType === 'asset' ? '' : 'display:none;' ?>">
                             <select name="line_asset_id[]" class="shr-line-asset">
                                 <option value="">— pick an asset —</option>
                                 <?php foreach ($allAssets as $A): ?>
@@ -2086,70 +2132,81 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                                     </option>
                                 <?php endforeach; ?>
                             </select>
-                        <?php else: ?>
-                            <span class="shr-slot shr-slot-asset" style="display:none;">
-                                <select name="line_asset_id[]" class="shr-line-asset">
-                                    <option value="">— pick an asset —</option>
-                                    <?php foreach ($allAssets as $A): ?>
-                                        <option value="<?= (int)$A['id'] ?>">
-                                            <?= h($A['asset_tag']) ?><?php if ($A['model_name']): ?> — <?= h($A['model_name']) ?><?php endif; ?>
-                                        </option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </span>
-                        <?php endif; ?>
+                        </span>
 
-                        <?php if ($lSubType === 'pending'): ?>
-                            <span class="shr-slot shr-slot-pending" style="display: flex; gap: 6px;">
-                                <input type="text" name="line_pending_name[]" maxlength="190"
-                                       class="shr-line-pending"
-                                       placeholder="Name of new item (created on receipt)"
-                                       value="<?= h($lPending) ?>" style="flex: 1;">
-                                <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom" style="flex: 0 0 110px;">
-                                    <option value="">UOM</option>
-                                    <?php foreach ($allUoms as $U): ?>
-                                        <option value="<?= (int)$U['id'] ?>" <?= (int)$U['id'] === $lPendUom ? 'selected' : '' ?>>
-                                            <?= h($U['code']) ?>
-                                        </option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </span>
-                        <?php else: ?>
-                            <span class="shr-slot shr-slot-pending" style="display:none; gap: 6px;">
-                                <input type="text" name="line_pending_name[]" maxlength="190"
-                                       class="shr-line-pending"
-                                       placeholder="Name of new item (created on receipt)"
-                                       value="" style="flex: 1;">
-                                <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom" style="flex: 0 0 110px;">
-                                    <option value="">UOM</option>
-                                    <?php foreach ($allUoms as $U): ?>
-                                        <option value="<?= (int)$U['id'] ?>"><?= h($U['code']) ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </span>
-                        <?php endif; ?>
+                        <span class="shr-slot shr-slot-pending"
+                              style="<?= $lSubType === 'pending' ? 'display:flex;' : 'display:none;' ?> gap: 6px;">
+                            <input type="text" name="line_pending_name[]" maxlength="190"
+                                   class="shr-line-pending"
+                                   placeholder="Name of new item (created on receipt)"
+                                   value="<?= h($lPending) ?>" style="flex: 1;">
+                            <select name="line_pending_uom_id[]" class="no-combobox shr-line-pending-uom"
+                                    style="flex: 0 0 110px;">
+                                <option value="">UOM</option>
+                                <?php foreach ($allUoms as $U): ?>
+                                    <option value="<?= (int)$U['id'] ?>"
+                                            <?= (int)$U['id'] === $lPendUom ? 'selected' : '' ?>>
+                                        <?= h($U['code']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </span>
                     </td>
                     <td class="r">
                         <input type="number" step="0.001" min="0" class="r"
                                name="line_qty[]" value="<?= h($lQty) ?>" placeholder="0">
                     </td>
                     <td>
-                        <select name="line_src_location_id[]" class="shr-line-src">
-                            <option value="">— pick a source —</option>
-                            <?php foreach ($locations as $loc): ?>
-                                <option value="<?= (int)$loc['id'] ?>"
-                                        <?= (int)$loc['id'] === $lSrc ? 'selected' : '' ?>>
-                                    <?= h($loc['name']) ?>
+                        <select name="line_uom_id[]" class="no-combobox shr-line-uom">
+                            <option value="">— UOM —</option>
+                            <?php foreach ($allUoms as $U): ?>
+                                <option value="<?= (int)$U['id'] ?>"
+                                        <?= (int)$U['id'] === $lUomId ? 'selected' : '' ?>>
+                                    <?= h($U['code']) ?>
                                 </option>
                             <?php endforeach; ?>
                         </select>
                     </td>
-                    <td>
-                        <input type="date" name="line_before_date[]" value="<?= h($lBefore) ?>">
-                    </td>
-                    <td>
-                        <input type="date" name="line_delivery_date[]" value="<?= h($lDelivery) ?>">
-                    </td>
+                    <?php if ($secKind === 'receive'): ?>
+                        <td class="r">
+                            <input type="number" step="0.0001" min="0" class="r"
+                                   name="line_unit_price[]" value="<?= h($lPrice) ?>" placeholder="0.00">
+                        </td>
+                        <td class="r">
+                            <input type="number" step="0.01" min="0" max="100" class="r"
+                                   name="line_gst_rate[]" value="<?= h($lGst) ?>" placeholder="0">
+                        </td>
+                    <?php else: ?>
+                        <!-- price/gst not used on ship lines; hidden to keep parallel arrays aligned -->
+                        <input type="hidden" name="line_unit_price[]" value="">
+                        <input type="hidden" name="line_gst_rate[]" value="">
+                    <?php endif; ?>
+                    <?php if ($secKind === 'ship'): ?>
+                        <td>
+                            <select name="line_src_location_id[]" class="shr-line-src">
+                                <option value="">— pick a source —</option>
+                                <?php foreach ($locations as $loc): ?>
+                                    <option value="<?= (int)$loc['id'] ?>"
+                                            <?= (int)$loc['id'] === $lSrc ? 'selected' : '' ?>>
+                                        <?= h($loc['name']) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </td>
+                    <?php endif; ?>
+                    <?php if ($secKind === 'ship'): ?>
+                        <td>
+                            <input type="date" name="line_before_date[]" value="<?= h($lBefore) ?>">
+                        </td>
+                        <!-- delivery date not used on ship lines; emit hidden to keep parallel arrays aligned -->
+                        <input type="hidden" name="line_delivery_date[]" value="">
+                    <?php else: ?>
+                        <!-- before date not used on receive lines; emit hidden to keep parallel arrays aligned -->
+                        <input type="hidden" name="line_before_date[]" value="">
+                        <td>
+                            <input type="date" name="line_delivery_date[]" value="<?= h($lDelivery) ?>">
+                        </td>
+                    <?php endif; ?>
                     <td>
                         <input type="text" maxlength="255" name="line_notes[]"
                                value="<?= h($lNote) ?>">
@@ -2162,8 +2219,12 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             </tbody>
         </table>
         <div style="margin-top: 8px;">
-            <button type="button" class="btn btn-ghost btn-sm" id="shr-line-add">+ Add blank line</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="<?= h($sec['addId']) ?>">
+                + Add <?= $secKind === 'ship' ? 'ship' : 'receive' ?> line
+            </button>
         </div>
+
+        <?php endforeach; // end ship / receive sections ?>
 
         </details><!-- /.shr-manual -->
 
@@ -2216,13 +2277,14 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
 
     <script>
     (function () {
-        var body = document.getElementById('shr-lines-body');
-        if (!body) return;
+        // Two separate tbodies — one per direction.
+        var shipBody = document.getElementById('shr-ship-body');
+        var recvBody = document.getElementById('shr-recv-body');
+        if (!shipBody && !recvBody) return;
 
         var stockUrl = <?= json_encode(url('/inventory_shiprcpt.php?action=stock_by_location')) ?>;
 
-        // Per-item cache so a user editing several rows with the same
-        // item doesn't trigger redundant HTTP. Cleared on page reload.
+        // Per-item stock cache — avoids redundant XHR for the same item.
         var stockCache = {};
 
         function fetchStockByLocation(itemId, cb) {
@@ -2247,15 +2309,11 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             return (Math.round(n * 1000) / 1000).toString();
         }
 
-        // Rebuild a row's Source select options from the stock-by-loc
-        // response. Preserves the current selection if it's still in the
-        // new option set; clears otherwise.
+        // Rebuild Source dropdown for a ship row from the stock-by-loc response.
         function rebuildSourceOptions(row, locs) {
             var srcSel = row.querySelector('.shr-line-src');
-            if (!srcSel) return;
+            if (!srcSel) return;   // receive rows have no source select
             var prevVal = srcSel.value;
-            // If a combobox enhancement wrapped the select, unwrap it
-            // so we can rebuild and re-init cleanly.
             var wrap = srcSel.closest('.cb-wrap');
             if (wrap && wrap.parentNode) {
                 wrap.parentNode.insertBefore(srcSel, wrap);
@@ -2281,104 +2339,63 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 if (String(loc.id) === String(prevVal)) opt.selected = true;
                 srcSel.appendChild(opt);
             });
-            // Re-enhance with combobox if available
             if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
                 window.MagDynCombobox.initAll(row);
             }
         }
 
-        // Refresh a row's source dropdown to reflect the current item + kind.
-        // For receive lines we leave the dropdown empty (it's ignored).
+        // Refresh the source dropdown when the item changes (ship rows only).
         function refreshRowSource(row) {
-            var kind   = row.querySelector('.shr-line-kind').value;
+            var kindEl = row.querySelector('.shr-line-kind');
+            if (!kindEl || kindEl.value !== 'ship') return;   // receive rows: skip
             var itemEl = row.querySelector('.shr-line-item');
             var itemId = itemEl ? parseInt(itemEl.value || '0', 10) : 0;
-            if (kind !== 'ship') {
-                // Restore the full list of active locations (server-rendered)
-                // OR leave as-is. Simpler: do nothing — the field is greyed
-                // by syncRow and the server ignores it.
-                return;
-            }
-            if (!itemId) {
-                rebuildSourceOptions(row, []);
-                return;
-            }
-            fetchStockByLocation(itemId, function (locs) {
-                rebuildSourceOptions(row, locs);
-            });
+            if (!itemId) { rebuildSourceOptions(row, []); return; }
+            fetchStockByLocation(itemId, function (locs) { rebuildSourceOptions(row, locs); });
         }
 
-        // Source-location field is only meaningful for ship lines. We
-        // grey it out for receive lines so the user understands it's
-        // optional; the server enforces presence on ship rows.
+        // For ship rows, ensure the source select is enabled and styled normally.
+        // Receive rows have no .shr-line-src so this is a no-op for them.
         function syncRow(row) {
-            var kind = row.querySelector('.shr-line-kind').value;
             var srcSel = row.querySelector('.shr-line-src');
-            // DO NOT use disabled — disabled form fields are NOT submitted,
-            // which silently shifts the parallel-arrays alignment on the
-            // server (receive rows' src slot goes missing, ship rows end
-            // up reading the WRONG row's src). Instead, mimic disabled
-            // visually via opacity + pointer-events:none on the COMBOBOX
-            // wrap (NOT the underlying select — that select is positioned
-            // absolutely with opacity:0 to stay hidden; any inline opacity
-            // we set on it would make the 1x1px hidden select visible at
-            // the top-left corner of the wrap, which is exactly the bug
-            // this comment is here to prevent recurring).
-            var isShip = (kind === 'ship');
-            srcSel.disabled = false;   // always enabled so POST includes it
-            if (!isShip) {
-                srcSel.value = '';      // ensure value is empty for non-ship rows
-            }
-            srcSel.tabIndex = isShip ? 0 : -1;
-            // Combobox wrap holds the visible input + chevron. Style it
-            // (not the hidden underlying select) for the greyed-out look.
+            if (!srcSel) return;   // receive row — nothing to sync
+            srcSel.disabled = false;
+            srcSel.tabIndex  = 0;
             var wrap = srcSel.closest('.cb-wrap');
             if (wrap) {
-                wrap.style.opacity = isShip ? '' : '0.5';
-                wrap.style.pointerEvents = isShip ? '' : 'none';
-                // Also make the visible input itself untabbable when greyed
+                wrap.style.opacity       = '';
+                wrap.style.pointerEvents = '';
                 var visibleInput = wrap.querySelector('input.cb-input');
-                if (visibleInput) visibleInput.tabIndex = isShip ? 0 : -1;
+                if (visibleInput) visibleInput.tabIndex = 0;
             }
-            // If the field is a plain (non-enhanced) select, fall back
-            // to styling the select itself — but DO NOT touch opacity
-            // (see comment above). Use a class instead for visual cue.
-            if (!wrap) {
-                srcSel.style.pointerEvents = isShip ? '' : 'none';
-                srcSel.classList.toggle('shr-src-disabled', !isShip);
-            }
-            // After value/options changes, tell combobox to refresh its
-            // visible input text.
             if (window.MagDynCombobox && typeof window.MagDynCombobox.resync === 'function') {
                 window.MagDynCombobox.resync(srcSel);
             }
         }
+
         function wireRow(row) {
             if (row._wired) return;
             row._wired = true;
             syncRow(row);
-            // If row loads with item + ship kind already set (edit mode),
-            // refresh the source dropdown to reflect stock.
-            var kindNow = row.querySelector('.shr-line-kind').value;
+
+            // On first paint (edit mode) refresh source if item is already set.
+            var kindEl  = row.querySelector('.shr-line-kind');
             var itemEl  = row.querySelector('.shr-line-item');
-            if (kindNow === 'ship' && itemEl && parseInt(itemEl.value || '0', 10) > 0) {
+            if (kindEl && kindEl.value === 'ship' && itemEl && parseInt(itemEl.value || '0', 10) > 0) {
                 refreshRowSource(row);
             }
-            row.querySelector('.shr-line-kind').addEventListener('change', function () {
-                syncRow(row);
-                refreshRowSource(row);
-            });
+
+            // Kind is fixed per section (hidden input) — no change listener needed.
             if (itemEl) {
                 itemEl.addEventListener('change', function () { refreshRowSource(row); });
             }
+
             row.querySelector('.shr-line-remove').addEventListener('click', function () {
-                if (body.querySelectorAll('tr.shr-line-row').length <= 1) return;
                 row.parentNode.removeChild(row);
                 if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
             });
-            // Phase C2 — subtype switcher. Toggles which slot is visible
-            // (item / asset / pending) and updates the hidden
-            // line_entity_type[] so the save handler branches correctly.
+
+            // Subtype switcher (Item / Asset / New item).
             var subSel = row.querySelector('.shr-line-subtype');
             if (subSel) {
                 var entHidden = row.querySelector('input[name="line_entity_type[]"]');
@@ -2397,23 +2414,36 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                     row.setAttribute('data-subtype', v);
                 }
                 subSel.addEventListener('change', applySubtype);
-                applySubtype();   // ensure consistency on first wire
+                applySubtype();
             }
         }
-        function cloneEmptyRow() {
-            var rows = body.querySelectorAll('tr.shr-line-row');
-            var tmpl = rows[rows.length - 1].cloneNode(true);
+
+        // Clone the last row of a given tbody, clear its values, append + wire it.
+        function cloneEmptyRow(tbodyEl) {
+            var rows = tbodyEl.querySelectorAll('tr.shr-line-row');
+            var tmpl;
+            if (rows.length > 0) {
+                tmpl = rows[rows.length - 1].cloneNode(true);
+            } else {
+                // Section is empty — borrow a template row from the other body.
+                var other = (tbodyEl === shipBody) ? recvBody : shipBody;
+                var otherRows = other ? other.querySelectorAll('tr.shr-line-row') : [];
+                if (!otherRows.length) return null;
+                tmpl = otherRows[0].cloneNode(true);
+                // Fix the kind hidden input to match this section.
+                var kindHid = tmpl.querySelector('.shr-line-kind');
+                if (kindHid) kindHid.value = (tbodyEl === shipBody) ? 'ship' : 'receive';
+            }
+            // Clear user-entered values.
             tmpl.querySelectorAll('input').forEach(function (inp) {
-                if (inp.type === 'number' || inp.type === 'text') inp.value = '';
+                if (inp.type === 'number' || inp.type === 'text' || inp.type === 'date') inp.value = '';
             });
-            // Phase D1 fix — cloned rows are NEW rows; clear any inherited
-            // line_id so the save handler routes them through INSERT, not
-            // UPDATE-by-someone-else's-id.
+            // Reset line_id to 0 so save handler INSERTs instead of UPDATEs.
             var lidInput = tmpl.querySelector('input[name="line_id[]"]');
             if (lidInput) lidInput.value = '0';
             tmpl.querySelectorAll('select').forEach(function (sel) {
                 sel.classList.remove('cb-bound', 'cb-native');
-                sel.disabled = false;
+                sel.disabled     = false;
                 sel.style.opacity = '';
                 sel.selectedIndex = 0;
             });
@@ -2422,138 +2452,118 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
                 if (sel) { wrap.parentNode.insertBefore(sel, wrap); wrap.parentNode.removeChild(wrap); }
             });
             tmpl._wired = false;
-            body.appendChild(tmpl);
+            tbodyEl.appendChild(tmpl);
             wireRow(tmpl);
             return tmpl;
         }
-        document.getElementById('shr-line-add').addEventListener('click', function () {
-            cloneEmptyRow();
-            if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
-                window.MagDynCombobox.initAll();
-            }
-            if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
-        });
 
-        // Programmatic line-append helper used by the receive-item panel
-        // when operating in client-buffered mode (new unsaved shipment).
-        // Spec: { kind: 'ship'|'receive', itemId, qty, srcId }
-        // Fills a freshly-cloned empty row with those values. Returns the
-        // appended <tr> element.
+        // "Add ship line" button.
+        if (shipBody) {
+            var shipAddBtn = document.getElementById('shr-ship-add');
+            if (shipAddBtn) {
+                shipAddBtn.addEventListener('click', function () {
+                    cloneEmptyRow(shipBody);
+                    if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                        window.MagDynCombobox.initAll();
+                    }
+                    if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
+                });
+            }
+            shipBody.querySelectorAll('tr.shr-line-row').forEach(wireRow);
+        }
+
+        // "Add receive line" button.
+        if (recvBody) {
+            var recvAddBtn = document.getElementById('shr-recv-add');
+            if (recvAddBtn) {
+                recvAddBtn.addEventListener('click', function () {
+                    cloneEmptyRow(recvBody);
+                    if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
+                        window.MagDynCombobox.initAll();
+                    }
+                    if (window.__shrRecomputeModePill) window.__shrRecomputeModePill();
+                });
+            }
+            recvBody.querySelectorAll('tr.shr-line-row').forEach(wireRow);
+        }
+
+        // setRowField helper — sets a select or input value, resyncs combobox.
         function setRowField(row, selector, value) {
             var el = row.querySelector(selector);
-            if (!el) {
-                console.warn('[shr setRowField] element not found:', selector);
-                return;
-            }
+            if (!el) { console.warn('[shr setRowField] not found:', selector); return; }
             if (el.tagName === 'SELECT') {
                 el.value = String(value);
                 if (el.value !== String(value)) {
-                    // Value didn't match any existing option. This can
-                    // happen if the source location came from the BOM
-                    // checklist's stock-by-loc list (which can theoretically
-                    // include locations not in the manual-row's render of
-                    // $locations). Append the option on the fly so the
-                    // value actually sticks AND the user sees a reasonable
-                    // label.
-                    console.warn('[shr setRowField] adding missing option', value, 'to', selector);
                     var opt = document.createElement('option');
                     opt.value = String(value);
                     opt.textContent = 'Loc #' + value;
                     el.appendChild(opt);
                     el.value = String(value);
-                } else {
-                    console.log('[shr setRowField] set', selector, '=', value);
                 }
-                // If this select has been enhanced by combobox, the visible
-                // input won't reflect the new value (combobox doesn't watch
-                // programmatic .value = X assignments unless we dispatch a
-                // change event OR call resync explicitly). Do both so we're
-                // covered either way.
                 if (window.MagDynCombobox && typeof window.MagDynCombobox.resync === 'function') {
                     window.MagDynCombobox.resync(el);
                 }
             } else {
                 el.value = String(value);
-                console.log('[shr setRowField] set', selector, '=', value);
             }
         }
+
+        // Programmatic line-append used by the BOM checklist panel.
+        // Spec: { kind: 'ship'|'receive', itemId, qty, srcId }
+        // Routes to the correct tbody based on spec.kind.
         window.__shrAppendLineRow = function (spec) {
-            var row = cloneEmptyRow();
-            // Initialize combobox on the cloned row FIRST. cloneEmptyRow
-            // strips the cb-wrap so the clone starts as raw selects;
-            // initAll(row) re-enhances them. setRowField below then sets
-            // values, and its built-in resync updates the visible
-            // combobox input text accordingly.
+            var targetBody = (spec.kind === 'ship') ? shipBody : recvBody;
+            if (!targetBody) return null;
+            var row = cloneEmptyRow(targetBody);
+            if (!row) return null;
             if (window.MagDynCombobox && typeof window.MagDynCombobox.initAll === 'function') {
                 window.MagDynCombobox.initAll(row);
             }
-            // IMPORTANT ordering: src must be set BEFORE item, otherwise
-            // changing the item triggers an async refreshRowSource() that
-            // rebuilds the source dropdown — and our later setRowField
-            // call wouldn't find the option anymore (it gets clobbered
-            // by the rebuild). By setting src first, rebuildSourceOptions
-            // sees our chosen srcId as prevVal and preserves it when the
-            // new option set arrives (it WILL be in the new set since it
-            // came from the stock list for this item).
-            setRowField(row, '.shr-line-kind', spec.kind || 'receive');
-            if (spec.srcId) setRowField(row, '.shr-line-src', spec.srcId);
+            // Set source BEFORE item so rebuildSourceOptions preserves the value.
+            if (spec.srcId && spec.kind === 'ship') setRowField(row, '.shr-line-src', spec.srcId);
             setRowField(row, '.shr-line-item', spec.itemId || '');
             setRowField(row, 'input[name="line_qty[]"]', spec.qty || '');
-            // syncRow needs to re-run after the kind change so the source
-            // dropdown state matches (greys out for receive lines).
             syncRow(row);
             return row;
         };
 
-        body.querySelectorAll('tr.shr-line-row').forEach(wireRow);
-
-        // Pre-submit diagnostic. Logs the parallel-array contents to the
-        // browser console right before the form POSTs, so we can see
-        // what's actually being sent. Mirrored on the server side via
-        // error_log() so both sides can be cross-checked.
+        // Pre-submit diagnostic.
         var mainForm = document.getElementById('shr-main-form');
         if (mainForm) {
             mainForm.addEventListener('submit', function () {
-                var k = mainForm.querySelectorAll('select[name="line_kind[]"]');
+                var k = mainForm.querySelectorAll('input[name="line_kind[]"]');
                 var i = mainForm.querySelectorAll('select[name="line_item_id[]"]');
                 var q = mainForm.querySelectorAll('input[name="line_qty[]"]');
-                var s = mainForm.querySelectorAll('select[name="line_src_location_id[]"]');
-                console.log('[shiprcpt submit] inputs in form:',
-                            'kinds=' + k.length,
-                            'items=' + i.length,
-                            'qtys=' + q.length,
-                            'srcs=' + s.length);
-                console.log('[shiprcpt submit] values:',
-                    Array.from(k).map(function (e) { return e.value; }).join(','),
-                    '|',
-                    Array.from(i).map(function (e) { return e.value; }).join(','),
-                    '|',
-                    Array.from(q).map(function (e) { return e.value; }).join(','),
-                    '|',
-                    Array.from(s).map(function (e) { return e.value; }).join(','));
+                var s = mainForm.querySelectorAll('[name="line_src_location_id[]"]');
+                console.log('[shiprcpt submit] kinds=' + k.length +
+                            ' items=' + i.length + ' qtys=' + q.length + ' srcs=' + s.length);
+                console.log('[shiprcpt submit] kinds:',
+                    Array.from(k).map(function (e) { return e.value; }).join(','));
             });
         }
     })();
 
-    // Mode pill at top of form is auto-derived from the kinds of lines
-    // currently in the lines table. Re-run whenever a row is added,
-    // removed, or its kind dropdown changes.
+    // Mode pill at top of form is auto-derived from the two direction sections.
+    // A section "has content" when at least one of its rows has qty > 0.
+    // We check qty (a plain number input) rather than item selects because
+    // combobox-enhanced selects don't always fire native change events, and
+    // qty correctly captures Asset/Pending subtypes too.
     (function () {
+        function bodyHasContent(tbodyId) {
+            var tbody = document.getElementById(tbodyId);
+            if (!tbody) return false;
+            var qtys = tbody.querySelectorAll('input[name="line_qty[]"]');
+            for (var i = 0; i < qtys.length; i++) {
+                if (parseFloat(qtys[i].value || '0') > 0) return true;
+            }
+            return false;
+        }
+
         function recomputeModePill() {
             var pill = document.getElementById('shr-mode-pill');
             if (!pill) return;
-            var hasShip = false, hasRecv = false;
-            document.querySelectorAll('.shr-line-row .shr-line-kind').forEach(function (sel) {
-                // Skip rows that have no item selected — they're empty
-                // starter rows, not real lines and shouldn't influence
-                // mode derivation.
-                var row = sel.closest('tr');
-                var itemSel = row && row.querySelector('.shr-line-item');
-                if (itemSel && !itemSel.value) return;
-                var v = (sel.value || '').toLowerCase();
-                if (v === 'ship')    hasShip = true;
-                if (v === 'receive') hasRecv = true;
-            });
+            var hasShip = bodyHasContent('shr-ship-body');
+            var hasRecv = bodyHasContent('shr-recv-body');
             var label, cls, mode;
             if (hasShip && hasRecv) { mode='both';    label='⇅ Ship & receive'; cls='pill pill-info'; }
             else if (hasShip)       { mode='ship';    label='↑ Ship only';      cls='pill pill-warning'; }
@@ -2562,41 +2572,20 @@ if ($action === 'new' || $action === 'edit' || $action === 'amend') {
             pill.textContent = label;
             pill.className = cls;
             pill.setAttribute('data-mode', mode);
-
-            // Toggle due-date visibility based on derived mode:
-            //   ship    → ship-due only
-            //   receive → recv-due only
-            //   both    → both
-            //   (none)  → show both as a default so user can still fill
-            //             them before adding lines, hidden again as soon
-            //             as the first line is added
-            var shipWrap = document.getElementById('shr-due-ship-wrap');
-            var recvWrap = document.getElementById('shr-due-recv-wrap');
-            if (shipWrap && recvWrap) {
-                if (mode === 'ship') {
-                    shipWrap.style.display = '';
-                    recvWrap.style.display = 'none';
-                } else if (mode === 'receive') {
-                    shipWrap.style.display = 'none';
-                    recvWrap.style.display = '';
-                } else {
-                    // 'both' or '' — show both
-                    shipWrap.style.display = '';
-                    recvWrap.style.display = '';
-                }
-            }
         }
-        // Initial paint + listeners
+
+        // Initial paint.
         recomputeModePill();
-        document.addEventListener('change', function (ev) {
-            if (ev.target && ev.target.classList && (
-                ev.target.classList.contains('shr-line-kind') ||
-                ev.target.classList.contains('shr-line-item')
-            )) {
-                recomputeModePill();
-            }
+
+        // Re-run on any qty change — covers typing, spinner, paste, and blur.
+        document.addEventListener('input',  function (ev) {
+            if (ev.target && ev.target.name === 'line_qty[]') recomputeModePill();
         });
-        // Expose so the line-add/remove handlers can call us too.
+        document.addEventListener('change', function (ev) {
+            if (ev.target && ev.target.name === 'line_qty[]') recomputeModePill();
+        });
+
+        // Expose for line-add / remove handlers.
         window.__shrRecomputeModePill = recomputeModePill;
     })();
 
@@ -3017,6 +3006,21 @@ if ($action === 'view') {
     $hasShipSide    = in_array($sh['mode'], shr_modes_with_ship(), true);
     $hasReceiveSide = in_array($sh['mode'], shr_modes_with_receive(), true);
 
+    // Amend is only meaningful when at least one line is still "planned"
+    // (i.e. no event posted yet). If every line already has a receipt or
+    // has been shipped, there is nothing left to amend.
+    $hasPlannedLines = (int)db_val(
+        "SELECT COUNT(*) FROM inv_shipment_lines sl
+          WHERE sl.shipment_id = ?
+            AND (
+                  (sl.line_kind = 'receive'
+                   AND NOT EXISTS (SELECT 1 FROM inv_receipts r WHERE r.shipment_line_id = sl.id))
+                  OR
+                  (sl.line_kind = 'ship' AND (sl.qty_shipped IS NULL OR sl.qty_shipped = 0))
+                )",
+        [$id], 0
+    ) > 0;
+
     $statusPill = '<span class="pill pill-'
         . ($sh['status'] === 'closed' ? 'active'
             : ($sh['status'] === 'cancelled' ? 'danger'
@@ -3052,11 +3056,18 @@ if ($action === 'view') {
         }
         // Phase D1 — Amend opens the form unlocked + flagged so save
         // creates a new PO version. Available on any past-draft, non-
-        // cancelled shipment. (Drafts use Edit instead.)
+        // cancelled shipment that still has at least one planned line.
+        // (Drafts use Edit instead.)
         if (in_array($sh['status'], ['approved', 'shipped', 'closed'], true)) {
-            $actions .= '<a class="btn btn-ghost btn-sm" href="'
-                      . h(url('/inventory_shiprcpt.php?action=amend&id=' . $id))
-                      . '" title="Edit the shipment and issue a new PO version. The previous PO stays intact for audit.">✎ Amend</a> ';
+            if ($hasPlannedLines) {
+                $actions .= '<a class="btn btn-ghost btn-sm" href="'
+                          . h(url('/inventory_shiprcpt.php?action=amend&id=' . $id))
+                          . '" title="Edit the shipment and update the PO. Previous version kept for audit.">✎ Amend</a> ';
+            } else {
+                $actions .= '<button class="btn btn-ghost btn-sm" disabled'
+                          . ' title="Amend is only available when at least one line is still planned (no receipt or shipment posted yet).">'
+                          . '✎ Amend</button> ';
+            }
         }
         if (in_array($sh['status'], ['draft', 'approved'], true)) {
             $actions .= '<form method="post" style="display:inline" action="' . h(url('/inventory_shiprcpt.php?action=cancel')) . '"'
@@ -3111,7 +3122,7 @@ if ($action === 'view') {
                                 <?php if ($isLatest && count($poChain) > 1): ?>
                                     <span class="pill pill-info" style="margin-left:4px;">latest</span>
                                 <?php elseif (!$isLatest): ?>
-                                    <span class="pill pill-muted" style="margin-left:4px;">superseded</span>
+                                    <span class="pill pill-muted" style="margin-left:4px;">history</span>
                                 <?php endif; ?>
                             </td>
                             <td>
@@ -3119,12 +3130,12 @@ if ($action === 'view') {
                                     <code><?= h($p['po_no']) ?></code>
                                 </a>
                             </td>
-                            <td><?= h($p['created_at']) ?></td>
+                            <td><?= h(substr((string)$p['created_at'], 0, 16)) ?></td>
                             <td><?= h($p['created_by_name'] ?: '—') ?></td>
                             <td class="r nowrap">
-                                <a class="btn btn-icon" href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$p['id'])) ?>" title="View">👁</a>
+                                <a class="btn btn-icon" href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$p['id'])) ?>" title="<?= $isLatest ? 'View current PO' : 'View historical version' ?>">👁</a>
                                 <?php if ($canPrintPo): ?>
-                                    <a class="btn btn-icon" target="_blank" href="<?= h(url('/purchase_orders.php?action=print&id=' . (int)$p['id'])) ?>" title="Print">🖨</a>
+                                    <a class="btn btn-icon" target="_blank" href="<?= h(url('/purchase_orders.php?action=print&id=' . (int)$p['id'])) ?>" title="Print v<?= (int)$p['version'] ?>">🖨</a>
                                 <?php endif; ?>
                             </td>
                         </tr>
@@ -3143,28 +3154,6 @@ if ($action === 'view') {
                 <?= $sh['is_rework'] ? ' <span class="pill pill-warning">rework</span>' : '' ?>
             </div>
             <div><div class="muted small">Vendor</div><?= $vendor ? '<code>' . h($vendor['code']) . '</code> ' . h($vendor['name']) : '—' ?></div>
-            <?php if ($hasShipSide): ?>
-                <div>
-                    <div class="muted small">Ship due / actual</div>
-                    <?= h($sh['ship_due_date'] ?: '—') ?>
-                    <?php if ($sh['actual_ship_date']): ?>
-                        → <strong><?= h($sh['actual_ship_date']) ?></strong>
-                        <?php
-                        $due = $sh['ship_due_date'];
-                        $actual = $sh['actual_ship_date'];
-                        if ($due && $actual) {
-                            $delta = (strtotime($actual) - strtotime($due)) / 86400;
-                            if ($delta > 0)      echo ' <span class="pill pill-danger">' . (int)$delta . 'd late</span>';
-                            elseif ($delta < 0)  echo ' <span class="pill pill-active">' . (int)abs($delta) . 'd early</span>';
-                            else                 echo ' <span class="pill pill-active">on time</span>';
-                        }
-                        ?>
-                    <?php endif; ?>
-                </div>
-            <?php endif; ?>
-            <?php if ($hasReceiveSide): ?>
-                <div><div class="muted small">Receive due</div><?= h($sh['receive_due_date'] ?: '—') ?></div>
-            <?php endif; ?>
             <?php if ($approver): ?>
                 <div><div class="muted small">Approved by</div><?= h($approver['full_name']) ?> · <?= h(substr((string)$sh['approved_at'], 0, 16)) ?></div>
             <?php endif; ?>
@@ -3434,8 +3423,6 @@ $baseUnion = "
           sh.ship_no                           AS ship_no,
           sh.status                            AS sh_status,
           sh.mode                              AS sh_mode,
-          sh.ship_due_date                     AS sh_ship_due,
-          sh.receive_due_date                  AS sh_recv_due,
           sh.is_rework                         AS sh_is_rework,
           v.code                               AS vendor_code,
           v.name                               AS vendor_name,
@@ -3453,7 +3440,9 @@ $baseUnion = "
               0
           )                                    AS inv_linked_qty,
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
-          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
+          (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
         FROM inv_receipts r
         JOIN inv_shipments sh        ON sh.id = r.shipment_id
         JOIN inv_shipment_lines sl   ON sl.id = r.shipment_line_id
@@ -3476,8 +3465,6 @@ $baseUnion = "
           sh.ship_no                           AS ship_no,
           sh.status                            AS sh_status,
           sh.mode                              AS sh_mode,
-          sh.ship_due_date                     AS sh_ship_due,
-          sh.receive_due_date                  AS sh_recv_due,
           sh.is_rework                         AS sh_is_rework,
           v.code                               AS vendor_code,
           v.name                               AS vendor_name,
@@ -3492,7 +3479,9 @@ $baseUnion = "
           sl.notes                             AS notes,
           0                                    AS inv_linked_qty,
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
-          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
+          (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh        ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i             ON i.id  = sl.item_id
@@ -3524,8 +3513,6 @@ $baseUnion = "
           sh.ship_no                           AS ship_no,
           sh.status                            AS sh_status,
           sh.mode                              AS sh_mode,
-          sh.ship_due_date                     AS sh_ship_due,
-          sh.receive_due_date                  AS sh_recv_due,
           sh.is_rework                         AS sh_is_rework,
           v.code                               AS vendor_code,
           v.name                               AS vendor_name,
@@ -3540,7 +3527,9 @@ $baseUnion = "
           sl.notes                             AS notes,
           0                                    AS inv_linked_qty,
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
-          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
+          (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh    ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i         ON i.id  = sl.item_id
@@ -3582,6 +3571,7 @@ $dtCfg = [
              ['value'=>'both',    'label'=>'Both'],
          ]]],
         ['key'=>'ship_no',       'label'=>'Ship #',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.ship_no'],
+        ['key'=>'po_no',         'label'=>'PO #',         'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.po_no'],
         ['key'=>'vendor',        'label'=>'Vendor',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.vendor_name'],
         ['key'=>'item_label',    'label'=>'Item',         'sortable'=>true, 'searchable'=>true,
          // Searchable on both code and name; displayed as (CODE)-Name
@@ -3590,8 +3580,6 @@ $dtCfg = [
          'sql_col'=>"CONCAT('(', COALESCE(e.item_code,''), ')-', COALESCE(e.item_name,''))"],
         ['key'=>'qty',           'label'=>'Qty',          'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.qty',          'th_class'=>'r','td_class'=>'r'],
         ['key'=>'line_qty_planned', 'label'=>'Planned',    'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.line_qty_planned', 'th_class'=>'r','td_class'=>'r'],
-        ['key'=>'sh_ship_due',   'label'=>'Ship due',     'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.sh_ship_due'],
-        ['key'=>'sh_recv_due',   'label'=>'Receive due',  'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.sh_recv_due'],
         ['key'=>'line_count',    'label'=>'Lines',        'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.line_count',    'th_class'=>'r','td_class'=>'r'],
         ['key'=>'receipt_count', 'label'=>'Receipts',     'sortable'=>true, 'searchable'=>false, 'sql_col'=>'e.receipt_count', 'th_class'=>'r','td_class'=>'r'],
         ['key'=>'inv_linked',    'label'=>'Linked',       'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
@@ -3667,25 +3655,37 @@ $rowRenderer = function ($r) use ($canManage) {
     $shipLink = '<a href="' . h(url('/inventory_shiprcpt.php?action=view&id=' . (int)$r['shipment_id'])) . '">'
               . '<code>' . h($r['ship_no']) . '</code></a>';
 
+    $poCell = !empty($r['po_id'])
+        ? '<a href="' . h(url('/purchase_orders.php?action=download_pdf&id=' . (int)$r['po_id'])) . '" target="_blank" title="Download PO PDF">'
+          . '<code>' . h($r['po_no']) . '</code></a>'
+        : '<span class="muted">—</span>';
+
     // Qty formatting — trim trailing zeros. Planned rows have no qty.
     $fmtQ = function ($v) {
         return rtrim(rtrim(number_format((float)$v, 3, '.', ''), '0'), '.');
     };
-    $qtyCell = ($r['direction'] === 'planned' || $r['qty'] === null)
-             ? '<span class="muted">—</span>'
-             : h($fmtQ($r['qty']));
+    // For planned rows (no event yet), show line_qty_planned directly in
+    // the Qty cell so the operator sees the number without hunting for it
+    // in the Planned column.
+    if ($r['direction'] === 'planned') {
+        $qtyCell = ($r['line_qty_planned'] !== null && $r['line_qty_planned'] !== '')
+                 ? h($fmtQ($r['line_qty_planned']))
+                 : '<span class="muted">—</span>';
+    } else {
+        $qtyCell = ($r['qty'] !== null)
+                 ? h($fmtQ($r['qty']))
+                 : '<span class="muted">—</span>';
+    }
 
-    // Planned qty — the line's CURRENT qty_planned. After an amendment,
-    // this may differ from the event qty (e.g. receipt was 1, plan now 2).
-    // Highlight that mismatch in amber so the operator can see at a glance
-    // which event rows have a planned amendment behind them.
+    // Planned column — shows line_qty_planned for receipt/ship-out rows only
+    // (lets operator spot amendments where event qty ≠ current plan).
+    // For planned-direction rows it's already in Qty, so suppress it here.
     $planned = $r['line_qty_planned'];
-    if ($planned === null || $planned === '') {
+    if ($r['direction'] === 'planned' || $planned === null || $planned === '') {
         $plannedCell = '<span class="muted">—</span>';
     } else {
         $plannedFmt = $fmtQ($planned);
-        if ($r['direction'] !== 'planned' && $r['qty'] !== null
-            && (float)$planned !== (float)$r['qty']) {
+        if ($r['qty'] !== null && (float)$planned !== (float)$r['qty']) {
             $plannedCell = '<strong style="color:#b45309" title="Differs from event qty — likely amended">'
                          . h($plannedFmt) . ' ⚑</strong>';
         } else {
@@ -3734,12 +3734,11 @@ $rowRenderer = function ($r) use ($canManage) {
         'sh_status'     => $statusPill,
         'sh_mode'       => h($modeLabel),
         'ship_no'       => $shipLink,
+        'po_no'         => $poCell,
         'vendor'        => $vendor,
         'item_label'    => $itemCell,
         'qty'           => $qtyCell,
         'line_qty_planned' => $plannedCell,
-        'sh_ship_due'   => h($r['sh_ship_due'] ?: '—'),
-        'sh_recv_due'   => h($r['sh_recv_due'] ?: '—'),
         'line_count'    => $lineCount   ?: '<span class="muted">—</span>',
         'receipt_count' => $receiptCount ?: '<span class="muted">—</span>',
         'inv_linked'    => $invLinkedCell,

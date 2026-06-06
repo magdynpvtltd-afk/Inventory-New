@@ -344,6 +344,302 @@ if ($action === 'asset_link_delete') {
 }
 
 // ============================================================
+// VENDOR CSV IMPORT — preview + commit
+//
+// Supports two formats detected automatically:
+//
+// FULL FORMAT (old system export — headerless, 16 columns):
+//   col[0]=row_id  col[1]=vendor_id  col[2]=contact_id
+//   col[3]=vendor_name  col[4]=contact_person  col[5]=salutation
+//   col[6]=email  col[7]=phone  col[8]=phone2  col[9]=mobile
+//   col[10]=?  col[11]=notes  col[12-15]=audit
+//   → Detected when col[0] is numeric and row has >= 4 columns.
+//   → Creates vendor + primary contact (if any contact detail exists).
+//
+// SIMPLE FORMAT (headerless, one vendor name per line):
+//   → Fallback when full format not detected.
+//   → Creates vendor only (no contact).
+//
+// Both formats skip names that are blank or consist only of dots/spaces.
+// ============================================================
+require_once __DIR__ . '/includes/_import.php';
+
+/**
+ * Sanitise a raw CSV cell: strip surrounding quotes/whitespace,
+ * treat "-", "NULL", "0" as blank.
+ */
+function vendor_csv_clean($v)
+{
+    $v = trim((string)$v);
+    if ($v === '' || $v === '-' || strtoupper($v) === 'NULL' || $v === '0') return '';
+    return $v;
+}
+
+/**
+ * Return true if a value should be treated as a real vendor name
+ * (i.e. not blank, not dot-only, not placeholder).
+ */
+function vendor_name_valid($name)
+{
+    $name = trim($name);
+    return $name !== '' && !preg_match('/^[\.\s\-]+$/', $name);
+}
+
+/**
+ * Parse the raw CSV text into an array of vendor rows.
+ * Each row: ['name', 'contact_name', 'salutation', 'email',
+ *            'phone', 'notes', '_line']
+ */
+function vendor_parse_csv($raw)
+{
+    if (substr($raw, 0, 3) === "\xEF\xBB\xBF") $raw = substr($raw, 3);
+    $raw = str_replace(["\r\n", "\r"], "\n", $raw);
+
+    $fh = fopen('php://memory', 'r+');
+    fwrite($fh, $raw);
+    rewind($fh);
+
+    // Peek at first row to detect format
+    $firstRow = fgetcsv($fh);
+    rewind($fh);
+
+    $isFullFormat = false;
+    if ($firstRow && count($firstRow) >= 4) {
+        $col0 = trim((string)($firstRow[0] ?? ''));
+        // Full format: col[0] is a numeric row ID
+        $isFullFormat = is_numeric($col0);
+    }
+
+    $rows   = [];
+    $lineNo = 0;
+    while (($cols = fgetcsv($fh)) !== false) {
+        $lineNo++;
+        if ($isFullFormat) {
+            // col[3] = vendor name
+            $name        = vendor_csv_clean($cols[3] ?? '');
+            $contactName = vendor_csv_clean($cols[4] ?? '');
+            $salutation  = vendor_csv_clean($cols[5] ?? '');
+            $email       = vendor_csv_clean($cols[6] ?? '');
+            $phone1      = vendor_csv_clean($cols[7] ?? '');
+            $phone2      = vendor_csv_clean($cols[8] ?? '');
+            $mobile      = vendor_csv_clean($cols[9] ?? '');
+            $notes       = vendor_csv_clean($cols[11] ?? '');
+
+            if (!vendor_name_valid($name)) continue;
+
+            // Primary phone: mobile (col[9]) first, then office (col[7]), then fax (col[8])
+            $phone = $mobile ?: ($phone1 ?: $phone2);
+
+            // Contact name: use alias if it differs from vendor name and is valid
+            $cname = (vendor_name_valid($contactName) && strtolower($contactName) !== strtolower($name))
+                   ? $contactName
+                   : ($salutation || $email || $phone ? $name : '');
+
+            $rows[] = [
+                'name'         => $name,
+                'contact_name' => $cname,
+                'salutation'   => $salutation,
+                'email'        => $email,
+                'phone'        => $phone,
+                'notes'        => $notes,
+                '_line'        => $lineNo,
+            ];
+        } else {
+            // Simple: col[0] = vendor name only
+            $name = vendor_csv_clean($cols[0] ?? '');
+            if (!vendor_name_valid($name)) continue;
+            $rows[] = [
+                'name'         => $name,
+                'contact_name' => '',
+                'salutation'   => '',
+                'email'        => '',
+                'phone'        => '',
+                'notes'        => '',
+                '_line'        => $lineNo,
+            ];
+        }
+    }
+    fclose($fh);
+    return $rows;
+}
+
+if ($action === 'import_preview') {
+    require_permission('vendors', 'manage');
+    csrf_check();
+
+    if (empty($_FILES['csv']) || $_FILES['csv']['error'] !== UPLOAD_ERR_OK) {
+        flash_set('error', 'No CSV file uploaded or upload failed.');
+        redirect(url('/vendors.php'));
+    }
+    $raw = file_get_contents($_FILES['csv']['tmp_name']);
+    if ($raw === false || $raw === '') {
+        flash_set('error', 'Could not read the uploaded file.');
+        redirect(url('/vendors.php'));
+    }
+    if (strlen($raw) > 2 * 1024 * 1024) {
+        flash_set('error', 'CSV too large (max 2 MB).');
+        redirect(url('/vendors.php'));
+    }
+
+    $parsed = vendor_parse_csv($raw);
+
+    if (empty($parsed)) {
+        flash_set('error', 'No valid vendor names found in the file.');
+        redirect(url('/vendors.php'));
+    }
+
+    // Existing vendor names for duplicate detection
+    $existing = [];
+    foreach (db_all('SELECT LOWER(name) AS n FROM vendors') as $r) {
+        $existing[$r['n']] = true;
+    }
+
+    $previewRows = [];
+    $insertCount = 0;
+    $skipCount   = 0;
+    foreach ($parsed as $row) {
+        $key = strtolower($row['name']);
+        if (isset($existing[$key])) {
+            $skipCount++;
+            $previewRows[] = $row + ['status' => 'skip', 'reason' => 'Already exists'];
+        } else {
+            $insertCount++;
+            $previewRows[] = $row + ['status' => 'insert', 'reason' => ''];
+            $existing[$key] = true;
+        }
+    }
+
+    $token = import_stash($raw, 'vendor');
+
+    $page_title  = 'Import vendors · preview';
+    $page_module = 'vendors';
+    $focus_id    = '';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="import-preview-page">
+        <div class="page-head">
+            <div>
+                <h1>Import vendors · preview</h1>
+                <p class="muted">
+                    Green rows will be inserted with their contact details. Grey rows are skipped (name already exists).
+                    Click Commit to apply.
+                </p>
+            </div>
+        </div>
+        <div class="import-summary">
+            <span class="pill pill-active">✓ Insert: <?= $insertCount ?></span>
+            <span class="pill pill-neutral">⊘ Skip: <?= $skipCount ?></span>
+        </div>
+        <div class="import-actions" style="margin: 16px 0;">
+            <form method="post" action="<?= h(url('/vendors.php?action=import_commit')) ?>" style="display:inline">
+                <?= csrf_field() ?>
+                <input type="hidden" name="token" value="<?= h($token) ?>">
+                <button type="submit" class="btn btn-primary"
+                        <?= $insertCount === 0 ? 'disabled title="Nothing to insert"' : '' ?>>
+                    Commit <?= $insertCount ?> vendor<?= $insertCount === 1 ? '' : 's' ?>
+                </button>
+            </form>
+            <a class="btn btn-ghost" href="<?= h(url('/vendors.php')) ?>">Cancel</a>
+        </div>
+        <table class="data-table import-preview-table">
+            <thead>
+                <tr>
+                    <th style="width:48px;">Line</th>
+                    <th style="width:78px;">Status</th>
+                    <th>Vendor name</th>
+                    <th>Contact</th>
+                    <th>Email</th>
+                    <th>Phone</th>
+                    <th>Notes</th>
+                    <th>Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($previewRows as $r):
+                    $cls = $r['status'] === 'insert' ? 'imp-insert' : 'imp-skip';
+                    $lbl = $r['status'] === 'insert' ? '✓ Insert'   : '⊘ Skip';
+                ?>
+                <tr class="<?= $cls ?>">
+                    <td class="r muted small"><?= (int)$r['_line'] ?></td>
+                    <td><strong><?= h($lbl) ?></strong></td>
+                    <td><?= h($r['name']) ?></td>
+                    <td class="muted small"><?= h(trim($r['salutation'] . ' ' . $r['contact_name'])) ?></td>
+                    <td class="muted small"><?= h($r['email']) ?></td>
+                    <td class="muted small"><?= h($r['phone']) ?></td>
+                    <td class="muted small"><?= h($r['notes']) ?></td>
+                    <td class="muted small"><?= h($r['reason']) ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+if ($action === 'import_commit') {
+    require_permission('vendors', 'manage');
+    csrf_check();
+
+    $token = trim((string)input('token', ''));
+    $raw   = import_unstash($token, 'vendor');
+    if ($raw === null) {
+        flash_set('error', 'Import session expired. Please re-upload the CSV.');
+        redirect(url('/vendors.php'));
+    }
+
+    $parsed = vendor_parse_csv($raw);
+
+    $existing = [];
+    foreach (db_all('SELECT LOWER(name) AS n FROM vendors') as $r) {
+        $existing[$r['n']] = true;
+    }
+
+    $inserted        = 0;
+    $skipped         = 0;
+    $contactsCreated = 0;
+
+    foreach ($parsed as $row) {
+        $key = strtolower($row['name']);
+        if (isset($existing[$key])) { $skipped++; continue; }
+
+        $code = vendor_code_generate();
+        db_exec(
+            'INSERT INTO vendors (code, name, notes, is_active) VALUES (?, ?, ?, ?)',
+            [$code, $row['name'], $row['notes'] ?: null, 1]
+        );
+        $vendorId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
+        $existing[$key] = true;
+        $inserted++;
+
+        // Create primary contact whenever any contact detail is present
+        $email      = $row['email']        ?: null;
+        $phone      = $row['phone']        ?: null;
+        $salutation = $row['salutation']   ?: null;
+        $cname      = $row['contact_name'] ?: $row['name'];
+
+        if ($vendorId && ($cname || $salutation || $email || $phone)) {
+            db_exec(
+                'INSERT INTO vendor_contacts
+                   (vendor_id, salutation, name, email, phone, is_primary, sort_order)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [$vendorId, $salutation, $cname, $email, $phone, 1, 10]
+            );
+            $contactsCreated++;
+        }
+    }
+
+    flash_set('success', sprintf(
+        'Imported %d vendor%s with %d contact%s.%s',
+        $inserted,   $inserted   === 1 ? '' : 's',
+        $contactsCreated, $contactsCreated === 1 ? '' : 's',
+        $skipped > 0 ? " $skipped skipped (already existed)." : ''
+    ));
+    redirect(url('/vendors.php'));
+}
+
+// ============================================================
 // NEW / EDIT form
 // ============================================================
 if ($action === 'new' || $action === 'edit') {
@@ -534,6 +830,15 @@ if ($action === 'new' || $action === 'edit') {
                             <td><?= h($c['phone'] ?: '—') ?></td>
                             <td><?= $c['is_primary'] ? '<span class="pill pill-active">primary</span>' : '' ?></td>
                             <td class="r">
+                                <button type="button" class="btn btn-icon js-contact-edit"
+                                        data-id="<?= (int)$c['id'] ?>"
+                                        data-salutation="<?= h($c['salutation'] ?? '') ?>"
+                                        data-name="<?= h($c['name'] ?? '') ?>"
+                                        data-designation="<?= h($c['designation'] ?? '') ?>"
+                                        data-email="<?= h($c['email'] ?? '') ?>"
+                                        data-phone="<?= h($c['phone'] ?? '') ?>"
+                                        data-primary="<?= (int)$c['is_primary'] ?>"
+                                        title="Edit contact" aria-label="Edit contact">✎</button>
                                 <form method="post" style="display:inline"
                                       action="<?= h(url('/vendors.php?action=contact_delete')) ?>"
                                       onsubmit="return confirm('Remove this contact?');">
@@ -547,10 +852,11 @@ if ($action === 'new' || $action === 'edit') {
                     <?php endforeach; endif; ?>
                 </tbody>
             </table>
-            <h3 style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">Add contact</h3>
-            <form method="post" action="<?= h(url('/vendors.php?action=contact_save')) ?>" class="form-grid">
+            <h3 id="contact-form-title" style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">Add contact</h3>
+            <form id="contact-form" method="post" action="<?= h(url('/vendors.php?action=contact_save')) ?>" class="form-grid">
                 <?= csrf_field() ?>
                 <input type="hidden" name="vendor_id" value="<?= (int)$editing['id'] ?>">
+                <input type="hidden" name="contact_id" id="contact-form-id" value="">
                 <div class="field">
                     <label>Salutation</label>
                     <select name="c_salutation">
@@ -570,9 +876,50 @@ if ($action === 'new' || $action === 'edit') {
                     </label>
                 </div>
                 <div class="form-actions span-2">
-                    <button type="submit" class="btn btn-primary">+ Add contact</button>
+                    <button type="submit" class="btn btn-primary" id="contact-form-submit">+ Add contact</button>
+                    <button type="button" class="btn btn-ghost" id="contact-form-cancel" style="display:none;">Cancel</button>
                 </div>
             </form>
+            <script>
+            (function () {
+                var form   = document.getElementById('contact-form');
+                if (!form) return;
+                var title  = document.getElementById('contact-form-title');
+                var idInp  = document.getElementById('contact-form-id');
+                var submit = document.getElementById('contact-form-submit');
+                var cancel = document.getElementById('contact-form-cancel');
+                function field(name) { return form.querySelector('[name="' + name + '"]'); }
+                function resetForm() {
+                    idInp.value = '';
+                    field('c_salutation').value = '';
+                    field('c_name').value = '';
+                    field('c_designation').value = '';
+                    field('c_email').value = '';
+                    field('c_phone').value = '';
+                    field('c_is_primary').checked = false;
+                    title.textContent = 'Add contact';
+                    submit.textContent = '+ Add contact';
+                    cancel.style.display = 'none';
+                }
+                document.querySelectorAll('.js-contact-edit').forEach(function (btn) {
+                    btn.addEventListener('click', function () {
+                        idInp.value = btn.getAttribute('data-id') || '';
+                        field('c_salutation').value = btn.getAttribute('data-salutation') || '';
+                        field('c_name').value = btn.getAttribute('data-name') || '';
+                        field('c_designation').value = btn.getAttribute('data-designation') || '';
+                        field('c_email').value = btn.getAttribute('data-email') || '';
+                        field('c_phone').value = btn.getAttribute('data-phone') || '';
+                        field('c_is_primary').checked = btn.getAttribute('data-primary') === '1';
+                        title.textContent = 'Edit contact';
+                        submit.textContent = 'Save changes';
+                        cancel.style.display = '';
+                        form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        field('c_name').focus();
+                    });
+                });
+                cancel.addEventListener('click', resetForm);
+            })();
+            </script>
         </div>
 
         <!-- ADDRESSES -->
@@ -595,6 +942,17 @@ if ($action === 'new' || $action === 'edit') {
                             <td><?= h($a['country']) ?></td>
                             <td><?= $a['is_primary'] ? '<span class="pill pill-active">primary</span>' : '' ?></td>
                             <td class="r">
+                                <button type="button" class="btn btn-icon js-address-edit"
+                                        data-id="<?= (int)$a['id'] ?>"
+                                        data-label="<?= h($a['label'] ?? '') ?>"
+                                        data-line1="<?= h($a['line1'] ?? '') ?>"
+                                        data-line2="<?= h($a['line2'] ?? '') ?>"
+                                        data-city="<?= h($a['city'] ?? '') ?>"
+                                        data-state="<?= h($a['state'] ?? '') ?>"
+                                        data-pincode="<?= h($a['pincode'] ?? '') ?>"
+                                        data-country="<?= h($a['country'] ?? '') ?>"
+                                        data-primary="<?= (int)$a['is_primary'] ?>"
+                                        title="Edit address" aria-label="Edit address">✎</button>
                                 <form method="post" style="display:inline"
                                       action="<?= h(url('/vendors.php?action=address_delete')) ?>"
                                       onsubmit="return confirm('Remove this address?');">
@@ -608,10 +966,11 @@ if ($action === 'new' || $action === 'edit') {
                     <?php endforeach; endif; ?>
                 </tbody>
             </table>
-            <h3 style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">Add address</h3>
-            <form method="post" action="<?= h(url('/vendors.php?action=address_save')) ?>" class="form-grid">
+            <h3 id="address-form-title" style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">Add address</h3>
+            <form id="address-form" method="post" action="<?= h(url('/vendors.php?action=address_save')) ?>" class="form-grid">
                 <?= csrf_field() ?>
                 <input type="hidden" name="vendor_id" value="<?= (int)$editing['id'] ?>">
+                <input type="hidden" name="address_id" id="address-form-id" value="">
                 <div class="field"><label>Label</label><input name="a_label" type="text" placeholder="Head office, Factory, …"></div>
                 <div class="field"><label>Country</label><input name="a_country" type="text" value="India"></div>
                 <div class="field span-2"><label>Address line 1 *</label><input name="a_line1" type="text" required></div>
@@ -625,9 +984,54 @@ if ($action === 'new' || $action === 'edit') {
                     </label>
                 </div>
                 <div class="form-actions span-2">
-                    <button type="submit" class="btn btn-primary">+ Add address</button>
+                    <button type="submit" class="btn btn-primary" id="address-form-submit">+ Add address</button>
+                    <button type="button" class="btn btn-ghost" id="address-form-cancel" style="display:none;">Cancel</button>
                 </div>
             </form>
+            <script>
+            (function () {
+                var form   = document.getElementById('address-form');
+                if (!form) return;
+                var title  = document.getElementById('address-form-title');
+                var idInp  = document.getElementById('address-form-id');
+                var submit = document.getElementById('address-form-submit');
+                var cancel = document.getElementById('address-form-cancel');
+                function field(name) { return form.querySelector('[name="' + name + '"]'); }
+                function resetForm() {
+                    idInp.value = '';
+                    field('a_label').value = '';
+                    field('a_country').value = 'India';
+                    field('a_line1').value = '';
+                    field('a_line2').value = '';
+                    field('a_city').value = '';
+                    field('a_state').value = '';
+                    field('a_pincode').value = '';
+                    field('a_is_primary').checked = false;
+                    title.textContent = 'Add address';
+                    submit.textContent = '+ Add address';
+                    cancel.style.display = 'none';
+                }
+                document.querySelectorAll('.js-address-edit').forEach(function (btn) {
+                    btn.addEventListener('click', function () {
+                        idInp.value = btn.getAttribute('data-id') || '';
+                        field('a_label').value = btn.getAttribute('data-label') || '';
+                        field('a_country').value = btn.getAttribute('data-country') || 'India';
+                        field('a_line1').value = btn.getAttribute('data-line1') || '';
+                        field('a_line2').value = btn.getAttribute('data-line2') || '';
+                        field('a_city').value = btn.getAttribute('data-city') || '';
+                        field('a_state').value = btn.getAttribute('data-state') || '';
+                        field('a_pincode').value = btn.getAttribute('data-pincode') || '';
+                        field('a_is_primary').checked = btn.getAttribute('data-primary') === '1';
+                        title.textContent = 'Edit address';
+                        submit.textContent = 'Save changes';
+                        cancel.style.display = '';
+                        form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        field('a_line1').focus();
+                    });
+                });
+                cancel.addEventListener('click', resetForm);
+            })();
+            </script>
         </div>
 
         <!-- LINKED INVENTORY ITEMS -->
@@ -819,14 +1223,31 @@ $dt = data_table_run($dtCfg, $rowRenderer);
 $page_title  = 'Vendors';
 $page_module = 'vendors';
 $focus_id    = '';
-$newBtnHtml = $canManage
-    ? '<a class="btn btn-primary" href="' . h(url('/vendors.php?action=new')) . '"'
-      . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New vendor', 'N') . '</a>'
-    : '';
+$newBtnHtml = '';
+if ($canManage) {
+    $newBtnHtml  = '<button type="button" class="btn btn-ghost btn-sm"'
+                 . ' data-open-import="vendor-import-modal"'
+                 . ' title="Import vendors from CSV">⤒ Import CSV</button> ';
+    $newBtnHtml .= '<a class="btn btn-primary" href="' . h(url('/vendors.php?action=new')) . '"'
+                 . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New vendor', 'N') . '</a>';
+}
 $dtCfg['title']        = 'Vendors';
 $dtCfg['description']  = 'Suppliers and service providers. Each vendor can have multiple contacts and addresses.';
 $dtCfg['actions_html'] = $newBtnHtml;
 require __DIR__ . '/includes/header.php';
 ?>
 <?php data_table_render($dtCfg, $dt, $rowRenderer); ?>
+<?php if ($canManage):
+    import_modal_html(
+        'vendor-import-modal',
+        'Import vendors from CSV',
+        url('/vendors.php?action=import_preview'),
+        '<strong>Full format</strong> (old system export, 16 columns, no header): '
+          . '<code>row_id, vendor_id, contact_id, <u>vendor_name</u>, contact_person, salutation, email, phone, phone2, mobile, -, notes, ...</code><br>'
+          . 'Vendor name is column 4 · Contact details (email, phone, mobile) are imported as a primary contact.<br>'
+          . '<strong>Simple format</strong>: one vendor name per line, no header needed.<br>'
+          . 'Both formats skip blank lines and "." entries. Names already in the system are skipped.',
+        /* showUpsert: */ false
+    );
+endif; ?>
 <?php require __DIR__ . '/includes/footer.php'; ?>

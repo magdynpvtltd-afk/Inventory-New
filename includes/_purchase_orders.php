@@ -12,6 +12,27 @@
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/_codes.php';
 
+// ---------------------------------------------------------------
+// Auto-migration: add lines_snapshot column if it doesn't exist.
+// Runs once per PHP process via a static guard.
+// ---------------------------------------------------------------
+(static function () {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    try {
+        $cols = db_all("SHOW COLUMNS FROM purchase_orders LIKE 'lines_snapshot'");
+        if (empty($cols)) {
+            db_exec("ALTER TABLE purchase_orders
+                     ADD COLUMN lines_snapshot LONGTEXT NULL
+                     COMMENT 'JSON snapshot of shipment lines+prices frozen at amendment time'
+                     AFTER po_date");
+        }
+    } catch (\Throwable $e) {
+        // Non-fatal — table might not exist yet on a fresh install.
+    }
+})();
+
 /**
  * Read a value from magdyn_settings, with a fallback default.
  */
@@ -91,35 +112,41 @@ function po_load_full($poId)
         [(int)$po['vendor_id']]
     );
 
-    // Lines — join inv_items for code/name, or fall back to pending_name
-    // for not-yet-existing items, or assets table for asset lines.
-    $lines = db_all(
-        "SELECT l.*,
-                i.code AS item_code, i.name AS item_name,
-                a.asset_tag AS asset_tag,
-                am.name AS asset_model,
-                COALESCE(u.label, pu.label) AS uom_label
-           FROM inv_shipment_lines l
-      LEFT JOIN inv_items i  ON i.id = l.item_id
-      LEFT JOIN assets    a  ON a.id = l.asset_id
-      LEFT JOIN asset_models am ON am.id = a.model_id
-      LEFT JOIN inv_uom   u  ON u.id = i.uom_id
-      LEFT JOIN inv_uom   pu ON pu.id = l.pending_uom_id
-          WHERE l.shipment_id = ?
-          ORDER BY l.sort_order, l.id",
-        [(int)$po['shipment_id']]
-    );
-
-    // Receive-side pricing rows (inv_shipment_receive_lines holds the
-    // price, gst, expected_date in the existing schema).
-    $receiveLines = [];
-    try {
-        $receiveLines = db_all(
-            "SELECT * FROM inv_shipment_receive_lines WHERE shipment_id = ? ORDER BY sort_order, id",
+    // If this PO version has a frozen snapshot (set when it was superseded
+    // by an amendment), serve that historical data instead of the live
+    // shipment lines — so old versions always show what they looked like.
+    if (!empty($po['lines_snapshot'])) {
+        $snap         = json_decode($po['lines_snapshot'], true) ?: [];
+        $lines        = $snap['lines']         ?? [];
+        $receiveLines = $snap['receive_lines'] ?? [];
+    } else {
+        // Latest (or only) version — query live data as normal.
+        $lines = db_all(
+            "SELECT l.*,
+                    i.code AS item_code, i.name AS item_name,
+                    a.asset_tag AS asset_tag,
+                    am.name AS asset_model,
+                    COALESCE(u.label, pu.label) AS uom_label
+               FROM inv_shipment_lines l
+          LEFT JOIN inv_items i  ON i.id = l.item_id
+          LEFT JOIN assets    a  ON a.id = l.asset_id
+          LEFT JOIN asset_models am ON am.id = a.model_id
+          LEFT JOIN inv_uom   u  ON u.id = i.uom_id
+          LEFT JOIN inv_uom   pu ON pu.id = l.pending_uom_id
+              WHERE l.shipment_id = ?
+              ORDER BY l.sort_order, l.id",
             [(int)$po['shipment_id']]
         );
-    } catch (\Throwable $e) {
-        // Table may not exist on a partial migration; degrade silently.
+
+        $receiveLines = [];
+        try {
+            $receiveLines = db_all(
+                "SELECT * FROM inv_shipment_receive_lines WHERE shipment_id = ? ORDER BY sort_order, id",
+                [(int)$po['shipment_id']]
+            );
+        } catch (\Throwable $e) {
+            // Table may not exist on a partial migration; degrade silently.
+        }
     }
 
     return [
@@ -191,17 +218,17 @@ function po_version_chain($shipmentId)
 }
 
 /**
- * Create a new PO version for the given shipment. Reads the latest
- * version, increments it, inserts a fresh row with a new po_no and
- * parent_po_id pointing at the previous version.
+ * Create a new PO version for the given shipment — same po_no, version+1.
+ * Freezes the BEFORE-state lines as a snapshot on the superseded row so
+ * history views always show what that version looked like.
  *
- * Use this from the shipment save handler when $isAmending is true.
- * For first-save / brand-new shipments, keep using
- * po_ensure_for_shipment() — it creates v1.
- *
- * Returns the newly-inserted PO row, or null on failure.
+ * $preComputedSnapshot — optional JSON string of lines/receive_lines captured
+ * BEFORE the amendment's DB changes committed. When provided it is used as-is
+ * for the historical snapshot (correct "before" state). When omitted the
+ * function falls back to querying live data, which may show the post-amend
+ * values — only acceptable for programmatic callers that don't need history.
  */
-function po_create_amendment_for_shipment($shipmentId, $actorId = null)
+function po_create_amendment_for_shipment($shipmentId, $actorId = null, $preComputedSnapshot = null)
 {
     $shipmentId = (int)$shipmentId;
     if ($shipmentId <= 0) return null;
@@ -217,14 +244,59 @@ function po_create_amendment_for_shipment($shipmentId, $actorId = null)
     $sh = db_one("SELECT id, vendor_id FROM inv_shipments WHERE id = ?", [$shipmentId]);
     if (!$sh) return null;
 
+    // ── Freeze the BEFORE-state lines into the about-to-be-superseded
+    //    PO row so that viewing that version later shows the OLD values.
+    //    Prefer the caller-supplied pre-amend snapshot (taken before the
+    //    transaction committed); fall back to a live query only when no
+    //    snapshot was passed (e.g. programmatic calls). ─────────────────
+    if ($preComputedSnapshot !== null) {
+        $snapshot = $preComputedSnapshot;
+    } else {
+        $liveLines = db_all(
+            "SELECT l.*,
+                    i.code AS item_code, i.name AS item_name,
+                    a.asset_tag AS asset_tag,
+                    am.name AS asset_model,
+                    COALESCE(u.label, pu.label) AS uom_label
+               FROM inv_shipment_lines l
+          LEFT JOIN inv_items i  ON i.id = l.item_id
+          LEFT JOIN assets    a  ON a.id = l.asset_id
+          LEFT JOIN asset_models am ON am.id = a.model_id
+          LEFT JOIN inv_uom   u  ON u.id = i.uom_id
+          LEFT JOIN inv_uom   pu ON pu.id = l.pending_uom_id
+              WHERE l.shipment_id = ?
+              ORDER BY l.sort_order, l.id",
+            [$shipmentId]
+        );
+        $liveReceiveLines = [];
+        try {
+            $liveReceiveLines = db_all(
+                "SELECT * FROM inv_shipment_receive_lines WHERE shipment_id = ? ORDER BY sort_order, id",
+                [$shipmentId]
+            );
+        } catch (\Throwable $e) { /* table may not exist yet */ }
+
+        $snapshot = json_encode([
+            'lines'          => $liveLines,
+            'receive_lines'  => $liveReceiveLines,
+            'snapshotted_at' => date('Y-m-d H:i:s'),
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    db_exec(
+        "UPDATE purchase_orders SET lines_snapshot = ? WHERE id = ?",
+        [$snapshot, (int)$latest['id']]
+    );
+
+    // ── Create the new version row — SAME po_no, just version + 1. ──
     $newVersion = (int)$latest['version'] + 1;
-    $newPoNo    = code_next('po');
+    $samePoNo   = $latest['po_no'];   // reuse, do NOT call code_next()
 
     db_exec(
         "INSERT INTO purchase_orders
             (po_no, shipment_id, vendor_id, version, parent_po_id, po_date, created_by)
           VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [$newPoNo, $shipmentId, (int)$sh['vendor_id'],
+        [$samePoNo, $shipmentId, (int)$sh['vendor_id'],
          $newVersion, (int)$latest['id'], date('Y-m-d'),
          $actorId ? (int)$actorId : null]
     );

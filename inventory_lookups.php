@@ -13,7 +13,12 @@
  */
 require_once __DIR__ . '/includes/bootstrap.php';
 require_login();
-require_permission('inventory_lookups', 'view');
+// Reachable from two Admin entries: "Inventory Lookups" (inventory_lookups
+// permission) and the dedicated "Divisions" entry (inventory_divisions
+// permission). Accept either so both entry points work.
+if (!permission_check('inventory_lookups', 'view') && !permission_check('inventory_divisions', 'view')) {
+    require_permission('inventory_lookups', 'view');   // renders the standard 403
+}
 
 $TYPES = [
     'uom'           => ['table' => 'inv_uom',           'name' => 'Unit of Measure'],
@@ -33,11 +38,13 @@ $type  = $TYPES[$typeKey];
 $table = $type['table'];
 $isCat = !empty($type['categories']);   // categories-backed (division)
 
-$canManage = permission_check('inventory_lookups', 'manage');
+$canManage = permission_check('inventory_lookups', 'manage') || permission_check('inventory_divisions', 'manage');
 $action    = (string)input('action', 'index');
 
 if (in_array($action, ['add', 'update', 'toggle', 'delete'], true)) {
-    require_permission('inventory_lookups', 'manage');
+    if (!permission_check('inventory_lookups', 'manage') && !permission_check('inventory_divisions', 'manage')) {
+        require_permission('inventory_lookups', 'manage');   // renders the standard 403
+    }
     csrf_check();
 }
 

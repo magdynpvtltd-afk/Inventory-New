@@ -185,6 +185,13 @@ if ($action === 'view') {
     $vendor   = $full['vendor'];
     $lines    = $full['lines'];
 
+    // Detect if this is a superseded (historical) version — i.e. another
+    // PO row exists for the same shipment with a higher version.
+    $latestPo      = po_latest_for_shipment((int)$po['shipment_id']);
+    $isSuperseded  = $latestPo && (int)$latestPo['id'] !== (int)$po['id'];
+    $isHistorical  = !empty($po['lines_snapshot']); // snapshot = lines frozen at amendment
+    $versionChain  = po_version_chain((int)$po['shipment_id']);
+
     $page_title  = 'PO ' . $po['po_no'];
     $page_module = 'purchase_orders';
     $focus_id    = '';
@@ -192,10 +199,16 @@ if ($action === 'view') {
     ?>
     <div class="page-head">
         <div>
-            <h1>PO <?= h($po['po_no']) ?></h1>
+            <h1>
+                PO <?= h($po['po_no']) ?>
+                <?php if ($isSuperseded): ?>
+                    <span class="pill pill-muted" style="font-size:.75rem;vertical-align:middle;">v<?= (int)$po['version'] ?> — historical</span>
+                <?php else: ?>
+                    <span class="pill pill-info" style="font-size:.75rem;vertical-align:middle;">v<?= (int)$po['version'] ?> — latest</span>
+                <?php endif; ?>
+            </h1>
             <p class="muted small">
-                Version <?= (int)$po['version'] ?> ·
-                <?= h($po['po_date']) ?> ·
+                Issued <?= h($po['po_date']) ?> ·
                 Vendor: <a href="<?= h(url('/vendors.php?action=edit&id=' . (int)$vendor['id'])) ?>"><?= h($vendor['name']) ?></a> ·
                 Linked shipment:
                 <a href="<?= h(url('/inventory_shiprcpt.php?action=view&id=' . (int)$shipment['id'])) ?>">
@@ -204,7 +217,7 @@ if ($action === 'view') {
             </p>
         </div>
         <div style="display: flex; gap: 8px;">
-            <?php if (permission_check('purchase_orders', 'email')): ?>
+            <?php if (!$isSuperseded && permission_check('purchase_orders', 'email')): ?>
                 <a class="btn btn-ghost"
                    href="<?= h(url('/purchase_orders.php?action=email_compose&id=' . (int)$po['id'])) ?>">
                     ✉ Send mail
@@ -223,10 +236,71 @@ if ($action === 'view') {
         </div>
     </div>
 
-    <?php if (po_has_blank_priced_lines((int)$shipment['id'])): ?>
+    <?php if ($isSuperseded): ?>
+        <div class="alert alert-warn" style="display:flex;align-items:center;gap:12px;">
+            <span style="font-size:1.3rem;">🕐</span>
+            <div>
+                <strong>You are viewing a historical version (v<?= (int)$po['version'] ?>).</strong>
+                The lines and prices below are frozen as they were <em>before</em> the next amendment was applied.
+                <a href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$latestPo['id'])) ?>" style="margin-left:8px;">
+                    → View latest version (v<?= (int)$latestPo['version'] ?>)
+                </a>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <?php if (!$isSuperseded && po_has_blank_priced_lines((int)$shipment['id'])): ?>
         <div class="alert alert-warn">
             <strong>System note:</strong>
             <?= h(magdyn_setting('shiprcpt.system_note_blank_price', '')) ?>
+        </div>
+    <?php endif; ?>
+
+    <?php if (count($versionChain) > 1): ?>
+        <div class="card" style="padding:12px 18px;margin-bottom:14px;">
+            <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px;">
+                <strong>Amendment history</strong>
+                <span class="muted small"><?= count($versionChain) ?> version<?= count($versionChain) === 1 ? '' : 's' ?></span>
+            </div>
+            <table class="data-table" style="margin:0;">
+                <thead><tr>
+                    <th style="width:60px;">Ver</th>
+                    <th>Issued</th>
+                    <th>By</th>
+                    <th class="r">Actions</th>
+                </tr></thead>
+                <tbody>
+                <?php foreach (array_reverse($versionChain) as $vi => $vp):
+                    $vIsLatest  = ($vi === 0);
+                    $vIsCurrent = ((int)$vp['id'] === (int)$po['id']);
+                ?>
+                    <tr<?= $vIsCurrent ? ' style="background:var(--row-hover,#f5f5f5);font-weight:600;"' : '' ?>>
+                        <td>
+                            v<?= (int)$vp['version'] ?>
+                            <?php if ($vIsLatest): ?>
+                                <span class="pill pill-info" style="margin-left:4px;">latest</span>
+                            <?php else: ?>
+                                <span class="pill pill-muted" style="margin-left:4px;">history</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="muted small"><?= h(substr((string)$vp['created_at'], 0, 16)) ?></td>
+                        <td><?= h($vp['created_by_name'] ?: '—') ?></td>
+                        <td class="r nowrap">
+                            <?php if (!$vIsCurrent): ?>
+                                <a class="btn btn-icon" href="<?= h(url('/purchase_orders.php?action=view&id=' . (int)$vp['id'])) ?>" title="View this version">👁</a>
+                            <?php else: ?>
+                                <span class="muted small">← current view</span>
+                            <?php endif; ?>
+                            <?php if (permission_check('purchase_orders', 'print')): ?>
+                                <a class="btn btn-icon" target="_blank"
+                                   href="<?= h(url('/purchase_orders.php?action=print&id=' . (int)$vp['id'])) ?>"
+                                   title="Print v<?= (int)$vp['version'] ?>">🖨</a>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
         </div>
     <?php endif; ?>
 
@@ -352,10 +426,10 @@ $dtCfg = [
 $canPrint = permission_check('purchase_orders', 'print');
 $rowRenderer = function ($r) use ($canPrint) {
     $actions = '<a class="btn btn-icon" title="Open PO" aria-label="Open PO" href="'
-             . h(url('/purchase_orders.php?action=view&id=' . (int)$r['id'])) . '">↗</a> ';
+             . h(url('/purchase_orders.php?action=view&id=' . (int)$r['id'])) . '">↗ <span class="dt-action-label">Open PO</span></a> ';
     if ($canPrint) {
         $actions .= '<a class="btn btn-icon" title="Print PO" aria-label="Print PO" target="_blank" href="'
-                  . h(url('/purchase_orders.php?action=print&id=' . (int)$r['id'])) . '">🖨</a>';
+                  . h(url('/purchase_orders.php?action=print&id=' . (int)$r['id'])) . '">🖨 <span class="dt-action-label">Print PO</span></a>';
     }
     return [
         'po_no'       => '<a href="' . h(url('/purchase_orders.php?action=view&id=' . (int)$r['id'])) . '"><strong>' . h($r['po_no']) . '</strong></a>',

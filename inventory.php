@@ -71,7 +71,8 @@ if (!$canViewItems && !$canViewBoms) {
 // ============================================================
 $itemActions = [
     'items', 'item_new', 'item_edit', 'item_save', 'item_delete',
-    'item_clone', 'item_import_preview', 'item_import_commit',
+    'item_clone', 'item_toggle_active',
+    'item_import_preview', 'item_import_commit',
 ];
 $txnActions = [
     'ledger', 'process', 'txn_save', 'txn_process', 'txn_history',

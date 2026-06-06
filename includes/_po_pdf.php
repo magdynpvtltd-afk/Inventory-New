@@ -19,7 +19,7 @@
  */
 
 require_once __DIR__ . '/_po_print.php';
-require_once __DIR__ . '/vendor/dompdf/autoload.php';
+require_once __DIR__ . '/vendor/autoload.php';
 
 /**
  * Render a PO to a PDF file. Returns

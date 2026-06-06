@@ -146,6 +146,224 @@ if ($action === 'clone') {
 }
 
 // ============================================================
+// EXPORT CSV
+// ============================================================
+if ($action === 'export') {
+    require_permission('locations', 'manage');
+    $rows = db_all(
+        'SELECT l.code, l.name, p.code AS parent_code, l.notes, l.sort_order, l.is_active
+           FROM locations l
+           LEFT JOIN locations p ON p.id = l.parent_id
+          ORDER BY l.sort_order, l.name'
+    );
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="locations_' . date('Ymd') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF)); // UTF-8 BOM
+    fputcsv($out, ['code', 'name', 'parent_code', 'notes', 'sort_order', 'is_active']);
+    foreach ($rows as $r) {
+        fputcsv($out, [
+            $r['code'], $r['name'], $r['parent_code'] ?? '',
+            $r['notes'] ?? '', $r['sort_order'], $r['is_active'],
+        ]);
+    }
+    fclose($out);
+    exit;
+}
+
+// ============================================================
+// IMPORT — preview + commit
+// CSV columns: code*, name*, parent_code, notes, sort_order, is_active
+// Parent links are resolved in a second pass after all rows are inserted.
+// ============================================================
+require_once __DIR__ . '/includes/_import.php';
+
+if ($action === 'import_preview') {
+    require_permission('locations', 'manage');
+    csrf_check();
+
+    $parsed = import_parse_uploaded_csv('csv');
+    if (empty($parsed['ok'])) {
+        flash_set('error', $parsed['error']);
+        redirect(url('/locations.php'));
+    }
+
+    $token = import_stash($parsed['csv_text'], 'locations');
+
+    // Validate rows
+    $counts = ['insert' => 0, 'update' => 0, 'skip' => 0, 'error' => 0];
+    $previewRows = [];
+    $upsert = !empty($_POST['upsert']);
+
+    foreach ($parsed['rows'] as $row) {
+        $code = trim((string)($row['code'] ?? ''));
+        $name = trim((string)($row['name'] ?? ''));
+        $line = (int)($row['_line'] ?? 0);
+
+        if ($code === '') {
+            $counts['error']++;
+            $previewRows[] = ['line' => $line, 'status' => 'error', 'data' => $row, 'reason' => 'code is required'];
+            continue;
+        }
+        if ($name === '') {
+            $counts['error']++;
+            $previewRows[] = ['line' => $line, 'status' => 'error', 'data' => $row, 'reason' => 'name is required'];
+            continue;
+        }
+
+        $existing = db_one('SELECT id FROM locations WHERE code = ?', [$code]);
+        if ($existing) {
+            if (!$upsert) {
+                $counts['skip']++;
+                $previewRows[] = ['line' => $line, 'status' => 'skip', 'data' => $row, 'reason' => 'code "' . $code . '" already exists'];
+            } else {
+                $counts['update']++;
+                $previewRows[] = ['line' => $line, 'status' => 'update', 'data' => $row, 'reason' => '', 'existing_id' => (int)$existing['id']];
+            }
+        } else {
+            $counts['insert']++;
+            $previewRows[] = ['line' => $line, 'status' => 'insert', 'data' => $row, 'reason' => ''];
+        }
+    }
+
+    $page_title  = 'Import locations · preview';
+    $page_module = 'locations';
+    $focus_id    = '';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="import-preview-page">
+        <div class="page-head">
+            <div>
+                <h1>Import locations · preview</h1>
+                <p class="muted">Green = insert · Blue = update · Grey = skip · Red = error. Click Commit to apply.</p>
+            </div>
+        </div>
+        <div class="import-summary">
+            <span class="pill pill-active">✓ Insert: <?= (int)$counts['insert'] ?></span>
+            <span class="pill pill-info">⟳ Update: <?= (int)$counts['update'] ?></span>
+            <span class="pill pill-neutral">⊘ Skip: <?= (int)$counts['skip'] ?></span>
+            <span class="pill pill-danger">✗ Error: <?= (int)$counts['error'] ?></span>
+        </div>
+        <div class="import-actions" style="margin:16px 0;">
+            <form method="post" action="<?= h(url('/locations.php?action=import_commit')) ?>" style="display:inline">
+                <?= csrf_field() ?>
+                <input type="hidden" name="token" value="<?= h($token) ?>">
+                <input type="hidden" name="upsert" value="<?= $upsert ? '1' : '0' ?>">
+                <?php $actionable = $counts['insert'] + $counts['update']; ?>
+                <button type="submit" class="btn btn-primary"
+                        <?= $actionable === 0 ? 'disabled' : '' ?>>
+                    Commit <?= $actionable ?> change<?= $actionable === 1 ? '' : 's' ?>
+                </button>
+            </form>
+            <a class="btn btn-ghost" href="<?= h(url('/locations.php')) ?>">Cancel</a>
+        </div>
+        <table class="data-table import-preview-table">
+            <thead><tr>
+                <th style="width:52px">Line</th>
+                <th style="width:80px">Status</th>
+                <th>Code</th><th>Name</th><th>Parent code</th><th>Notes</th><th>Order</th>
+                <th>Notes</th>
+            </tr></thead>
+            <tbody>
+            <?php foreach ($previewRows as $r):
+                $cls = ['insert'=>'imp-insert','update'=>'imp-update','skip'=>'imp-skip','error'=>'imp-error'][$r['status']] ?? '';
+                $lbl = ['insert'=>'✓ Insert','update'=>'⟳ Update','skip'=>'⊘ Skip','error'=>'✗ Error'][$r['status']] ?? $r['status'];
+            ?>
+            <tr class="<?= $cls ?>">
+                <td class="r muted small"><?= (int)$r['line'] ?></td>
+                <td><strong><?= h($lbl) ?></strong></td>
+                <td><?= h($r['data']['code'] ?? '') ?></td>
+                <td><?= h($r['data']['name'] ?? '') ?></td>
+                <td><?= h($r['data']['parent_code'] ?? '') ?></td>
+                <td><?= h($r['data']['notes'] ?? '') ?></td>
+                <td><?= h($r['data']['sort_order'] ?? '') ?></td>
+                <td class="muted small"><?= h($r['reason']) ?></td>
+            </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+if ($action === 'import_commit') {
+    require_permission('locations', 'manage');
+    csrf_check();
+
+    $token  = trim((string)input('token', ''));
+    $upsert = !empty($_POST['upsert']);
+    $raw    = import_unstash($token, 'locations');
+    if ($raw === null) {
+        flash_set('error', 'Import session expired. Please re-upload.');
+        redirect(url('/locations.php'));
+    }
+
+    $parsed = import_parse_csv_text($raw);
+    if (empty($parsed['ok'])) {
+        flash_set('error', $parsed['error'] ?? 'Parse failed.');
+        redirect(url('/locations.php'));
+    }
+
+    $inserted = 0; $updated = 0; $errors = 0;
+    $codeToId = []; // track newly inserted codes → ids for parent pass
+
+    // Pass 1: insert / update without parents
+    foreach ($parsed['rows'] as $row) {
+        $code     = trim((string)($row['code']       ?? ''));
+        $name     = trim((string)($row['name']       ?? ''));
+        $notes    = trim((string)($row['notes']      ?? '')) ?: null;
+        $sort     = isset($row['sort_order']) && $row['sort_order'] !== '' ? (int)$row['sort_order'] : 100;
+        $active   = isset($row['is_active'])  && $row['is_active']  !== '' ? ((int)$row['is_active'] ? 1 : 0) : 1;
+
+        if ($code === '' || $name === '') { $errors++; continue; }
+
+        $existing = db_one('SELECT id FROM locations WHERE code = ?', [$code]);
+        if ($existing) {
+            if (!$upsert) continue;
+            db_exec(
+                'UPDATE locations SET name=?, notes=?, sort_order=?, is_active=? WHERE id=?',
+                [$name, $notes, $sort, $active, (int)$existing['id']]
+            );
+            $codeToId[$code] = (int)$existing['id'];
+            $updated++;
+        } else {
+            db_exec(
+                'INSERT INTO locations (code, name, notes, sort_order, is_active) VALUES (?, ?, ?, ?, ?)',
+                [$code, $name, $notes, $sort, $active]
+            );
+            $newId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
+            $codeToId[$code] = $newId;
+            $inserted++;
+        }
+    }
+
+    // Pass 2: resolve parent_code links
+    $parentLinked = 0;
+    foreach ($parsed['rows'] as $row) {
+        $code       = trim((string)($row['code']        ?? ''));
+        $parentCode = trim((string)($row['parent_code'] ?? ''));
+        if ($code === '' || $parentCode === '') continue;
+
+        $locId    = $codeToId[$code] ?? (int)db_val('SELECT id FROM locations WHERE code = ?', [$code], 0);
+        $parentId = $codeToId[$parentCode] ?? (int)db_val('SELECT id FROM locations WHERE code = ?', [$parentCode], 0);
+        if ($locId && $parentId && $locId !== $parentId) {
+            db_exec('UPDATE locations SET parent_id = ? WHERE id = ?', [$parentId, $locId]);
+            $parentLinked++;
+        }
+    }
+
+    flash_set('success', sprintf(
+        'Imported: %d inserted, %d updated.%s%s',
+        $inserted, $updated,
+        $errors    > 0 ? " $errors rows had errors and were skipped." : '',
+        $parentLinked > 0 ? " $parentLinked parent links resolved." : ''
+    ));
+    redirect(url('/locations.php'));
+}
+
+// ============================================================
 // NEW / EDIT
 // ============================================================
 if ($action === 'new' || $action === 'edit') {
@@ -407,6 +625,8 @@ require __DIR__ . '/includes/header.php';
     </div>
     <div class="head-actions">
         <?php if ($canManage): ?>
+            <a class="btn btn-ghost" href="<?= h(url('/locations.php?action=export')) ?>" title="Download all locations as CSV">⤓ Export CSV</a>
+            <button type="button" class="btn btn-ghost" data-open-import="loc-import-modal" title="Import locations from CSV">⤒ Import CSV</button>
             <a class="btn btn-primary" href="<?= h(url('/locations.php?action=new')) ?>"
                data-shortcut="N" accesskey="n"><?= shortcut_label('+ New location', 'N') ?></a>
         <?php endif; ?>
@@ -432,4 +652,15 @@ require __DIR__ . '/includes/header.php';
     </table>
 </div>
 
+<?php if ($canManage):
+    import_modal_html(
+        'loc-import-modal',
+        'Import locations from CSV',
+        url('/locations.php?action=import_preview'),
+        'Required columns: <code>code</code>, <code>name</code>. '
+          . 'Optional: <code>parent_code</code>, <code>notes</code>, <code>sort_order</code>, <code>is_active</code>. '
+          . 'Use <a href="' . h(url('/locations.php?action=export')) . '">Export CSV</a> on your local system to get the right format.',
+        /* showUpsert: */ true
+    );
+endif; ?>
 <?php require __DIR__ . '/includes/footer.php'; ?>

@@ -28,6 +28,11 @@ $TYPES = [
     'inspection'    => 'Inspection',
     'running_notes' => 'Running Notes',
     'invoice'       => 'Invoice',
+    // "All" is a shared bucket: categories created here surface in EVERY
+    // module's category picker (currently Asset models + Inventory items)
+    // alongside that module's own categories. Managed on its own tab like
+    // any other type; the consumer queries include type='all'.
+    'all'           => 'All modules',
 ];
 
 $typeKey = (string)input('type', 'asset');
@@ -177,6 +182,341 @@ if ($action === 'delete') {
             [real_user_id(), 'deleted category ' . $cat['type'] . '/' . $cat['code']]);
     flash_set('success', 'Category deleted.');
     redirect(url('/categories.php?type=' . $cat['type']));
+}
+
+// ============================================================
+// CATEGORY EXPORT CSV
+// ============================================================
+if ($action === 'export') {
+    require_permission('categories', 'manage');
+    $exportType = (string)input('type', '');
+    $where  = $exportType && isset($TYPES[$exportType]) ? 'WHERE type = ' . db()->quote($exportType) : '';
+    $expRows = db_all("SELECT type, code, name, notes, sort_order, is_active FROM categories $where ORDER BY type, sort_order, name");
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="categories_' . ($exportType ?: 'all') . '_' . date('Ymd') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
+    fputcsv($out, ['type', 'code', 'name', 'notes', 'sort_order', 'is_active']);
+    foreach ($expRows as $r) {
+        fputcsv($out, [$r['type'], $r['code'], $r['name'], $r['notes'] ?? '', $r['sort_order'], $r['is_active']]);
+    }
+    fclose($out);
+    exit;
+}
+
+// ============================================================
+// CATEGORY CSV IMPORT — preview + commit
+// Supports two CSV formats:
+//   FULL (with headers): type, code, name, notes, sort_order, is_active
+//   SIMPLE (headerless): one category name per line (type chosen in modal)
+// Codes are auto-generated for the simple format.
+// ============================================================
+require_once __DIR__ . '/includes/_import.php';
+
+function category_code_from_name($name)
+{
+    // Uppercase slug: non-alphanumeric → underscore, max 12 chars.
+    $base = strtoupper(preg_replace('/[^A-Z0-9]+/i', '_', trim($name)));
+    $base = trim($base, '_');
+    return $base !== '' ? substr($base, 0, 12) : 'CAT';
+}
+
+function category_code_generate($name, $type)
+{
+    $base = category_code_from_name($name);
+    $candidate = $base;
+    $i = 2;
+    while (db_val('SELECT id FROM categories WHERE type = ? AND code = ?', [$type, $candidate], 0)) {
+        $candidate = $base . '_' . $i++;
+    }
+    return $candidate;
+}
+
+if ($action === 'import_preview') {
+    require_permission('categories', 'manage');
+    csrf_check();
+
+    $importType = (string)input('import_type', 'asset');
+    if (!isset($TYPES[$importType])) $importType = 'asset';
+
+    if (empty($_FILES['csv']) || $_FILES['csv']['error'] !== UPLOAD_ERR_OK) {
+        flash_set('error', 'No CSV file uploaded or upload failed.');
+        redirect(url('/categories.php?type=' . $typeKey));
+    }
+    $raw = file_get_contents($_FILES['csv']['tmp_name']);
+    if ($raw === false || $raw === '') {
+        flash_set('error', 'Could not read the uploaded file.');
+        redirect(url('/categories.php?type=' . $typeKey));
+    }
+
+    // Strip BOM, normalise line endings
+    if (substr($raw, 0, 3) === "\xEF\xBB\xBF") $raw = substr($raw, 3);
+    $raw = str_replace(["\r\n", "\r"], "\n", $raw);
+
+    // Detect format: FULL (first row has "type","code","name" headers) vs SIMPLE (name-only)
+    $fh = fopen('php://memory', 'r+');
+    fwrite($fh, $raw);
+    rewind($fh);
+    $firstRow = fgetcsv($fh);
+    fclose($fh);
+    $firstRowLower = array_map(function($v){ return strtolower(trim((string)$v)); }, $firstRow ?: []);
+    $isFullFormat  = in_array('name', $firstRowLower, true) && in_array('type', $firstRowLower, true);
+
+    $parsed = [];
+    if ($isFullFormat) {
+        // Full format: parse with _import.php helper (uses first row as header)
+        $parsedResult = import_parse_csv_text($raw);
+        if (!$parsedResult['ok']) {
+            flash_set('error', $parsedResult['error']);
+            redirect(url('/categories.php?type=' . $typeKey));
+        }
+        foreach ($parsedResult['rows'] as $r) {
+            $name = trim((string)($r['name'] ?? ''));
+            $type = trim((string)($r['type'] ?? $importType));
+            if (!isset($TYPES[$type])) $type = $importType;
+            if ($name === '' || preg_match('/^\.*\s*$/', $name)) continue;
+            $parsed[] = [
+                'name'       => $name,
+                'type'       => $type,
+                'code'       => trim((string)($r['code']       ?? '')),
+                'notes'      => trim((string)($r['notes']      ?? '')),
+                'sort_order' => isset($r['sort_order']) && $r['sort_order'] !== '' ? (int)$r['sort_order'] : 100,
+                'is_active'  => isset($r['is_active'])  && $r['is_active']  !== '' ? ((int)$r['is_active'] ? 1 : 0) : 1,
+                '_line'      => (int)($r['_line'] ?? 0),
+            ];
+        }
+    } else {
+        // Simple format: one name per line, no header, type from selector
+        $fh = fopen('php://memory', 'r+');
+        fwrite($fh, $raw);
+        rewind($fh);
+        $lineNo = 0;
+        while (($cols = fgetcsv($fh)) !== false) {
+            $lineNo++;
+            $name = isset($cols[0]) ? trim($cols[0]) : '';
+            if ($name === '' || preg_match('/^\.*\s*$/', $name)) continue;
+            $parsed[] = ['name' => $name, 'type' => $importType, 'code' => '', 'notes' => '', 'sort_order' => 100, 'is_active' => 1, '_line' => $lineNo];
+        }
+        fclose($fh);
+    }
+
+    if (empty($parsed)) {
+        flash_set('error', 'No valid category names found in the file.');
+        redirect(url('/categories.php?type=' . $typeKey));
+    }
+
+    // Build existing name maps per type
+    $existingByType = [];
+    $existingCodesByType = [];
+    foreach (db_all('SELECT type, LOWER(name) AS n, code FROM categories') as $r) {
+        $existingByType[$r['type']][$r['n']] = true;
+        $existingCodesByType[$r['type']][$r['code']] = true;
+    }
+
+    $previewRows = [];
+    $insertCount = 0;
+    $skipCount   = 0;
+    $usedCodes   = [];
+    $sortSeq     = 100;
+    foreach ($parsed as $row) {
+        $type = $row['type'];
+        $key  = strtolower($row['name']);
+        if (isset($existingByType[$type][$key])) {
+            $skipCount++;
+            $previewRows[] = ['line' => $row['_line'], 'status' => 'skip', 'name' => $row['name'], 'type' => $type, 'code' => '', 'reason' => 'Name already exists in ' . ($TYPES[$type] ?? $type)];
+        } else {
+            // Resolve code: use provided code if non-empty and unique, otherwise auto-generate
+            if ($row['code'] !== '') {
+                $code = $row['code'];
+                if (isset($existingCodesByType[$type][$code]) || isset($usedCodes[$type][$code])) {
+                    $code = category_code_generate($row['name'], $type);
+                }
+            } else {
+                $base = category_code_from_name($row['name']);
+                $code = $base; $i = 2;
+                while (
+                    isset($existingCodesByType[$type][$code]) || isset($usedCodes[$type][$code])
+                ) { $code = $base . '_' . $i++; }
+            }
+            $usedCodes[$type][$code] = true;
+
+            $insertCount++;
+            $previewRows[] = ['line' => $row['_line'], 'status' => 'insert', 'name' => $row['name'], 'type' => $type, 'code' => $code,
+                              'notes' => $row['notes'], 'sort_order' => $row['sort_order'], 'reason' => ''];
+            $existingByType[$type][$key] = true;
+            $sortSeq += 10;
+        }
+    }
+
+    $token = import_stash($raw . "\x00" . $importType, 'category');
+
+    $page_title  = 'Import categories · preview';
+    $page_module = 'categories';
+    $focus_id    = '';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="import-preview-page">
+        <div class="page-head">
+            <div>
+                <h1>Import categories · preview</h1>
+                <p class="muted">
+                    <?= $isFullFormat ? 'Full format detected (type/code/name headers).' : 'Simple format — importing into type: <strong>' . h($TYPES[$importType]) . '</strong>.' ?>
+                    Green rows will be inserted; grey rows are skipped.
+                    Click Commit to apply.
+                </p>
+            </div>
+        </div>
+        <div class="import-summary">
+            <span class="pill pill-active">✓ Insert: <?= $insertCount ?></span>
+            <span class="pill pill-neutral">⊘ Skip: <?= $skipCount ?></span>
+        </div>
+        <div class="import-actions" style="margin: 16px 0;">
+            <form method="post" action="<?= h(url('/categories.php?action=import_commit')) ?>" style="display:inline">
+                <?= csrf_field() ?>
+                <input type="hidden" name="token" value="<?= h($token) ?>">
+                <button type="submit" class="btn btn-primary"
+                        <?= $insertCount === 0 ? 'disabled title="Nothing to insert"' : '' ?>>
+                    Commit <?= $insertCount ?> categor<?= $insertCount === 1 ? 'y' : 'ies' ?>
+                </button>
+            </form>
+            <a class="btn btn-ghost" href="<?= h(url('/categories.php?type=' . $importType)) ?>">Cancel</a>
+        </div>
+        <table class="data-table import-preview-table">
+            <thead>
+                <tr>
+                    <th style="width:52px;">Line</th>
+                    <th style="width:82px;">Status</th>
+                    <th>Type</th><th>Code</th><th>Name</th><th>Notes</th>
+                    <th>Notes</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($previewRows as $r):
+                    $cls = $r['status'] === 'insert' ? 'imp-insert' : 'imp-skip';
+                    $lbl = $r['status'] === 'insert' ? '✓ Insert'   : '⊘ Skip';
+                ?>
+                <tr class="<?= $cls ?>">
+                    <td class="r muted small"><?= (int)$r['line'] ?></td>
+                    <td><strong><?= h($lbl) ?></strong></td>
+                    <td><?= h($r['type'] ?? $importType) ?></td>
+                    <td><code><?= h($r['code']) ?></code></td>
+                    <td><?= h($r['name']) ?></td>
+                    <td class="muted small"><?= h($r['notes'] ?? '') ?></td>
+                    <td class="muted small"><?= h($r['reason']) ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+if ($action === 'import_commit') {
+    require_permission('categories', 'manage');
+    csrf_check();
+
+    $token   = trim((string)input('token', ''));
+    $rawFull = import_unstash($token, 'category');
+    if ($rawFull === null) {
+        flash_set('error', 'Import session expired. Please re-upload the CSV.');
+        redirect(url('/categories.php'));
+    }
+
+    $parts      = explode("\x00", $rawFull, 2);
+    $raw        = $parts[0];
+    $importType = isset($parts[1]) ? trim($parts[1]) : 'asset';
+    if (!isset($TYPES[$importType])) $importType = 'asset';
+
+    // Detect format same way as preview
+    $fh2 = fopen('php://memory', 'r+');
+    fwrite($fh2, $raw);
+    rewind($fh2);
+    $firstRow2 = fgetcsv($fh2);
+    fclose($fh2);
+    $firstLower2 = array_map(function($v){ return strtolower(trim((string)$v)); }, $firstRow2 ?: []);
+    $isFullFmt2  = in_array('name', $firstLower2, true) && in_array('type', $firstLower2, true);
+
+    $rows = [];
+    if ($isFullFmt2) {
+        $pr = import_parse_csv_text($raw);
+        if (!empty($pr['ok'])) {
+            foreach ($pr['rows'] as $r) {
+                $name = trim((string)($r['name'] ?? ''));
+                $type = trim((string)($r['type'] ?? $importType));
+                if (!isset($TYPES[$type])) $type = $importType;
+                if ($name === '' || preg_match('/^\.*\s*$/', $name)) continue;
+                $rows[] = [
+                    'name'       => $name,
+                    'type'       => $type,
+                    'code'       => trim((string)($r['code'] ?? '')),
+                    'notes'      => trim((string)($r['notes'] ?? '')) ?: null,
+                    'sort_order' => isset($r['sort_order']) && $r['sort_order'] !== '' ? (int)$r['sort_order'] : 100,
+                    'is_active'  => isset($r['is_active'])  && $r['is_active']  !== '' ? ((int)$r['is_active'] ? 1 : 0) : 1,
+                ];
+            }
+        }
+    } else {
+        $fh = fopen('php://memory', 'r+');
+        fwrite($fh, $raw);
+        rewind($fh);
+        $sortSeqBase = (int)db_val('SELECT COALESCE(MAX(sort_order), 90) FROM categories WHERE type = ?', [$importType], 90);
+        while (($cols = fgetcsv($fh)) !== false) {
+            $name = isset($cols[0]) ? trim($cols[0]) : '';
+            if ($name === '' || preg_match('/^\.*\s*$/', $name)) continue;
+            $sortSeqBase += 10;
+            $rows[] = ['name' => $name, 'type' => $importType, 'code' => '', 'notes' => null, 'sort_order' => $sortSeqBase, 'is_active' => 1];
+        }
+        fclose($fh);
+    }
+
+    $existingByType = [];
+    $existingCodesByType = [];
+    foreach (db_all('SELECT type, LOWER(name) AS n, code FROM categories') as $r) {
+        $existingByType[$r['type']][$r['n']] = true;
+        $existingCodesByType[$r['type']][$r['code']] = true;
+    }
+
+    $inserted = 0; $skipped = 0; $usedCodes = [];
+    $firstType = $rows ? $rows[0]['type'] : $importType;
+
+    foreach ($rows as $row) {
+        $type = $row['type'];
+        $key  = strtolower($row['name']);
+        if (isset($existingByType[$type][$key])) { $skipped++; continue; }
+
+        if ($row['code'] !== '') {
+            $code = $row['code'];
+            if (isset($existingCodesByType[$type][$code]) || isset($usedCodes[$type][$code])) {
+                $code = category_code_generate($row['name'], $type);
+            }
+        } else {
+            $base = category_code_from_name($row['name']);
+            $code = $base; $i = 2;
+            while (isset($existingCodesByType[$type][$code]) || isset($usedCodes[$type][$code])) {
+                $code = $base . '_' . $i++;
+            }
+        }
+        $usedCodes[$type][$code] = true;
+
+        db_exec(
+            'INSERT INTO categories (type, parent_id, code, name, notes, sort_order, is_active)
+             VALUES (?, NULL, ?, ?, ?, ?, ?)',
+            [$type, $code, $row['name'], $row['notes'], $row['sort_order'], $row['is_active']]
+        );
+        $existingByType[$type][$key] = true;
+        $existingCodesByType[$type][$code] = true;
+        $inserted++;
+    }
+
+    flash_set('success', sprintf(
+        'Imported %d categor%s.%s',
+        $inserted,
+        $inserted === 1 ? 'y' : 'ies',
+        $skipped > 0 ? " $skipped skipped (already existed)." : ''
+    ));
+    redirect(url('/categories.php?type=' . $firstType));
 }
 
 // ============================================================
@@ -351,8 +691,11 @@ if ($useDataTable) {
 
     $actionsHtml = '';
     if ($canManage) {
-        $actionsHtml = '<a class="btn btn-primary btn-sm" href="' . h(url('/categories.php?action=new&type=' . $typeKey)) . '"'
-                     . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New category', 'N') . '</a>';
+        $actionsHtml = '<button type="button" class="btn btn-ghost btn-sm"'
+                     . ' data-open-import="category-import-modal"'
+                     . ' title="Import categories from CSV">⤒ Import CSV</button> ';
+        $actionsHtml .= '<a class="btn btn-primary btn-sm" href="' . h(url('/categories.php?action=new&type=' . $typeKey)) . '"'
+                      . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New category', 'N') . '</a>';
     }
     $actionsHtml .= ' <a class="btn btn-ghost btn-sm" href="' . h(url('/categories.php?type=' . $typeKey)) . '">← Tree view</a>';
     $dtCfg['title']        = $TYPES[$typeKey] . ' categories (flat)';
@@ -441,6 +784,10 @@ require __DIR__ . '/includes/header.php';
     </div>
     <div class="head-actions">
         <?php if ($canManage): ?>
+            <a class="btn btn-ghost" href="<?= h(url('/categories.php?action=export&type=' . $typeKey)) ?>" title="Download categories as CSV">⤓ Export CSV</a>
+            <button type="button" class="btn btn-ghost"
+                    data-open-import="category-import-modal"
+                    title="Import categories from CSV">⤒ Import CSV</button>
             <a class="btn btn-primary" href="<?= h(url('/categories.php?action=new&type=' . $typeKey)) ?>"
                data-shortcut="N" accesskey="n"><?= shortcut_label('+ New category', 'N') ?></a>
         <?php endif; ?>
@@ -484,4 +831,64 @@ require __DIR__ . '/includes/header.php';
     </table>
 </div>
 
+<?php if ($canManage):
+    require_once __DIR__ . '/includes/_import.php';
+    // Custom modal — includes the type selector not present in the generic helper.
+    ?>
+    <div id="category-import-modal" class="att-preview-modal" hidden>
+        <div class="att-preview-backdrop" data-import-close></div>
+        <div class="att-preview-dialog" role="dialog" aria-label="Import categories from CSV"
+             style="max-width:540px;margin:auto;height:auto;">
+            <div class="att-preview-head">
+                <span class="att-preview-name">Import categories from CSV</span>
+                <button type="button" class="btn btn-icon att-preview-close-btn" data-import-close title="Close">✕</button>
+            </div>
+            <form method="post" action="<?= h(url('/categories.php?action=import_preview')) ?>"
+                  enctype="multipart/form-data" style="padding:18px;">
+                <?= csrf_field() ?>
+                <div class="field">
+                    <label>Category type *</label>
+                    <select name="import_type" class="no-combobox">
+                        <?php foreach ($TYPES as $k => $label): ?>
+                            <option value="<?= h($k) ?>" <?= $k === $typeKey ? 'selected' : '' ?>><?= h($label) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="field" data-drop-zone="csv-import" style="margin-top:12px;">
+                    <label>CSV file * <span class="muted small">(or drag onto this area)</span></label>
+                    <input name="csv" type="file" accept=".csv,text/csv" required>
+                </div>
+                <div class="muted small" style="margin-top:10px;">
+                    One category name per line. No header row needed. Blank lines and "." entries are
+                    skipped. Names already present in the chosen type are skipped automatically.
+                    Codes are auto-generated from the name.
+                </div>
+                <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end;">
+                    <button type="button" class="btn btn-ghost" data-import-close>Cancel</button>
+                    <button type="submit" class="btn btn-primary">Preview</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script>
+    (function () {
+        var modal = document.getElementById('category-import-modal');
+        if (!modal) return;
+        document.querySelectorAll('[data-open-import="category-import-modal"]').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                modal.hidden = false;
+                document.body.classList.add('att-preview-modal-open');
+            });
+        });
+        document.addEventListener('click', function (e) {
+            if (e.target.closest && e.target.closest('[data-import-close]')) {
+                if (modal.contains(e.target)) {
+                    modal.hidden = true;
+                    document.body.classList.remove('att-preview-modal-open');
+                }
+            }
+        });
+    })();
+    </script>
+<?php endif; ?>
 <?php require __DIR__ . '/includes/footer.php'; ?>

@@ -375,13 +375,12 @@ if ($op === 'set_invoice') {
         //         opening the linked job card.
         db_exec(
             "INSERT INTO inv_shipments
-               (ship_no, vendor_id, mode, ship_due_date, receive_due_date,
+               (ship_no, vendor_id, mode,
                 status, ref_doc, notes, is_rework, created_by)
-             VALUES (?, NULL, 'ship', ?, NULL,
+             VALUES (?, NULL, 'ship',
                      'closed', ?, ?, 0, NULL)",
             [
                 '__pending__',
-                $invoiceDate,
                 $jcNo,
                 sprintf("Auto-shipped on close of %s.\nInvoice: %s (%s)\nCustomer: %s\nDelivery: %s",
                         $jcNo, $invoiceNo, $invoiceDate,

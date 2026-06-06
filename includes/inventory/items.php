@@ -86,6 +86,23 @@ function inv_id_generate() {
 require_once dirname(__DIR__, 2) . '/includes/_import.php';
 require_once dirname(__DIR__, 2) . '/includes/_billing_products.php';
 
+/**
+ * Robust "is this category a Finished Good?" test. Matches by NAME
+ * (case-insensitive, starts with "finished good") or a couple of known
+ * codes — NOT by a specific id — so it survives category id/code drift
+ * when categories are re-imported from CSV. This drives the per-item
+ * is_product flag, which is what makes an item a TOP ELEMENT in the BOM tree.
+ */
+function inv_is_finished_good_category($catId) {
+    $catId = (int)$catId;
+    if ($catId <= 0) return false;
+    $row = db_one('SELECT name, code FROM categories WHERE id = ?', [$catId]);
+    if (!$row) return false;
+    $name = strtolower(trim((string)$row['name']));
+    return (strpos($name, 'finished good') === 0)
+        || in_array((string)$row['code'], ['finshd', 'FINISHED_GOO'], true);
+}
+
 function item_import_adapter(array $row, bool $upsert) {
     $code = isset($row['code']) ? trim((string)$row['code']) : '';
     $sd   = isset($row['short_description']) ? trim((string)$row['short_description']) : '';
@@ -98,10 +115,10 @@ function item_import_adapter(array $row, bool $upsert) {
     if ($catCode === '') {
         return ['status' => 'error', 'reason' => 'category_code is required'];
     }
-    $c = db_one("SELECT id FROM categories WHERE type = 'inventory' AND code = ?", [$catCode]);
+    $c = db_one("SELECT id FROM categories WHERE type IN ('inventory', 'all') AND code = ? ORDER BY FIELD(type, 'inventory', 'all') LIMIT 1", [$catCode]);
     if (!$c) {
         return ['status' => 'error',
-                'reason' => 'Unknown category_code "' . $catCode . '" (must be a categories row with type=inventory)'];
+                'reason' => 'Unknown category_code "' . $catCode . '" (must be a categories row with type=inventory or type=all)'];
     }
     $categoryId = (int)$c['id'];
 
@@ -184,6 +201,7 @@ function item_import_adapter(array $row, bool $upsert) {
         'long_description'  => trim((string)($row['long_description'] ?? '')) ?: null,
         'category_id'       => $categoryId,
         'category_code'     => $catCode,        // for preview display
+        'is_product'        => inv_is_finished_good_category($categoryId) ? 1 : 0,
         'division_id'       => $divisionId,
         'division_code'     => $divCode,
         'uom_id'            => $uomId,
@@ -238,7 +256,8 @@ function item_import_committer(array $previewRow) {
                 process_spec=?, process_step_id=?, step_no=?,
                 step_time_min=?, step_cost=?, min_stock_level=?, min_order_qty=?,
                 min_sample_qty=?, min_sample_pct=?,
-                material_spec=?, remarks=?, notes=?, is_active=?
+                material_spec=?, remarks=?, notes=?, is_active=?,
+                is_product = GREATEST(is_product, ?)
              WHERE id = ?',
             [$d['name'], $d['short_description'], $d['long_description'],
              $d['category_id'], $d['division_id'], $d['uom_id'], $d['manufacturer_type'],
@@ -247,6 +266,7 @@ function item_import_committer(array $previewRow) {
              $d['step_time_min'], $d['step_cost'], $d['min_stock_level'], $d['min_order_qty'],
              $d['min_sample_qty'], $d['min_sample_pct'],
              $d['material_spec'], $d['remarks'], $d['notes'], $d['is_active'],
+             (int)($d['is_product'] ?? 0),
              $id]
         );
         // Order matters: deactivate FIRST (so we don't push fresh state
@@ -266,9 +286,9 @@ function item_import_committer(array $previewRow) {
             process_spec, process_step_id, step_no,
             step_time_min, step_cost, min_stock_level, min_order_qty,
             min_sample_qty, min_sample_pct,
-            material_spec, remarks, notes, is_active
+            material_spec, remarks, notes, is_active, is_product
          ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          )',
         [$codeForInsert, $d['name'], $d['short_description'], $d['long_description'],
          $d['category_id'], $d['division_id'], $d['uom_id'], $d['manufacturer_type'],
@@ -276,7 +296,7 @@ function item_import_committer(array $previewRow) {
          $d['process_spec'], $d['process_step_id'], $d['step_no'],
          $d['step_time_min'], $d['step_cost'], $d['min_stock_level'], $d['min_order_qty'],
          $d['min_sample_qty'], $d['min_sample_pct'],
-         $d['material_spec'], $d['remarks'], $d['notes'], $d['is_active']]
+         $d['material_spec'], $d['remarks'], $d['notes'], $d['is_active'], (int)($d['is_product'] ?? 0)]
     );
     $newId = (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
     billing_product_push_if_needed($newId, current_user_id());
@@ -399,7 +419,8 @@ if ($action === 'item_save') {
     if ($shortDesc === '')        $errors[] = 'Short Description is required.';
     if ($data['code'] === '')     $errors[] = 'Inventory Code could not be generated.';
     if (!$data['category_id'])    $errors[] = 'Category is required.';
-    if (!$data['division_id'])    $errors[] = 'I_Division is required.';
+    // I_Division is optional — items without a division still appear in the
+    // BOM tree's "All" view (and just won't show under a specific division tab).
     if (!$data['uom_id'])         $errors[] = 'I_UOM is required.';
     // Manufacturer toggle is required; when external, at least one vendor must be picked.
     $vendorIds = array_filter(array_map('intval', (array)input('vendor_ids', [])));
@@ -419,6 +440,10 @@ if ($action === 'item_save') {
 
     $certIds = array_filter(array_map('intval', (array)input('cert_ids', [])));
 
+    // Finished good → top element of a BOM tree. Selecting a "Finished Good"
+    // category sets the stable is_product flag (the BOM tree reads this).
+    $isFinishedGood = inv_is_finished_good_category($data['category_id']) ? 1 : 0;
+
     if ($id) {
         if (!$canManageItems) { flash_set('error', 'No permission to edit items.'); redirect(url('/inventory.php?action=items')); }
         db_exec(
@@ -430,7 +455,8 @@ if ($action === 'item_save') {
                 step_time_min = ?, step_cost = ?,
                 min_stock_level = ?, min_order_qty = ?,
                 min_sample_qty = ?, min_sample_pct = ?,
-                material_spec = ?, remarks = ?, notes = ?
+                material_spec = ?, remarks = ?, notes = ?,
+                is_product = GREATEST(is_product, ?)
               WHERE id = ?',
             [$data['name'], $data['short_description'], $data['long_description'],
              $data['category_id'], $data['division_id'], $data['manufacturer_type'],
@@ -440,33 +466,44 @@ if ($action === 'item_save') {
              $data['min_stock_level'], $data['min_order_qty'],
              $data['min_sample_qty'], $data['min_sample_pct'],
              $data['material_spec'], $data['remarks'], $data['notes'],
+             $isFinishedGood,
              $id]
         );
         db_exec("INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'inventory.item.update', ?, ?)",
             [current_user_id(), $id, $data['code']]);
         flash_set('success', 'Item updated.');
     } else {
-        db_exec(
-            'INSERT INTO inv_items (
-                code, name, short_description, long_description,
-                category_id, division_id, manufacturer_type,
-                uom_id, dwg_no, dwg_rev_no, part_no, part_rev_no, ecn,
-                process_spec, process_step_id, step_no,
-                step_time_min, step_cost,
-                min_stock_level, min_order_qty,
-                min_sample_qty, min_sample_pct,
-                material_spec, remarks, notes,
-                is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)',
-            [$data['code'], $data['name'], $data['short_description'], $data['long_description'],
-             $data['category_id'], $data['division_id'], $data['manufacturer_type'],
-             $data['uom_id'], $data['dwg_no'], $data['dwg_rev_no'], $data['part_no'], $data['part_rev_no'], $data['ecn'],
-             $data['process_spec'], $data['process_step_id'], $data['step_no'],
-             $data['step_time_min'], $data['step_cost'],
-             $data['min_stock_level'], $data['min_order_qty'],
-             $data['min_sample_qty'], $data['min_sample_pct'],
-             $data['material_spec'], $data['remarks'], $data['notes']]
-        );
+        try {
+            db_exec(
+                'INSERT INTO inv_items (
+                    code, name, short_description, long_description,
+                    category_id, division_id, manufacturer_type,
+                    uom_id, dwg_no, dwg_rev_no, part_no, part_rev_no, ecn,
+                    process_spec, process_step_id, step_no,
+                    step_time_min, step_cost,
+                    min_stock_level, min_order_qty,
+                    min_sample_qty, min_sample_pct,
+                    material_spec, remarks, notes,
+                    is_product, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)',
+                [$data['code'], $data['name'], $data['short_description'], $data['long_description'],
+                 $data['category_id'], $data['division_id'], $data['manufacturer_type'],
+                 $data['uom_id'], $data['dwg_no'], $data['dwg_rev_no'], $data['part_no'], $data['part_rev_no'], $data['ecn'],
+                 $data['process_spec'], $data['process_step_id'], $data['step_no'],
+                 $data['step_time_min'], $data['step_cost'],
+                 $data['min_stock_level'], $data['min_order_qty'],
+                 $data['min_sample_qty'], $data['min_sample_pct'],
+                 $data['material_spec'], $data['remarks'], $data['notes'],
+                 $isFinishedGood]
+            );
+        } catch (\PDOException $e) {
+            if ($e->getCode() === '23000') {
+                flash_set('error', 'An item with Part No "' . $data['part_no'] . '" and Rev "' . $data['part_rev_no'] . '" already exists. Please use a different Part No / Rev combination.');
+            } else {
+                flash_set('error', 'Could not create item: ' . $e->getMessage());
+            }
+            redirect(url('/inventory.php?action=item_new'));
+        }
         $id = (int)db()->lastInsertId();
         db_exec("INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'inventory.item.create', ?, ?)",
             [current_user_id(), $id, $data['code']]);
@@ -542,6 +579,11 @@ if ($action === 'item_delete') {
         flash_set('error', 'Cannot delete: item is referenced in a BOM. Remove the references first.');
         redirect(url('/inventory.php?action=item_edit&id=' . $id));
     }
+    $txnCount = db_val('SELECT COUNT(*) FROM inv_txns WHERE item_id = ?', [$id], 0);
+    if ($txnCount) {
+        flash_set('error', 'Cannot delete: item has ' . $txnCount . ' transaction record(s). Delete or reassign the transactions first.');
+        redirect(url('/inventory.php?action=item_edit&id=' . $id));
+    }
     db_exec('DELETE FROM inv_items WHERE id = ?', [$id]);
     db_exec("INSERT INTO audit_log (actor_id, action, target_id, details) VALUES (?, 'inventory.item.delete', ?, ?)", [current_user_id(), $id, '']);
     flash_set('success', 'Item deleted.');
@@ -549,6 +591,23 @@ if ($action === 'item_delete') {
 }
 
 // ============================================================
+// ITEM TOGGLE ACTIVE
+// ============================================================
+if ($action === 'item_toggle_active') {
+    csrf_check();
+    if (!$canManageItems) {
+        flash_set('error', 'No permission to edit items.');
+        redirect(url('/inventory.php?action=items'));
+    }
+    $id = (int)input('id', 0);
+    $item = db_one('SELECT id, short_description, is_active FROM inv_items WHERE id = ?', [$id]);
+    if (!$item) { flash_set('error', 'Item not found.'); redirect(url('/inventory.php?action=items')); }
+    $newActive = $item['is_active'] ? 0 : 1;
+    db_exec('UPDATE inv_items SET is_active = ? WHERE id = ?', [$newActive, $id]);
+    flash_set('success', 'Item "' . $item['short_description'] . '" marked ' . ($newActive ? 'active' : 'inactive') . '.');
+    redirect(url('/inventory.php?action=item_edit&id=' . $id));
+}
+
 // ITEM CLONE — duplicate an item header + its vendor/cert children
 // ============================================================
 // We copy:
@@ -879,7 +938,7 @@ if ($action === 'item_new' || $action === 'item_edit') {
     }
 
     // ---- Load dropdown sources ----
-    $categories = db_all("SELECT id, name FROM categories WHERE type = 'inventory' AND is_active = 1 ORDER BY sort_order, name");
+    $categories = db_all("SELECT id, name FROM categories WHERE type IN ('inventory', 'all') AND is_active = 1 ORDER BY sort_order, name");
     $divisions  = db_all("SELECT id, name FROM categories WHERE type = 'division'  AND is_active = 1 ORDER BY sort_order, name");
     $uoms       = db_all("SELECT id, label FROM inv_uom           WHERE is_active = 1 ORDER BY sort_order, label");
     $certTypes  = db_all("SELECT id, label FROM inv_cert_types    WHERE is_active = 1 ORDER BY sort_order, label");
@@ -924,6 +983,18 @@ if ($action === 'item_new' || $action === 'item_edit') {
           . '<button type="submit" class="btn btn-danger btn-sm">Delete</button>'
           . '</form>';
     }
+    $toggleActiveHtml = '';
+    if ($isEdit && $canManageItems) {
+        $isActive = (int)($editing['is_active'] ?? 1);
+        $toggleActiveHtml =
+            ' <form method="post" style="display:inline;"'
+          . ' action="' . h(url('/inventory.php?action=item_toggle_active')) . '">'
+          . csrf_field()
+          . '<input type="hidden" name="id" value="' . (int)$editing['id'] . '">'
+          . '<button type="submit" class="btn ' . ($isActive ? 'btn-warn' : 'btn-ghost') . ' btn-sm">'
+          . ($isActive ? 'Mark Inactive' : 'Mark Active') . '</button>'
+          . '</form>';
+    }
     $bomHtml = '';
     if ($isEdit) {
         $bomHtml = ' <a class="btn btn-ghost btn-sm" href="'
@@ -951,6 +1022,7 @@ if ($action === 'item_new' || $action === 'item_edit') {
               . ' data-shortcut="C" accesskey="c">' . shortcut_label('Cancel', 'C') . '</a>'
               . $notesBtnHtml
               . $bomHtml
+              . $toggleActiveHtml
               . $deleteHtml,
         ]) ?>
         <form id="main-form" method="post" action="<?= h(url('/inventory.php?action=item_save')) ?>"
@@ -996,9 +1068,9 @@ if ($action === 'item_new' || $action === 'item_edit') {
                 </select>
             </div>
             <div class="field">
-                <label for="f_division">I_Division *</label>
-                <select id="f_division" name="division_id" required tabindex="3">
-                    <option value="">— Select One —</option>
+                <label for="f_division">I_Division</label>
+                <select id="f_division" name="division_id" tabindex="3">
+                    <option value="">— None (optional) —</option>
                     <?php foreach ($divisions as $d): ?>
                         <option value="<?= (int)$d['id'] ?>" <?= ($isEdit && (int)$editing['division_id'] === (int)$d['id']) ? 'selected' : '' ?>>
                             <?= h($d['name']) ?>

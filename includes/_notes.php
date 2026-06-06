@@ -410,13 +410,11 @@ function notes_render($entityType, $entityId, $mode = 'inline', $returnTo = null
         <?php endif; ?>
 
         <div class="notes-list">
-            <?php if ($canManage && !empty($notes)): ?>
+            <?php if ($canManage && !empty($notes) && !$isModal): ?>
                 <!--
-                  Secondary "Add note" toggle, placed inside the notes-list
-                  so users browsing a long thread don't have to scroll back
-                  up to the toolbar to add another. Wired by the same JS
-                  handler as the toolbar button (querySelectorAll picks
-                  up both).
+                  Secondary "Add note" toggle — only in inline mode.
+                  In a popup modal the primary button at the top is always
+                  visible, so a second one here would appear duplicated.
                 -->
                 <div class="notes-list-add-row" style="margin-bottom: 10px;">
                     <button type="button" class="btn btn-ghost btn-sm notes-composer-toggle"
@@ -660,6 +658,37 @@ function notes_render($entityType, $entityId, $mode = 'inline', $returnTo = null
                 return;
             }
             bodyInp.value = quill.root.innerHTML;
+
+            // Inside the popup modal, submit via AJAX so the modal STAYS
+            // OPEN and refreshes in place. A normal POST would navigate the
+            // host page and close the modal.
+            var modalBody = document.querySelector('.notes-modal-body');
+            if (section.classList.contains('notes-section-modal') && modalBody && window.fetch && window.FormData) {
+                e.preventDefault();
+                var hasBody = quill.getText().trim() !== '';
+                var hasFile = attInput && attInput.files && attInput.files.length > 0;
+                if (!hasBody && !hasFile) { return; }   // nothing to save
+                var fd = new FormData(form);
+                fd.append('ajax', '1');
+                if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Saving…'; }
+                fetch(form.action, { method: 'POST', body: fd, credentials: 'same-origin' })
+                    .then(function (r) { return r.text(); })
+                    .then(function (html) {
+                        modalBody.innerHTML = html;
+                        // innerHTML doesn't run <script>; re-create them so the
+                        // fresh composer + Quill re-initialise inside the modal.
+                        modalBody.querySelectorAll('script').forEach(function (oldS) {
+                            var s = document.createElement('script');
+                            if (oldS.src) s.src = oldS.src; else s.text = oldS.textContent;
+                            oldS.parentNode.replaceChild(s, oldS);
+                        });
+                    })
+                    .catch(function () {
+                        // Network/parse failure → fall back to a normal submit.
+                        if (submitBtn) submitBtn.disabled = false;
+                        form.submit();
+                    });
+            }
         });
 
         attInput.addEventListener('change', function () {
@@ -982,11 +1011,153 @@ function notes_counts_for($entityType, array $entityIds)
  * just before footer.php). Safe to omit if no notes_popup_button() is
  * on the page — but harmless to include either way.
  */
+/**
+ * Render a clickable attachment indicator (📎 + count badge) for an entity.
+ * Click behaviour is wired by note_att_indicator_assets():
+ *   - 0 attachments → a muted dash.
+ *   - 1 attachment  → opens it directly.
+ *   - >1            → a small popup listing each filename (click to open).
+ */
+function note_att_indicator($entityType, $entityId, $count)
+{
+    $count = (int)$count;
+    if ($count <= 0) return '<span class="muted small">—</span>';
+    return '<button type="button" class="att-indicator"'
+         . ' data-entity-type="' . h($entityType) . '" data-entity-id="' . (int)$entityId . '"'
+         . ' data-count="' . $count . '"'
+         . ' title="' . $count . ' attachment' . ($count === 1 ? '' : 's') . '">'
+         . '📎&nbsp;<span class="att-badge">' . $count . '</span></button>';
+}
+
+/**
+ * Emit the shared popup + click handler for note_att_indicator() once per
+ * page. Fetches the attachment list from running_notes.php?action=attachments
+ * on click; opens a single attachment directly, or shows a filename popup.
+ */
+function note_att_indicator_assets()
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    ?>
+    <style>
+        .att-indicator { background:none; border:none; padding:0; cursor:pointer; font:inherit; line-height:1; white-space:nowrap; }
+        #att-backdrop {
+            position: fixed; inset: 0; z-index: 99998; display: none;
+            background: rgba(0,0,0,.35);
+        }
+        #att-pop {
+            position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+            z-index: 99999; display: none;
+            background: #ffffff; color: #111827;
+            border: 1px solid #d1d5db; border-radius: 10px;
+            box-shadow: 0 18px 50px rgba(0,0,0,.30);
+            width: min(420px, 92vw); max-height: 70vh; overflow: auto;
+        }
+        #att-pop .att-pop-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 14px; border-bottom: 1px solid #eef0f3;
+            font-size: 13px; font-weight: 700; color: #111827;
+            position: sticky; top: 0; background: #fff;
+        }
+        #att-pop .att-pop-close {
+            background: none; border: none; font-size: 18px; line-height: 1;
+            cursor: pointer; color: #6b7280; padding: 0 2px;
+        }
+        #att-pop .att-pop-body { padding: 8px; }
+        #att-pop a {
+            display: flex; align-items: center; gap: 8px;
+            padding: 9px 11px; border-radius: 6px; text-decoration: none;
+            color: #1d4ed8; font-size: 13.5px;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        #att-pop a:hover { background: #eff6ff; }
+        #att-pop .att-pop-empty { padding: 14px; color: #6b7280; font-size: 13px; }
+    </style>
+    <script>
+    (function () {
+        if (window.__attIndicatorBound) return;
+        window.__attIndicatorBound = true;
+        var base = (window.MAGDYN_BASE || '');
+
+        // Build a centered modal popup + backdrop once, anchored on <body>.
+        var backdrop = document.getElementById('att-backdrop');
+        if (!backdrop) { backdrop = document.createElement('div'); backdrop.id = 'att-backdrop'; document.body.appendChild(backdrop); }
+        var pop = document.getElementById('att-pop');
+        if (!pop) { pop = document.createElement('div'); pop.id = 'att-pop'; document.body.appendChild(pop); }
+
+        function hide() { pop.style.display = 'none'; backdrop.style.display = 'none'; pop.innerHTML = ''; }
+        function render(list) {
+            pop.innerHTML = '';
+            var head = document.createElement('div');
+            head.className = 'att-pop-head';
+            var label = document.createElement('span');
+            label.textContent = '📎 ' + list.length + ' attachment' + (list.length === 1 ? '' : 's');
+            var x = document.createElement('button');
+            x.type = 'button'; x.className = 'att-pop-close'; x.textContent = '✕';
+            x.addEventListener('click', hide);
+            head.appendChild(label); head.appendChild(x);
+            pop.appendChild(head);
+
+            var body = document.createElement('div');
+            body.className = 'att-pop-body';
+            if (!list.length) {
+                var em = document.createElement('div');
+                em.className = 'att-pop-empty';
+                em.textContent = 'No attachments found.';
+                body.appendChild(em);
+            } else {
+                list.forEach(function (a) {
+                    var link = document.createElement('a');
+                    link.href = base + '/note_attach.php?id=' + a.id;
+                    link.title = a.name;
+                    link.target = '_blank';
+                    link.rel = 'noopener';
+                    link.textContent = '📄 ' + a.name;
+                    body.appendChild(link);
+                });
+            }
+            pop.appendChild(body);
+            backdrop.style.display = 'block';
+            pop.style.display = 'block';
+        }
+
+        // Capture phase so nothing can swallow the click before us.
+        document.addEventListener('click', function (e) {
+            var btn = e.target.closest && e.target.closest('.att-indicator');
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            var et  = btn.getAttribute('data-entity-type');
+            var eid = btn.getAttribute('data-entity-id');
+            render([]);                       // open immediately with a placeholder
+            pop.querySelector('.att-pop-body').innerHTML = '<div class="att-pop-empty">Loading…</div>';
+            var url = base + '/running_notes.php?action=attachments'
+                    + '&entity_type=' + encodeURIComponent(et)
+                    + '&entity_id='   + encodeURIComponent(eid);
+            fetch(url, { credentials: 'same-origin' })
+                .then(function (r) { return r.json(); })
+                .then(function (list) { render(Array.isArray(list) ? list : []); })
+                .catch(function () {
+                    pop.querySelector('.att-pop-body').innerHTML =
+                        '<div class="att-pop-empty">Could not load attachments.</div>';
+                });
+        }, true);
+
+        backdrop.addEventListener('click', hide);
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hide(); });
+    })();
+    </script>
+    <?php
+}
+
 function notes_popup_assets()
 {
     // Always make sure the attachment preview machinery is on the page
     // too — every page that has notes also has attachment links to preview.
     notes_attachment_preview_assets();
+    // And the 📎 attachment-indicator popup handler (used by list/txn tables).
+    note_att_indicator_assets();
 
     static $emitted = false;
     if ($emitted) return;
