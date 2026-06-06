@@ -483,12 +483,9 @@ if ($action === 'delete') {
     $a  = db_one('SELECT * FROM assets WHERE id = ?', [$id]);
     if (!$a) { flash_set('error', 'Asset not found.'); redirect(url('/asset.php')); }
 
-    // Refuse delete unless the asset is archived first. Forces the audit
-    // trail to record the archival before destruction.
-    if ($a['status'] !== 'archived') {
-        flash_set('error', 'Archive the asset before deleting it. This keeps the audit trail honest.');
-        redirect(url('/asset.php?action=view&id=' . $id));
-    }
+    // Direct delete is allowed from the asset view (archive-first is no
+    // longer required). The referential safeguards below still apply, and
+    // the deletion is recorded in the audit log.
     // Refuse if any other asset has this as a parent
     $children = db_val('SELECT COUNT(*) FROM assets WHERE parent_asset_id = ?', [$id], 0);
     if ($children > 0) {
@@ -583,16 +580,40 @@ if ($action === 'model_delete') {
     $id = (int)input('id', 0);
     $m  = db_one('SELECT * FROM asset_models WHERE id = ?', [$id]);
     if (!$m) { flash_set('error', 'Model not found.'); redirect(url('/asset.php?action=models')); }
-    // Block if any assets reference this model
-    $linked = db_val('SELECT COUNT(*) FROM assets WHERE model_id = ?', [$id], 0);
+    // Block if any assets reference this model. List the blocking assets
+    // (by tag) so the operator knows exactly which ones to reassign to
+    // another model — or delete — before this model can go. Assets require
+    // a model (assets.model_id is NOT NULL), so we never silently orphan them.
+    $linked = (int)db_val('SELECT COUNT(*) FROM assets WHERE model_id = ?', [$id], 0);
     if ($linked > 0) {
-        flash_set('error', sprintf('Cannot delete model "%s" — %d asset(s) reference it.', $m['name'], $linked));
+        $sample = db_all('SELECT asset_tag FROM assets WHERE model_id = ? ORDER BY asset_tag LIMIT 10', [$id]);
+        $tags   = array_map(function ($s) { return $s['asset_tag']; }, $sample);
+        $more   = $linked > count($tags) ? sprintf(' (+%d more)', $linked - count($tags)) : '';
+        flash_set('error', sprintf(
+            'Cannot delete model "%s" — %d asset(s) still use it: %s%s. Reassign those assets to another model (or delete them) first.',
+            $m['name'], $linked, implode(', ', $tags), $more
+        ));
         redirect(url('/asset.php?action=models'));
     }
     db_exec('DELETE FROM asset_models WHERE id = ?', [$id]);
     db_exec("INSERT INTO audit_log (actor_id, action, details) VALUES (?, 'asset_model.delete', ?)",
             [real_user_id(), 'deleted model ' . $m['name']]);
     flash_set('success', 'Model deleted.');
+    redirect(url('/asset.php?action=models'));
+}
+
+// ============================================================
+// MODEL TOGGLE ACTIVE
+// ============================================================
+if ($action === 'model_toggle_active') {
+    require_permission('asset', 'manage_model');
+    csrf_check();
+    $id = (int)input('id', 0);
+    $m  = db_one('SELECT id, name, is_active FROM asset_models WHERE id = ?', [$id]);
+    if (!$m) { flash_set('error', 'Model not found.'); redirect(url('/asset.php?action=models')); }
+    $newActive = $m['is_active'] ? 0 : 1;
+    db_exec('UPDATE asset_models SET is_active = ? WHERE id = ?', [$newActive, $id]);
+    flash_set('success', 'Model "' . $m['name'] . '" marked ' . ($newActive ? 'active' : 'inactive') . '.');
     redirect(url('/asset.php?action=models'));
 }
 
@@ -1134,7 +1155,8 @@ if ($action === 'asset_txn_import_commit') {
 if ($action === 'txn_save') {
     require_permission('asset', 'transact');
     csrf_check();
-    $assetId = (int)input('id', 0);
+    $assetId    = (int)input('id', 0);
+    $redirectTo = trim((string)input('redirect_to', ''));   // 'list' when called from list-page modal
     $a = db_one('SELECT * FROM assets WHERE id = ?', [$assetId]);
     if (!$a) { flash_set('error', 'Asset not found.'); redirect(url('/asset.php')); }
 
@@ -1143,7 +1165,26 @@ if ($action === 'txn_save') {
     $valid = ['move','send_vendor','receive_vendor','send_user','receive_user'];
     if (!in_array($type, $valid, true)) {
         flash_set('error', 'Unknown transaction type.');
-        redirect(url('/asset.php?action=view&id=' . $assetId));
+        redirect($redirectTo === 'list'
+            ? url('/asset.php?action=list')
+            : url('/asset.php?action=view&id=' . $assetId));
+    }
+
+    // Expected-return date — only meaningful when handing the asset OUT
+    // (to a vendor or a user). Accept a strict YYYY-MM-DD value; ignore it
+    // for moves and check-ins. Stored on the transaction (history) and
+    // mirrored onto the asset as its current checkout_due_on (cleared on
+    // any non-checkout transaction).
+    $isCheckout = in_array($type, ['send_vendor', 'send_user'], true);
+    $dueDate = null;
+    if ($isCheckout) {
+        $dueRaw = trim((string)input('due_date', ''));
+        if ($dueRaw !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dueRaw)) {
+            $ts = strtotime($dueRaw);
+            if ($ts !== false && date('Y-m-d', $ts) === $dueRaw) {
+                $dueDate = $dueRaw;
+            }
+        }
     }
 
     // What we're moving FROM is determined by the asset's current state
@@ -1157,32 +1198,36 @@ if ($action === 'txn_save') {
     $newUser     = null;
     $newStatus   = 'active';
 
+    $errRedir = $redirectTo === 'list'
+        ? url('/asset.php?action=list')
+        : url('/asset.php?action=txn&id=' . $assetId);
+
     switch ($type) {
         case 'move':
             $to_loc = (int)input('to_location_id', 0) ?: null;
-            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect(url('/asset.php?action=txn&id=' . $assetId)); }
+            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect($errRedir); }
             $newLocation = $to_loc;
             break;
         case 'send_vendor':
             $to_vendor = (int)input('to_vendor_id', 0) ?: null;
-            if (!$to_vendor) { flash_set('error', 'Pick a vendor.'); redirect(url('/asset.php?action=txn&id=' . $assetId)); }
+            if (!$to_vendor) { flash_set('error', 'Pick a vendor.'); redirect($errRedir); }
             $newVendor = $to_vendor; $newStatus = 'with_vendor';
             $newLocation = null;
             break;
         case 'receive_vendor':
             $to_loc = (int)input('to_location_id', 0) ?: null;
-            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect(url('/asset.php?action=txn&id=' . $assetId)); }
+            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect($errRedir); }
             $newLocation = $to_loc; $newVendor = null;
             break;
         case 'send_user':
             $to_user = (int)input('to_user_id', 0) ?: null;
-            if (!$to_user) { flash_set('error', 'Pick a user.'); redirect(url('/asset.php?action=txn&id=' . $assetId)); }
+            if (!$to_user) { flash_set('error', 'Pick a user.'); redirect($errRedir); }
             $newUser = $to_user; $newStatus = 'with_user';
             $newLocation = null;
             break;
         case 'receive_user':
             $to_loc = (int)input('to_location_id', 0) ?: null;
-            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect(url('/asset.php?action=txn&id=' . $assetId)); }
+            if (!$to_loc) { flash_set('error', 'Pick a destination location.'); redirect($errRedir); }
             $newLocation = $to_loc; $newUser = null;
             break;
     }
@@ -1190,18 +1235,76 @@ if ($action === 'txn_save') {
     db_exec(
         "INSERT INTO asset_transactions
           (asset_id, txn_type, from_location_id, from_vendor_id, from_user_id,
-           to_location_id, to_vendor_id, to_user_id, actor_id, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+           to_location_id, to_vendor_id, to_user_id, actor_id, notes, due_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [$assetId, $type, $from_loc, $from_vendor, $from_user,
-         $to_loc, $to_vendor, $to_user, $uid, $notes]
+         $to_loc, $to_vendor, $to_user, $uid, $notes, $dueDate]
     );
+    // checkout_due_on tracks the asset's CURRENT expected return. On a
+    // checkout it takes the new due date; on a move/check-in it clears.
     db_exec(
-        "UPDATE assets SET location_id=?, current_vendor_id=?, current_user_id=?, status=? WHERE id=?",
-        [$newLocation, $newVendor, $newUser, $newStatus, $assetId]
+        "UPDATE assets SET location_id=?, current_vendor_id=?, current_user_id=?, status=?, checkout_due_on=? WHERE id=?",
+        [$newLocation, $newVendor, $newUser, $newStatus, $dueDate, $assetId]
     );
 
-    flash_set('success', 'Transaction recorded.');
-    redirect(url('/asset.php?action=view&id=' . $assetId));
+    flash_set('success', 'Transaction recorded for ' . $a['asset_tag'] . '.');
+    redirect($redirectTo === 'list'
+        ? url('/asset.php?action=list')
+        : url('/asset.php?action=view&id=' . $assetId));
+}
+
+// ============================================================
+// MODEL EXPORT CSV
+// ============================================================
+if ($action === 'model_export') {
+    require_permission('asset', 'view');
+    $rows = db_all(
+        'SELECT code, name, category, manufacturer, model_number, notes, is_active
+           FROM asset_models ORDER BY code'
+    );
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="asset_models_' . date('Ymd') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
+    fputcsv($out, ['code', 'name', 'category', 'manufacturer', 'model_number', 'notes', 'is_active']);
+    foreach ($rows as $r) {
+        fputcsv($out, [
+            $r['code'] ?? '', $r['name'], $r['category'] ?? '',
+            $r['manufacturer'] ?? '', $r['model_number'] ?? '',
+            str_replace(["\r\n", "\r"], "\n", $r['notes'] ?? ''), $r['is_active'],
+        ]);
+    }
+    fclose($out);
+    exit;
+}
+
+// ============================================================
+// ASSET LIST EXPORT CSV
+// ============================================================
+if ($action === 'list_export') {
+    require_permission('asset', 'view');
+    $rows = db_all(
+        'SELECT a.asset_tag, am.code AS model_code, l.code AS location_code,
+                a.status, a.notes, a.a_price, p.asset_tag AS parent_asset_tag
+           FROM assets a
+           LEFT JOIN asset_models am ON am.id = a.model_id
+           LEFT JOIN locations l     ON l.id  = a.location_id
+           LEFT JOIN assets p        ON p.id  = a.parent_asset_id
+          ORDER BY a.asset_tag'
+    );
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="assets_' . date('Ymd') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
+    fputcsv($out, ['asset_tag', 'model_code', 'location_code', 'status', 'notes', 'a_price', 'parent_asset_tag']);
+    foreach ($rows as $r) {
+        fputcsv($out, [
+            $r['asset_tag'], $r['model_code'] ?? '', $r['location_code'] ?? '',
+            $r['status'], $r['notes'] ?? '', $r['a_price'] ?? '', $r['parent_asset_tag'] ?? '',
+        ]);
+    }
+    fclose($out);
+    exit;
 }
 
 // ============================================================
@@ -1230,7 +1333,15 @@ if ($action === 'models') {
         ['key'=>'model_number',   'label'=>'Model number',     'sortable'=>true, 'searchable'=>true, 'sql_col'=>'am.model_number'],
         ['key'=>'cal_freq_label', 'label'=>'Default cal freq', 'sortable'=>true, 'searchable'=>false,'sql_col'=>'cf.label'],
         ['key'=>'asset_count',    'label'=>'Assets',           'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r'],
-        ['key'=>'is_active',      'label'=>'Status',           'sortable'=>true, 'searchable'=>false,'sql_col'=>'am.is_active'],
+        ['key'=>'is_active',      'label'=>'Status',           'sortable'=>true, 'searchable'=>false,'sql_col'=>'am.is_active',
+         'filter' => [
+             'type' => 'select',
+             'placeholder' => 'all',
+             'options' => [
+                 ['value' => '1', 'label' => 'Active'],
+                 ['value' => '0', 'label' => 'Inactive'],
+             ],
+         ]],
         ['key'=>'_actions',       'label'=>'Actions',          'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r nowrap'],
     ]);
 
@@ -1255,6 +1366,12 @@ if ($action === 'models') {
         $actions = '';
         if ($canModelMgr) {
             $actions .= '<a class="btn btn-icon" href="' . h(url('/asset.php?action=model_edit&id=' . (int)$m['id'])) . '" title="Edit" aria-label="Edit">✎ <span class="dt-action-label">Edit</span></a> ';
+            $toggleLabel = $m['is_active'] ? 'Deactivate' : 'Activate';
+            $actions .= '<form method="post" style="display:inline" action="' . h(url('/asset.php?action=model_toggle_active')) . '">'
+                      . csrf_field()
+                      . '<input type="hidden" name="id" value="' . (int)$m['id'] . '">'
+                      . '<button class="btn btn-icon' . ($m['is_active'] ? '' : ' btn-warn') . '" type="submit" title="' . $toggleLabel . '">'
+                      . ($m['is_active'] ? '⏸' : '▶') . ' <span class="dt-action-label">' . $toggleLabel . '</span></button></form> ';
         }
         if ($canDelete && (int)$m['asset_count'] === 0) {
             $actions .= '<form method="post" style="display:inline" action="' . h(url('/asset.php?action=model_delete')) . '"'
@@ -1288,6 +1405,8 @@ if ($action === 'models') {
     $actionsHtml = '<a class="btn btn-ghost btn-sm" href="' . h(url('/asset.php')) . '"'
                  . ' data-shortcut="B" accesskey="b">' . shortcut_label('← Assets', 'B') . '</a>';
     if ($canModelMgr) {
+        $actionsHtml .= ' <a class="btn btn-ghost btn-sm" href="' . h(url('/asset.php?action=model_export')) . '"'
+                      . ' title="Download all asset models as CSV">⤓ Export CSV</a>';
         $actionsHtml .= ' <button type="button" class="btn btn-ghost btn-sm"'
                       . ' data-open-import="model-import-modal"'
                       . ' title="Import asset models from CSV">⤒ Import CSV</button>';
@@ -1339,7 +1458,14 @@ if ($action === 'model_new' || $action === 'model_edit') {
                 '<button type="submit" form="main-form" class="btn btn-primary btn-sm"'
               . ' data-shortcut="S">' . shortcut_label('Save', 'S') . '</button>'
               . ' <a class="btn btn-ghost btn-sm" href="' . h(url('/asset.php?action=models')) . '"'
-              . ' data-shortcut="C" accesskey="c">' . shortcut_label('Cancel', 'C') . '</a>',
+              . ' data-shortcut="C" accesskey="c">' . shortcut_label('Cancel', 'C') . '</a>'
+              . (($editing && permission_check('asset', 'delete'))
+                    ? ' <form method="post" style="display:inline" action="' . h(url('/asset.php?action=model_delete')) . '"'
+                      . ' onsubmit="return confirm(\'Delete model &quot;' . h(addslashes($editing['name'])) . '&quot;? Blocked if any asset still uses it.\');">'
+                      . csrf_field()
+                      . '<input type="hidden" name="id" value="' . (int)$editing['id'] . '">'
+                      . '<button class="btn btn-danger btn-sm" type="submit" data-shortcut="D" accesskey="d">' . shortcut_label('Delete', 'D') . '</button></form>'
+                    : ''),
         ]) ?>
         <form id="main-form" class="form-page-body" method="post"
               action="<?= h(url('/asset.php?action=model_save')) ?>" novalidate>
@@ -1384,7 +1510,7 @@ if ($action === 'model_new' || $action === 'model_edit') {
                     try {
                         $catRows = db_all(
                             "SELECT id, parent_id, name FROM categories
-                              WHERE type = 'asset' AND is_active = 1
+                              WHERE type IN ('asset', 'all') AND is_active = 1
                               ORDER BY sort_order, name"
                         );
                     } catch (Exception $e) { /* table absent on legacy installs */ }
@@ -1403,7 +1529,7 @@ if ($action === 'model_new' || $action === 'model_edit') {
                         };
                         $currentCatId = (int)($editing['category_id'] ?? 0);
                     ?>
-                        <select id="f_cat" name="category_id" tabindex="2">
+                        <select id="f_cat" name="category_id" class="no-combobox" tabindex="2">
                             <option value="" <?= $currentCatId === 0 ? 'selected' : '' ?>>— None —</option>
                             <?php foreach ($catRows as $c): ?>
                                 <option value="<?= (int)$c['id'] ?>"
@@ -1842,6 +1968,22 @@ if ($action === 'view') {
     // gear-menu Notes item can show a (N) badge.
     $txnIds = array_map(function ($t) { return (int)$t['id']; }, $txns);
     $txnNoteCounts = notes_counts_for('asset_txn', $txnIds);
+    // Attachment counts per txn (attachments live on notes attached to the
+    // transaction). Used for the 📎 indicator in the history table.
+    $txnAttCounts = [];
+    if ($txnIds) {
+        $inTxn = implode(',', array_map('intval', $txnIds));
+        foreach (db_all(
+            "SELECT n.entity_id AS tid, COUNT(na.id) AS c
+               FROM notes n
+               JOIN note_attachments na ON na.note_id = n.id
+              WHERE n.entity_type = 'asset_txn' AND n.is_deleted = 0
+                AND n.entity_id IN ($inTxn)
+              GROUP BY n.entity_id"
+        ) as $r) {
+            $txnAttCounts[(int)$r['tid']] = (int)$r['c'];
+        }
+    }
 
     // Fetch recent inspections of this asset for the small panel
     // shown below the txn history. Guarded by table existence so
@@ -1903,34 +2045,46 @@ if ($action === 'view') {
                 <a class="btn btn-ghost" href="<?= h(url('/asset.php?action=edit&id=' . $id)) ?>"
                    data-shortcut="E" accesskey="e"><?= shortcut_label('Edit', 'E') ?></a>
             <?php endif; ?>
-            <?php if ($canTransact && $a['status'] !== 'archived'): ?>
-                <a class="btn btn-primary" href="<?= h(url('/asset.php?action=txn&id=' . $id)) ?>"
-                   data-shortcut="T" accesskey="t"><?= shortcut_label('Transact', 'T') ?></a>
+            <?php if ($canTransact && $a['status'] !== 'archived'):
+                if ($a['status'] === 'with_vendor') {
+                    $txnLabel  = 'Check In';
+                    $txnPreset = 'receive_vendor';
+                } elseif ($a['status'] === 'with_user') {
+                    $txnLabel  = 'Check In';
+                    $txnPreset = 'receive_user';
+                } else {
+                    $txnLabel  = 'Check Out';
+                    $txnPreset = 'send_vendor';
+                }
+            ?>
+                <a class="btn btn-primary"
+                   href="<?= h(url('/asset.php?action=txn&id=' . $id . '&preset=' . $txnPreset)) ?>"
+                   data-shortcut="T" accesskey="t"><?= shortcut_label($txnLabel, 'T') ?></a>
             <?php endif; ?>
-            <?php if ($canArchive && $a['status'] !== 'archived'): ?>
+            <?php if ($canArchive && $a['status'] === 'active'): ?>
                 <form method="post" style="display:inline"
                       action="<?= h(url('/asset.php?action=archive')) ?>"
-                      onsubmit="return confirm('Archive this asset?');">
+                      onsubmit="return confirm('Mark this asset as inactive (archived)?');">
                     <?= csrf_field() ?>
                     <input type="hidden" name="id" value="<?= (int)$id ?>">
-                    <button class="btn btn-warn" type="submit">Archive</button>
+                    <button class="btn btn-warn" type="submit">Mark Inactive</button>
                 </form>
             <?php endif; ?>
-            <?php if ($canArchive && $a['status'] === 'archived'): ?>
+            <?php if ($canArchive && $a['status'] !== 'active'): ?>
                 <form method="post" style="display:inline"
                       action="<?= h(url('/asset.php?action=unarchive')) ?>">
                     <?= csrf_field() ?>
                     <input type="hidden" name="id" value="<?= (int)$id ?>">
-                    <button class="btn btn-ghost" type="submit">Restore</button>
+                    <button class="btn btn-ghost" type="submit">Mark Active</button>
                 </form>
             <?php endif; ?>
-            <?php if ($canDelete && $a['status'] === 'archived'): ?>
+            <?php if ($canDelete): ?>
                 <form method="post" style="display:inline"
                       action="<?= h(url('/asset.php?action=delete')) ?>"
                       onsubmit="return confirm('Permanently delete <?= h(addslashes($a['asset_tag'])) ?>? This destroys its transaction history and cannot be undone.');">
                     <?= csrf_field() ?>
                     <input type="hidden" name="id" value="<?= (int)$id ?>">
-                    <button class="btn btn-danger" type="submit">Delete</button>
+                    <button class="btn btn-danger" type="submit" data-shortcut="D" accesskey="d"><?= shortcut_label('Delete', 'D') ?></button>
                 </form>
             <?php endif; ?>
         </div>
@@ -1997,34 +2151,66 @@ if ($action === 'view') {
         </div>
         <table class="data-table">
             <thead>
-            <tr><th>When</th><th>Type</th><th>From</th><th>To</th><th>By</th><th>Notes</th><th class="r">Actions</th></tr>
+            <tr><th>Issued</th><th>Due</th><th>Type</th><th>In / Out</th><th>From</th><th>To</th><th>By</th><th>Notes</th><th class="r">Files</th><th class="r">Actions</th></tr>
             </thead>
             <tbody>
+            <?php
+            // Check-in / check-out indicator maps.
+            $txnCicoLabel = [
+                'send_vendor'    => '↑ Check Out',
+                'send_user'      => '↑ Check Out',
+                'receive_vendor' => '↓ Check In',
+                'receive_user'   => '↓ Check In',
+            ];
+            $txnCicoCls = [
+                'send_vendor'    => 'pill-warn',
+                'send_user'      => 'pill-warn',
+                'receive_vendor' => 'pill-active',
+                'receive_user'   => 'pill-active',
+            ];
+            ?>
             <?php if (!$txns): ?>
-                <tr><td colspan="7" class="empty">No transactions yet.</td></tr>
+                <tr><td colspan="10" class="empty">No transactions yet.</td></tr>
             <?php else: foreach ($txns as $t):
                 $from = $t['from_loc_name'] ?: ($t['from_vendor_name'] ?: ($t['from_user_name'] ?: '—'));
                 $to   = $t['to_loc_name']   ?: ($t['to_vendor_name']   ?: ($t['to_user_name']   ?: '—'));
                 // Build the gear-menu cell: Notes always, plus a
                 // "+ Invoice" deep-link when the txn type is qty-
-                // increasing AND no invoice is already attached. The
-                // invoice module's eligibility check is the source of
-                // truth — we do a light pre-filter here just to avoid
-                // showing the link in obviously-wrong rows.
+                // increasing AND no invoice is already attached.
                 $rowActions = notes_popup_menu_item('asset_txn', (int)$t['id'], 'Notes', $txnNoteCounts[(int)$t['id']] ?? 0);
                 if (in_array($t['txn_type'], ['create','receive_vendor','receive_user'], true)
                     && permission_check('invoice', 'manage')) {
                     $rowActions .= '<a href="' . h(url('/invoice.php?action=new&link_type=asset_txn&link_id=' . (int)$t['id']))
                                  . '" title="Create an invoice linked to this transaction">+ Invoice</a>';
                 }
+                $tt = $t['txn_type'];
             ?>
+                <?php
+                // Due date only applies to checkout rows (send_user / send_vendor).
+                $rowDue = (!empty($t['due_date']) && in_array($tt, ['send_vendor','send_user'], true)) ? (string)$t['due_date'] : '';
+                $rowDueCls = '';
+                if ($rowDue && $rowDue < date('Y-m-d'))                              $rowDueCls = 'text-danger';
+                elseif ($rowDue && $rowDue <= date('Y-m-d', strtotime('+7 days')))   $rowDueCls = 'text-warn';
+                $attCount = (int)($txnAttCounts[(int)$t['id']] ?? 0);
+                ?>
                 <tr>
                     <td class="nowrap"><?= h(dt_display($t['at'])) ?></td>
-                    <td><code><?= h(str_replace('_',' ', $t['txn_type'])) ?></code></td>
+                    <td class="nowrap"><?php if ($rowDue): ?><span class="<?= $rowDueCls ?>"><?= h($rowDue) ?></span><?php else: ?><span class="muted small">—</span><?php endif; ?></td>
+                    <td><code><?= h(str_replace('_',' ', $tt)) ?></code></td>
+                    <td>
+                        <?php if (isset($txnCicoLabel[$tt])): ?>
+                            <span class="pill <?= $txnCicoCls[$tt] ?>">
+                                <?= $txnCicoLabel[$tt] ?>
+                            </span>
+                        <?php else: ?>
+                            <span class="muted small">—</span>
+                        <?php endif; ?>
+                    </td>
                     <td><?= h($from) ?></td>
                     <td><?= h($to) ?></td>
                     <td><?= h($t['actor_name'] ?: '—') ?></td>
                     <td class="muted small"><?= h($t['notes'] ?: '') ?></td>
+                    <td class="r"><?= note_att_indicator('asset_txn', (int)$t['id'], $attCount) ?></td>
                     <td class="r"><?= dt_actions_wrap($rowActions) ?></td>
                 </tr>
             <?php endforeach; endif; ?>
@@ -2139,6 +2325,18 @@ if ($action === 'txn') {
                   LEFT JOIN users u     ON u.id = a.current_user_id
                  WHERE a.id = ?', [$id]);
     if (!$a) { flash_set('error', 'Asset not found.'); redirect(url('/asset.php')); }
+
+    // Auto-select the transaction type when arriving from the view-page
+    // Check In / Check Out button (preset= query param). Fall back to a
+    // sensible default based on current asset status.
+    $validPresets = ['move', 'send_vendor', 'receive_vendor', 'send_user', 'receive_user'];
+    $txnPreset = (string)input('preset', '');
+    if (!in_array($txnPreset, $validPresets, true)) {
+        // Derive from asset status when no preset given
+        if ($a['status'] === 'with_vendor')   $txnPreset = 'receive_vendor';
+        elseif ($a['status'] === 'with_user') $txnPreset = 'receive_user';
+        else                                  $txnPreset = 'send_vendor';
+    }
     $locations = db_all('SELECT id, code, name FROM locations WHERE is_active = 1 ORDER BY sort_order, name');
     $vendors   = db_all('SELECT id, code, name FROM vendors   WHERE is_active = 1 ORDER BY name');
     $users     = db_all('SELECT id, full_name, username FROM users WHERE is_active = 1 ORDER BY full_name');
@@ -2176,11 +2374,19 @@ if ($action === 'txn') {
                 <div class="field span-2">
                     <label for="f_txn_type">Transaction type</label>
                     <select id="f_txn_type" name="txn_type" tabindex="1">
-                        <option value="move">Move (location → location)</option>
-                        <option value="send_vendor">Send to vendor</option>
-                        <option value="receive_vendor">Receive from vendor</option>
-                        <option value="send_user">Hand out to user</option>
-                        <option value="receive_user">Receive back from user</option>
+                        <?php
+                        $txnTypeOptions = [
+                            'move'           => 'Move (location → location)',
+                            'send_vendor'    => 'Send to vendor',
+                            'receive_vendor' => 'Receive from vendor',
+                            'send_user'      => 'Hand out to user',
+                            'receive_user'   => 'Receive back from user',
+                        ];
+                        foreach ($txnTypeOptions as $val => $lbl): ?>
+                            <option value="<?= h($val) ?>"<?= $val === $txnPreset ? ' selected' : '' ?>>
+                                <?= h($lbl) ?>
+                            </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
 
@@ -2214,9 +2420,14 @@ if ($action === 'txn') {
                     </select>
                 </div>
 
+                <div class="field js-due-target" style="display:none;">
+                    <label for="f_txn_due">Due date <span class="muted small">(expected return)</span></label>
+                    <input id="f_txn_due" name="due_date" type="date" tabindex="5">
+                </div>
+
                 <div class="field span-2">
                     <label for="f_txn_notes">Notes</label>
-                    <input id="f_txn_notes" name="notes" type="text" tabindex="5">
+                    <input id="f_txn_notes" name="notes" type="text" tabindex="6">
                 </div>
             </div>
         </form>
@@ -2228,14 +2439,24 @@ if ($action === 'txn') {
         var loc = document.querySelector('.js-loc-target');
         var ven = document.querySelector('.js-vendor-target');
         var usr = document.querySelector('.js-user-target');
+        var due = document.querySelector('.js-due-target');
         function apply() {
             var t = sel.value;
             loc.style.display = (t === 'move' || t === 'receive_vendor' || t === 'receive_user') ? '' : 'none';
             ven.style.display = (t === 'send_vendor') ? '' : 'none';
             usr.style.display = (t === 'send_user') ? '' : 'none';
+            // Due date only applies when handing the asset out.
+            due.style.display = (t === 'send_vendor' || t === 'send_user') ? '' : 'none';
         }
         sel.addEventListener('change', apply);
-        apply();
+        // Apply preset immediately (synchronous pass)
+        var preset = '<?= h($txnPreset) ?>';
+        if (preset) { sel.value = preset; apply(); }
+        // Re-apply after a tick to beat browser session-autofill which
+        // fires asynchronously after DOMContentLoaded on some browsers.
+        if (preset) {
+            setTimeout(function () { sel.value = preset; apply(); }, 0);
+        }
     })();
     </script>
     <?php require __DIR__ . '/includes/footer.php'; exit;
@@ -2368,7 +2589,20 @@ if ($action === 'txn_history') {
             'restore'        => 'restore',
             'calibrate'      => 'calibrate',
         ][$type] ?? $type;
-        $typePill = '<span class="pill pill-' . $pillClass . '">' . h($typeLabel) . '</span>';
+
+        // Check-in / check-out indicator shown below the type pill.
+        $cicoMap = [
+            'send_vendor'    => ['↑ Check Out', 'warn'],
+            'send_user'      => ['↑ Check Out', 'warn'],
+            'receive_vendor' => ['↓ Check In',  'active'],
+            'receive_user'   => ['↓ Check In',  'active'],
+        ];
+        $cicoPill = isset($cicoMap[$type])
+            ? ' <span class="pill pill-' . $cicoMap[$type][1] . '" style="font-size:10px;">'
+              . $cicoMap[$type][0] . '</span>'
+            : '';
+
+        $typePill = '<span class="pill pill-' . $pillClass . '">' . h($typeLabel) . '</span>' . $cicoPill;
 
         // Build the from→to cell. Whichever of the three pairs has
         // a non-null value gets rendered. For calibrate / archive /
@@ -2492,7 +2726,13 @@ if ($action === 'list') {
     $dtCfg = [
         'id'       => 'assets',
         'base_sql' => 'SELECT a.*, am.name AS model_name, am.category, am.manufacturer,
-                              l.name AS location_name, v.name AS vendor_name, u.full_name AS user_name
+                              l.name AS location_name, v.name AS vendor_name, u.full_name AS user_name,
+                              (SELECT t.at FROM asset_transactions t
+                                WHERE t.asset_id = a.id AND t.txn_type IN ("send_vendor","send_user")
+                                ORDER BY t.at DESC, t.id DESC LIMIT 1) AS checkout_issued_at,
+                              (SELECT COUNT(na.id) FROM note_attachments na
+                                 JOIN notes n ON n.id = na.note_id
+                                WHERE n.entity_type = "asset" AND n.entity_id = a.id AND n.is_deleted = 0) AS att_count
                          FROM assets a
                          LEFT JOIN asset_models am ON am.id = a.model_id
                          LEFT JOIN locations l     ON l.id  = a.location_id
@@ -2503,6 +2743,10 @@ if ($action === 'list') {
             ['key'=>'model_name',      'label'=>'Model',             'sortable'=>true, 'searchable'=>true, 'sql_col'=>'am.name'],
             ['key'=>'category',        'label'=>'Category',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'am.category'],
             ['key'=>'holder',          'label'=>'Location / holder', 'sortable'=>false,'searchable'=>true, 'sql_col'=>'CONCAT_WS(" ", l.name, v.name, u.full_name)'],
+            // Issued / Due back — set when the asset is checked out; only
+            // meaningful while it's with a vendor/user.
+            ['key'=>'checkout_issued_on', 'label'=>'Issued',         'sortable'=>false,'searchable'=>false],
+            ['key'=>'checkout_due_on', 'label'=>'Due back',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.checkout_due_on'],
             // Next cal due is now text-filterable. The column stores
             // YYYY-MM-DD so typing '2026-03' or '03-14' both work via LIKE.
             ['key'=>'next_cal_due_on', 'label'=>'Next cal due',      'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.next_cal_due_on'],
@@ -2518,6 +2762,7 @@ if ($action === 'list') {
                      ['value' => 'archived',    'label' => 'Archived'],
                  ],
              ]],
+            ['key'=>'att_count',       'label'=>'Files',             'sortable'=>false,'searchable'=>false, 'th_class'=>'r', 'td_class'=>'r'],
             ['key'=>'_actions',        'label'=>'Actions',           'sortable'=>false,'searchable'=>false, 'th_class'=>'r', 'td_class'=>'r nowrap'],
         ],
         'default_sort' => ['asset_tag', 'asc'],
@@ -2525,7 +2770,7 @@ if ($action === 'list') {
 
     $canCreateInspection = permission_check('inspection', 'create');
 
-    $rowRenderer = function ($a) use ($canCreate, $canManage, $canDelete, $canCreateInspection) {
+    $rowRenderer = function ($a) use ($canCreate, $canManage, $canDelete, $canCreateInspection, $canTransact) {
         $today = date('Y-m-d');
         $due   = $a['next_cal_due_on'];
         $dueCls = '';
@@ -2534,6 +2779,18 @@ if ($action === 'list') {
 
         $holder = $a['location_name'] ?: ($a['vendor_name'] ?: ($a['user_name'] ?: '—'));
 
+        // Issued / Due-back dates: only meaningful while checked out.
+        $isOut    = ($a['status'] === 'with_vendor' || $a['status'] === 'with_user');
+        $coIssued = $isOut && !empty($a['checkout_issued_at']) ? substr((string)$a['checkout_issued_at'], 0, 10) : '';
+        $coDue    = $isOut ? ($a['checkout_due_on'] ?? '') : '';
+        $coDueCls = '';
+        if ($coDue && $coDue < $today)                                    $coDueCls = 'text-danger';
+        elseif ($coDue && $coDue <= date('Y-m-d', strtotime('+7 days')))  $coDueCls = 'text-warn';
+
+        // Clickable attachment indicator (📎 + count). 1 → opens directly,
+        // >1 → popup of filenames. See note_att_indicator()/_assets().
+        $attHtml = note_att_indicator('asset', (int)$a['id'], (int)($a['att_count'] ?? 0));
+
         $statusPill = $a['status'] === 'active' ? 'active'
                     : ($a['status'] === 'archived' ? 'neutral'
                     : ($a['status'] === 'with_vendor' ? 'warn' : 'info'));
@@ -2541,6 +2798,22 @@ if ($action === 'list') {
         $actions  = '<a class="btn btn-icon" href="' . h(url('/asset.php?action=view&id=' . (int)$a['id'])) . '" title="Open" aria-label="Open">👁 <span class="dt-action-label">Open</span></a> ';
         if ($canManage) {
             $actions .= '<a class="btn btn-icon" href="' . h(url('/asset.php?action=edit&id=' . (int)$a['id'])) . '" title="Edit" aria-label="Edit">✎ <span class="dt-action-label">Edit</span></a> ';
+        }
+        if ($canTransact && $a['status'] !== 'archived') {
+            if ($a['status'] === 'with_vendor') {
+                $txnBtnLabel = 'Check In'; $txnBtnPreset = 'receive_vendor'; $txnBtnIcon = '↓';
+            } elseif ($a['status'] === 'with_user') {
+                $txnBtnLabel = 'Check In'; $txnBtnPreset = 'receive_user';   $txnBtnIcon = '↓';
+            } else {
+                $txnBtnLabel = 'Check Out'; $txnBtnPreset = 'send_user';     $txnBtnIcon = '↑';
+            }
+            $actions .= '<button type="button" class="btn btn-icon asset-txn-trigger"'
+                      . ' data-id="' . (int)$a['id'] . '"'
+                      . ' data-tag="' . h($a['asset_tag']) . '"'
+                      . ' data-preset="' . $txnBtnPreset . '"'
+                      . ' data-label="' . h($txnBtnLabel) . '"'
+                      . ' title="' . h($txnBtnLabel) . '" aria-label="' . h($txnBtnLabel) . '">'
+                      . $txnBtnIcon . ' <span class="dt-action-label">' . h($txnBtnLabel) . '</span></button> ';
         }
         if ($canCreate) {
             $actions .= '<form method="post" style="display:inline" action="' . h(url('/asset.php?action=clone')) . '"'
@@ -2576,7 +2849,10 @@ if ($action === 'list') {
             'asset_tag'       => '<strong><a href="' . h(url('/asset.php?action=view&id=' . (int)$a['id'])) . '">' . h($a['asset_tag']) . '</a></strong>',
             'model_name'      => h($a['model_name'] ?: '—'),
             'category'        => h($a['category'] ?: '—'),
-            'holder'          => h($holder),
+            'holder'             => h($holder),
+            'checkout_issued_on' => $coIssued !== '' ? h($coIssued) : '<span class="muted small">—</span>',
+            'checkout_due_on'    => '<span class="' . $coDueCls . '">' . h($coDue ?: '—') . '</span>',
+            'att_count'          => $attHtml,
             'next_cal_due_on' => '<span class="' . $dueCls . '">' . h($due ?: '—') . '</span>',
             'status'          => '<span class="pill pill-' . $statusPill . '">' . h(str_replace('_', ' ', $a['status'])) . '</span>',
             '_actions'        => dt_actions_wrap($actions),
@@ -2585,17 +2861,29 @@ if ($action === 'list') {
 
     $dt = data_table_run($dtCfg, $rowRenderer);
 
+    // Lookup data for the inline transact modal.
+    $txnLocations = $txnVendors = $txnUsers = [];
+    if ($canTransact) {
+        $txnLocations = db_all('SELECT id, code, name FROM locations WHERE is_active = 1 ORDER BY sort_order, name');
+        $txnVendors   = db_all('SELECT id, code, name FROM vendors   WHERE is_active = 1 ORDER BY name');
+        $txnUsers     = db_all('SELECT id, full_name FROM users       WHERE is_active = 1 ORDER BY full_name');
+    }
+
     $page_title  = 'All assets';
     $page_module = 'asset';
     $focus_id    = '';
 
     $actionsHtml = '';
     if ($canCreate) {
-        $actionsHtml = '<button type="button" class="btn btn-ghost btn-sm"'
-                     . ' data-open-import="asset-import-modal"'
-                     . ' title="Import assets from CSV">⤒ Import CSV</button> ';
+        $actionsHtml = '<a class="btn btn-ghost btn-sm" href="' . h(url('/asset.php?action=list_export')) . '"'
+                     . ' title="Download all assets as CSV">⤓ Export CSV</a> ';
+        $actionsHtml .= '<button type="button" class="btn btn-ghost btn-sm"'
+                      . ' data-open-import="asset-import-modal"'
+                      . ' title="Import assets from CSV">⤒ Import CSV</button> ';
         $actionsHtml .= '<a class="btn btn-primary btn-sm" href="' . h(url('/asset.php?action=new')) . '"'
-                     . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New asset', 'N') . '</a>';
+                      . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ New asset', 'N') . '</a>';
+        $actionsHtml .= ' <a class="btn btn-ghost btn-sm" href="' . h(url('/asset.php?action=import_old_preview')) . '"'
+                      . ' title="Import assets from old inventory_live database">⤒ Import Old Inventory</a>';
     }
     if ($canTransact) {
         // Append after the create-side buttons so the order reads
@@ -2610,6 +2898,170 @@ if ($action === 'list') {
     require __DIR__ . '/includes/header.php';
     ?>
     <?php data_table_render($dtCfg, $dt, $rowRenderer); ?>
+
+    <?php if ($canTransact): ?>
+    <!-- ── Inline Transact modal ──────────────────────────────────── -->
+    <div id="asset-txn-modal"
+         style="display:none; position:fixed; inset:0; z-index:9000; background:rgba(0,0,0,.45);"
+         role="dialog" aria-modal="true" aria-labelledby="asset-txn-modal-title">
+        <div style="background:var(--surface); border-radius:8px; max-width:460px; width:calc(100% - 32px);
+                    margin:80px auto; padding:24px 26px 20px; position:relative;
+                    box-shadow:0 8px 32px rgba(0,0,0,.28);">
+            <button type="button" id="asset-txn-modal-close" aria-label="Close"
+                    style="position:absolute;top:12px;right:14px;background:none;border:none;
+                           font-size:20px;line-height:1;cursor:pointer;color:var(--text-muted);">✕</button>
+            <h3 id="asset-txn-modal-title" style="margin:0 0 18px; font-size:16px; font-weight:600;">
+                <span id="asset-txn-modal-action">Check Out</span> — <span id="asset-txn-modal-tag" style="color:var(--primary,#2563eb);"></span>
+            </h3>
+
+            <form id="asset-txn-modal-form" method="post" autocomplete="off"
+                  action="<?= h(url('/asset.php?action=txn_save')) ?>">
+                <?= csrf_field() ?>
+                <input type="hidden" name="id"          id="asset-txn-modal-id">
+                <input type="hidden" name="redirect_to" value="list">
+
+                <div class="field">
+                    <label for="modal-txn-type">Transaction type</label>
+                    <select id="modal-txn-type" name="txn_type" autocomplete="off">
+                        <option value="move">Move (location → location)</option>
+                        <option value="send_vendor">Send to vendor</option>
+                        <option value="receive_vendor">Receive from vendor</option>
+                        <option value="send_user">Hand out to user</option>
+                        <option value="receive_user">Receive back from user</option>
+                    </select>
+                </div>
+
+                <div class="field" id="modal-loc-field">
+                    <label>Destination location</label>
+                    <select name="to_location_id">
+                        <option value="">— Select —</option>
+                        <?php foreach ($txnLocations as $l): ?>
+                            <option value="<?= (int)$l['id'] ?>">
+                                <?= h($l['name']) ?> (<?= h($l['code']) ?>)
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field" id="modal-vendor-field" style="display:none;">
+                    <label>Vendor</label>
+                    <select name="to_vendor_id">
+                        <option value="">— Select —</option>
+                        <?php foreach ($txnVendors as $v): ?>
+                            <option value="<?= (int)$v['id'] ?>"><?= h($v['name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field" id="modal-user-field" style="display:none;">
+                    <label>User</label>
+                    <select name="to_user_id">
+                        <option value="">— Select —</option>
+                        <?php foreach ($txnUsers as $u): ?>
+                            <option value="<?= (int)$u['id'] ?>"><?= h($u['full_name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="field" id="modal-due-field" style="display:none;">
+                    <label for="modal-txn-due">Due date <span class="muted small">(expected return)</span></label>
+                    <input id="modal-txn-due" name="due_date" type="date">
+                </div>
+
+                <div class="field">
+                    <label for="modal-txn-notes">Notes</label>
+                    <input id="modal-txn-notes" name="notes" type="text" maxlength="255"
+                           placeholder="Optional">
+                </div>
+
+                <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:20px;">
+                    <button type="button" id="asset-txn-modal-cancel"
+                            class="btn btn-ghost">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save transaction</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script>
+    (function () {
+        var modal   = document.getElementById('asset-txn-modal');
+        var idInp   = document.getElementById('asset-txn-modal-id');
+        var tagSpan = document.getElementById('asset-txn-modal-tag');
+        var typeSel = document.getElementById('modal-txn-type');
+        var locF    = document.getElementById('modal-loc-field');
+        var venF    = document.getElementById('modal-vendor-field');
+        var usrF    = document.getElementById('modal-user-field');
+        var dueF    = document.getElementById('modal-due-field');
+        var dueInp  = document.getElementById('modal-txn-due');
+        var notesInp= document.getElementById('modal-txn-notes');
+
+        function applyType() {
+            var ts = document.getElementById('modal-txn-type');
+            var t  = ts ? ts.value : 'move';
+            locF.style.display = (t === 'move' || t === 'receive_vendor' || t === 'receive_user') ? '' : 'none';
+            venF.style.display = (t === 'send_vendor') ? '' : 'none';
+            usrF.style.display = (t === 'send_user')   ? '' : 'none';
+            dueF.style.display = (t === 'send_vendor' || t === 'send_user') ? '' : 'none';
+        }
+        typeSel.addEventListener('change', applyType);
+
+        function openModal(id, tag, preset, label) {
+            idInp.value         = id;
+            tagSpan.textContent = tag;
+            var titleAction = document.getElementById('asset-txn-modal-action');
+            if (titleAction) titleAction.textContent = label || 'Transact';
+            // Reset destination selects and inputs first
+            [locF, venF, usrF].forEach(function (f) {
+                var s = f.querySelector('select');
+                if (s) s.selectedIndex = 0;
+            });
+            notesInp.value = '';
+            if (dueInp) dueInp.value = '';
+            modal.style.display = '';
+
+            var targetType = preset || 'move';
+
+            function forcePreset() {
+                // Always re-query — never rely on the closure reference which
+                // could be stale if the page has re-rendered any containing element.
+                var ts = document.getElementById('modal-txn-type');
+                if (!ts) return;
+                // Set via .value AND option.selected on each option — the most
+                // compatible combination across all browsers.
+                ts.value = targetType;
+                for (var i = 0; i < ts.options.length; i++) {
+                    ts.options[i].selected = (ts.options[i].value === targetType);
+                }
+                applyType();
+            }
+
+            forcePreset();                          // synchronous pass
+            setTimeout(function () {
+                forcePreset();                      // async pass — beats browser autofill
+                var ts = document.getElementById('modal-txn-type');
+                if (ts) ts.focus();
+            }, 50);
+        }
+
+        function closeModal() { modal.style.display = 'none'; }
+
+        document.getElementById('asset-txn-modal-close').addEventListener('click',  closeModal);
+        document.getElementById('asset-txn-modal-cancel').addEventListener('click', closeModal);
+        modal.addEventListener('click', function (e) { if (e.target === modal) closeModal(); });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape' && modal.style.display !== 'none') closeModal();
+        });
+
+        // Wire every Check In / Check Out button — including rows added later by datatable pagination.
+        document.addEventListener('click', function (e) {
+            var btn = e.target.closest('.asset-txn-trigger');
+            if (!btn) return;
+            openModal(btn.dataset.id, btn.dataset.tag, btn.dataset.preset, btn.dataset.label);
+        });
+    })();
+    </script>
+    <?php endif; ?>
+
     <?php notes_popup_assets(); ?>
     <?php if ($canCreate):
         import_modal_html(
@@ -2768,5 +3220,173 @@ require __DIR__ . '/includes/header.php';
         </tbody>
     </table>
 </div>
+
+<?php
+// =============================================================================
+// IMPORT_OLD_PREVIEW — confirmation page before running the old-inventory import
+// =============================================================================
+if ($action === 'import_old_preview'):
+    require_permission('asset', 'create');
+
+    // Test connection to old DB so we can warn early if unreachable
+    $oldDbError = null;
+    try {
+        require_once __DIR__ . '/includes/old_inventory_db.php';
+        $testPdo  = old_inventory_db();
+        $oldCount = (int) $testPdo->query(
+            "SELECT COUNT(*) FROM asset WHERE archived_flag IS NULL OR archived_flag = 0"
+        )->fetchColumn();
+    } catch (Throwable $e) {
+        $oldDbError = $e->getMessage();
+        $oldCount   = 0;
+    }
+
+    $page_title  = 'Import Old Inventory Assets';
+    $page_module = 'asset';
+    require __DIR__ . '/includes/header.php';
+?>
+<div class="form-page">
+    <?= form_toolbar([
+        'title'     => 'Import Old Inventory Assets',
+        'subtitle'  => 'Migrate asset records from <code>inventory_live</code> into this system.',
+        'back_href'  => url('/asset.php?action=list'),
+        'back_label' => 'Back to Assets',
+    ]) ?>
+
+    <div class="form-page-body" style="max-width:680px;">
+
+        <?php if ($oldDbError): ?>
+        <div class="alert alert-error" style="margin-bottom:16px;">
+            <strong>Cannot connect to old inventory database.</strong><br>
+            <code style="font-size:12px;"><?= h($oldDbError) ?></code><br><br>
+            Make sure the server at <strong>192.168.1.73</strong> allows connections from this machine,
+            and that the <code>inventory_live</code> database exists.<br>
+            On the remote server run:<br>
+            <code style="font-size:12px;">GRANT ALL ON inventory_live.* TO 'root'@'%'; FLUSH PRIVILEGES;</code>
+        </div>
+        <?php else: ?>
+        <div class="alert alert-info" style="margin-bottom:16px;">
+            Connected to <strong>inventory_live @ 192.168.1.73</strong> —
+            <strong><?= number_format($oldCount) ?></strong> active asset(s) found.
+        </div>
+        <?php endif; ?>
+
+        <table class="info-table" style="margin-bottom:20px; width:100%;">
+            <tr><th>What will be imported</th><td>Active (non-archived) assets only</td></tr>
+            <tr><th>Duplicate handling</th><td>If <code>asset_code</code> already exists → <strong>update</strong>; otherwise → insert</td></tr>
+            <tr><th>Models</th><td>Missing models are created automatically</td></tr>
+            <tr><th>Locations</th><td>Matched by name; unmatched → imported with no location</td></tr>
+            <tr><th>Files</th><td>File names are recorded in notes; physical files are <em>not</em> transferred (remote filesystem)</td></tr>
+            <tr><th>Batch size</th><td>100 records per transaction</td></tr>
+        </table>
+
+        <?php if (!$oldDbError): ?>
+        <form method="post" action="<?= h(url('/asset.php?action=import_old_run')) ?>">
+            <?= csrf_field() ?>
+            <button type="submit" class="btn btn-primary"
+                    onclick="return confirm('Start importing <?= number_format($oldCount) ?> asset(s) from inventory_live? This may take a moment.');">
+                ▶ Start Import
+            </button>
+            <a class="btn btn-ghost" href="<?= h(url('/asset.php?action=list')) ?>">Cancel</a>
+        </form>
+        <?php endif; ?>
+
+    </div>
+</div>
+<?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+endif;
+
+
+// =============================================================================
+// IMPORT_OLD_RUN — execute the import and display the summary report
+// =============================================================================
+if ($action === 'import_old_run'):
+    require_permission('asset', 'create');
+    csrf_check();
+
+    require_once __DIR__ . '/includes/old_inventory_db.php';
+    require_once __DIR__ . '/services/OldInventoryAssetImportService.php';
+
+    $page_title  = 'Import Old Inventory — Results';
+    $page_module = 'asset';
+
+    $result     = null;
+    $fatalError = null;
+
+    try {
+        $svc    = new OldInventoryAssetImportService(current_user_id());
+        $result = $svc->run();
+    } catch (Throwable $e) {
+        $fatalError = $e->getMessage();
+    }
+
+    require __DIR__ . '/includes/header.php';
+?>
+<div class="form-page">
+    <?= form_toolbar([
+        'title'      => 'Import Old Inventory — Results',
+        'back_href'  => url('/asset.php?action=list'),
+        'back_label' => 'Back to Assets',
+    ]) ?>
+
+    <div class="form-page-body" style="max-width:760px;">
+
+    <?php if ($fatalError): ?>
+        <div class="alert alert-error">
+            <strong>Import failed with a fatal error:</strong><br>
+            <code><?= h($fatalError) ?></code>
+        </div>
+    <?php else: ?>
+
+        <!-- Summary cards -->
+        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+            <?php
+            $cards = [
+                ['Total Found',        $result['total'],    '#f3f4f6', '#374151'],
+                ['Imported (new)',      $result['imported'], '#d1fae5', '#065f46'],
+                ['Updated (existing)', $result['updated'],  '#dbeafe', '#1e40af'],
+                ['Failed',             $result['failed'],   '#fee2e2', '#991b1b'],
+                ['Skipped',            $result['skipped'],  '#fef9c3', '#854d0e'],
+            ];
+            foreach ($cards as [$label, $val, $bg, $color]): ?>
+            <div style="background:<?= $bg ?>; color:<?= $color ?>; border-radius:8px;
+                        padding:12px 20px; min-width:120px; text-align:center;">
+                <div style="font-size:28px; font-weight:700;"><?= number_format((int)$val) ?></div>
+                <div style="font-size:12px;"><?= h($label) ?></div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <?php if (!empty($result['errors'])): ?>
+        <h3 style="margin-bottom:8px;">Import Log</h3>
+        <div style="background:#f9fafb; border:1px solid var(--border); border-radius:6px;
+                    max-height:400px; overflow-y:auto; padding:12px;
+                    font-size:12px; font-family:monospace;">
+            <?php foreach ($result['errors'] as $entry): ?>
+            <?php $color = $entry['level'] === 'error' ? '#991b1b' : ($entry['level'] === 'warn' ? '#854d0e' : '#374151'); ?>
+            <div style="color:<?= $color ?>; margin-bottom:3px;">
+                [<?= h($entry['time']) ?>]
+                [<?= strtoupper(h($entry['level'])) ?>]
+                <?= h($entry['message']) ?>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+    <?php endif; ?>
+
+        <div style="margin-top:20px;">
+            <a class="btn btn-primary" href="<?= h(url('/asset.php?action=list')) ?>">View Assets</a>
+            <a class="btn btn-ghost"   href="<?= h(url('/asset.php?action=import_old_preview')) ?>">Run Again</a>
+        </div>
+    </div>
+</div>
+<?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
+endif;
+?>
 
 <?php require __DIR__ . '/includes/footer.php'; ?>
