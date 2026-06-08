@@ -2835,7 +2835,7 @@ if ($action === 'list') {
             } elseif ($a['status'] === 'with_user') {
                 $txnBtnLabel = 'Check In'; $txnBtnPreset = 'receive_user';   $txnBtnIcon = '↓';
             } else {
-                $txnBtnLabel = 'Check Out'; $txnBtnPreset = 'send_user';     $txnBtnIcon = '↑';
+                $txnBtnLabel = 'Check Out'; $txnBtnPreset = 'move';          $txnBtnIcon = '↑';
             }
             $actions .= '<button type="button" class="btn btn-icon asset-txn-trigger"'
                       . ' data-id="' . (int)$a['id'] . '"'
@@ -2952,7 +2952,7 @@ if ($action === 'list') {
 
                 <div class="field">
                     <label for="modal-txn-type">Transaction type</label>
-                    <select id="modal-txn-type" name="txn_type" autocomplete="off">
+                    <select id="modal-txn-type" name="txn_type" autocomplete="off" class="no-combobox">
                         <option value="move">Move (location → location)</option>
                         <option value="send_vendor">Send to vendor</option>
                         <option value="receive_vendor">Receive from vendor</option>
@@ -2975,7 +2975,7 @@ if ($action === 'list') {
 
                 <div class="field" id="modal-vendor-field" style="display:none;">
                     <label>Vendor</label>
-                    <select name="to_vendor_id">
+                    <select name="to_vendor_id" class="no-combobox">
                         <option value="">— Select —</option>
                         <?php foreach ($txnVendors as $v): ?>
                             <option value="<?= (int)$v['id'] ?>"><?= h($v['name']) ?></option>
@@ -2985,7 +2985,7 @@ if ($action === 'list') {
 
                 <div class="field" id="modal-user-field" style="display:none;">
                     <label>User</label>
-                    <select name="to_user_id">
+                    <select name="to_user_id" class="no-combobox">
                         <option value="">— Select —</option>
                         <?php foreach ($txnUsers as $u): ?>
                             <option value="<?= (int)$u['id'] ?>"><?= h($u['full_name']) ?></option>
@@ -3030,11 +3030,12 @@ if ($action === 'list') {
                 var ts = document.getElementById('modal-txn-type');
                 t = ts ? ts.value : 'move';
             }
-            var isSend = (t === 'send_vendor' || t === 'send_user');
-            locF.style.display  = isSend ? 'none' : 'block';
-            venF.style.display  = (t === 'send_vendor') ? 'block' : 'none';
-            usrF.style.display  = (t === 'send_user')   ? 'block' : 'none';
-            dueF.style.display  = isSend ? 'block' : 'none';
+            var isSendOut = (t === 'send_vendor' || t === 'send_user');
+            // Location: shown for move, receive_vendor, receive_user
+            locF.style.display = isSendOut              ? 'none'  : 'block';
+            venF.style.display = (t === 'send_vendor')  ? 'block' : 'none';
+            usrF.style.display = (t === 'send_user')    ? 'block' : 'none';
+            dueF.style.display = isSendOut              ? 'block' : 'none';
         }
         typeSel.addEventListener('change', function () { applyType(this.value); });
 

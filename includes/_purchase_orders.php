@@ -34,24 +34,6 @@ require_once __DIR__ . '/_codes.php';
 })();
 
 /**
- * Read a value from magdyn_settings, with a fallback default.
- */
-function magdyn_setting($key, $default = '')
-{
-    static $cache = null;
-    if ($cache === null) {
-        try {
-            $rows = db_all("SELECT setting_key, setting_value FROM magdyn_settings");
-            $cache = [];
-            foreach ($rows as $r) $cache[$r['setting_key']] = $r['setting_value'];
-        } catch (\Throwable $e) {
-            $cache = [];
-        }
-    }
-    return $cache[$key] ?? $default;
-}
-
-/**
  * Ensure a PO exists for the given shipment. Returns the PO row.
  * Idempotent — if a PO is already linked, returns it unchanged.
  *

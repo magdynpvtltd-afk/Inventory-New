@@ -136,22 +136,69 @@ if (!function_exists('qc_auto_create_inspection_for_txn')) {
         $code = qc_next_inspection_code();
         $uid  = function_exists('current_user_id') ? (int)current_user_id() : null;
 
+        // Look up the item's linked template so the checklist is ready
+        // for the inspector without manual template selection.
+        $linkedTplId = null;
+        if ($txn['item_id']) {
+            $tplRow = db_one(
+                "SELECT t.id FROM inspection_template_targets tt
+                   JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
+                  WHERE tt.entity_type = 'inv_item' AND tt.entity_id = ?
+                  ORDER BY t.id LIMIT 1",
+                [(int)$txn['item_id']]
+            );
+            if ($tplRow) {
+                $linkedTplId = (int)$tplRow['id'];
+            }
+        }
+
         db_exec(
             'INSERT INTO inspections
-               (code, inspection_type, entity_type, entity_id, status,
+               (code, inspection_type, entity_type, entity_id, template_id, status,
                 verdict_notes, planned_by, planned_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())',
             [
                 $code,
                 $inspectionType,
                 'inv_txn',
                 $txnId,
+                $linkedTplId,
                 'draft',
                 'Auto-created on ' . $type . ' txn at LOC-QCH.',
                 $uid,
             ]
         );
-        return (int)db()->lastInsertId();
+        $newInspId = (int)db()->lastInsertId();
+
+        // Seed checklist rows from the linked template
+        if ($linkedTplId) {
+            if (function_exists('ir_seed_results_with_samples')) {
+                ir_seed_results_with_samples($newInspId, $linkedTplId, 1);
+            } else {
+                $items = db_all(
+                    'SELECT * FROM inspection_template_items
+                      WHERE template_id = ? ORDER BY sort_order, id',
+                    [$linkedTplId]
+                );
+                foreach ($items as $it) {
+                    db_exec(
+                        'INSERT INTO inspection_results
+                           (inspection_id, sample_no, template_item_id, sort_order,
+                            label, bubble_no, gdt_symbol, check_type,
+                            target_value, tolerance_lower, tolerance_upper, unit,
+                            instrument_asset_id, pass_fail)
+                         VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [$newInspId, (int)$it['id'], (int)$it['sort_order'],
+                         $it['label'], $it['bubble_no'] ?? null, $it['gdt_symbol'] ?? null,
+                         $it['check_type'], $it['target_value'],
+                         $it['tolerance_lower'], $it['tolerance_upper'], $it['unit'],
+                         $it['instrument_asset_id'] ?? null, 'pending']
+                    );
+                }
+            }
+        }
+
+        return $newInspId;
     }
 }
 

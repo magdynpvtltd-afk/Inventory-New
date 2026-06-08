@@ -617,6 +617,50 @@ if ($action === 'save') {
     }
 
     // ---------------------------------------------------------
+    // EXECUTE START — capture date / inspector / samples before
+    // the inspector fills in measurements. Re-seeds the results
+    // grid when the sample count changes.
+    // ---------------------------------------------------------
+    if ($op === 'execute_start') {
+        require_permission('inspection', 'execute');
+        $id  = (int)input('id', 0);
+        $row = db_one('SELECT * FROM inspections WHERE id = ? AND is_deleted = 0', [$id]);
+        if (!$row || !inspection_can_execute($row)) {
+            flash_set('error', 'Cannot start execution for this inspection.');
+            redirect(url('/inspection.php?action=view&id=' . $id));
+        }
+
+        $inspDate = trim((string)input('inspection_date', ''));
+        if (!$inspDate || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $inspDate)) {
+            $inspDate = date('Y-m-d');
+        }
+        $inspectorId  = (int)input('inspector_id', 0) ?: (int)current_user_id();
+        $samplesTaken = max(1, (int)input('samples_taken', 1));
+
+        // Cap samples to the txn's positive qty so we can't inspect
+        // more pieces than were actually received.
+        if ($row['entity_type'] === 'inv_txn' && $row['entity_id']) {
+            $txnQtyRow = db_one('SELECT qty_delta FROM inv_txns WHERE id = ?', [(int)$row['entity_id']]);
+            if ($txnQtyRow && (float)$txnQtyRow['qty_delta'] > 0) {
+                $samplesTaken = min($samplesTaken, (int)ceil((float)$txnQtyRow['qty_delta']));
+            }
+        }
+
+        $oldSamples = max(1, (int)($row['sample_count'] ?? 1));
+        if ($samplesTaken !== $oldSamples) {
+            db_exec('UPDATE inspections SET sample_count = ? WHERE id = ?', [$samplesTaken, $id]);
+            if ($row['template_id']) {
+                ir_seed_results_with_samples($id, (int)$row['template_id'], $samplesTaken);
+            }
+        }
+
+        redirect(url('/inspection.php?action=execute&id=' . $id
+            . '&started=1'
+            . '&insp_date='   . urlencode($inspDate)
+            . '&inspector='   . $inspectorId));
+    }
+
+    // ---------------------------------------------------------
     // EXECUTE — submit measurements and verdict
     // ---------------------------------------------------------
     if ($op === 'execute') {
@@ -639,7 +683,16 @@ if ($action === 'save') {
         $rnotes   = is_array(input('result_notes', []))     ? input('result_notes', [])     : [];
 
         $uid = (int)current_user_id();
-        $now = date('Y-m-d H:i:s');
+
+        // Inspector and date come from the execute_start modal.
+        // Fall back to current user / now if not present (e.g. legacy direct submit).
+        $inspectorId = (int)input('inspector_id', 0);
+        $inspectedBy = ($inspectorId > 0) ? $inspectorId : $uid;
+        $inspDateRaw = trim((string)input('inspection_date', ''));
+        $now = ($inspDateRaw && preg_match('/^\d{4}-\d{2}-\d{2}$/', $inspDateRaw))
+            ? $inspDateRaw . ' ' . date('H:i:s')
+            : date('Y-m-d H:i:s');
+
         $existing = db_all(
             'SELECT id, check_type, target_value, tolerance_lower, tolerance_upper
                FROM inspection_results WHERE inspection_id = ?',
@@ -705,7 +758,7 @@ if ($action === 'save') {
                     sample_remarks_json = ?,
                     status = ?
               WHERE id = ?',
-            [$verdict ?: null, $uid, $now, $remarksJson, 'in_progress', $id]
+            [$verdict ?: null, $inspectedBy, $now, $remarksJson, 'in_progress', $id]
         );
 
         // Attachments
@@ -1667,6 +1720,31 @@ if ($action === 'entity_picker') {
         );
     }
     echo json_encode(['ok' => true, 'rows' => $rows]);
+    exit;
+}
+
+// =================================================================
+// TEMPLATE FOR ENTITY — AJAX: linked templates for a given entity
+// Used by the new-inspection form to auto-select a template when
+// the user picks an item/asset that has a pre-linked template.
+// =================================================================
+if ($action === 'template_for_entity') {
+    header('Content-Type: application/json; charset=utf-8');
+    $et  = (string)input('entity_type', '');
+    $eid = (int)input('entity_id', 0);
+    if (!$eid || !in_array($et, ['asset', 'inv_item'], true)) {
+        echo json_encode(['ok' => true, 'templates' => []]);
+        exit;
+    }
+    $rows = db_all(
+        "SELECT t.id, t.code, t.name, t.inspection_type
+           FROM inspection_template_targets tt
+           JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
+          WHERE tt.entity_type = ? AND tt.entity_id = ?
+          ORDER BY t.name",
+        [$et, $eid]
+    );
+    echo json_encode(['ok' => true, 'templates' => $rows]);
     exit;
 }
 
@@ -3243,7 +3321,21 @@ if ($action === 'new') {
         var chosen   = document.querySelector('.entity-picker-chosen');
         var timer = null;
 
-        function clearChoice() { hidden.value = ''; chosen.textContent = ''; }
+        function clearChoice() {
+            hidden.value = ''; chosen.textContent = '';
+            // Reset all template options to unlinked state
+            if (tplSel) {
+                for (var i = 0; i < tplSel.options.length; i++) {
+                    var opt = tplSel.options[i];
+                    if (!opt.value) continue;
+                    if (opt.getAttribute('data-linked') === '1') {
+                        opt.setAttribute('data-linked', '0');
+                        opt.text = opt.text.replace(/^★\s*/, '');
+                    }
+                }
+                applyTplFilter();
+            }
+        }
         typeSel.addEventListener('change', function () {
             clearChoice(); search.value = ''; dropdown.hidden = true;
             search.disabled = typeSel.value === 'none';
@@ -3287,6 +3379,40 @@ if ($action === 'new') {
                 hidden.value = item.dataset.id;
                 chosen.textContent = '✓ ' + item.dataset.label;
                 search.value = ''; dropdown.hidden = true;
+                // Auto-select linked template when entity has one assigned
+                var et = typeSel.value;
+                if ((et === 'inv_item' || et === 'asset') && item.dataset.id) {
+                    var tplFetchUrl = (window.MAGDYN_BASE || '') + '/inspection.php?action=template_for_entity'
+                        + '&entity_type=' + encodeURIComponent(et)
+                        + '&entity_id='   + encodeURIComponent(item.dataset.id);
+                    fetch(tplFetchUrl, { credentials: 'same-origin' })
+                        .then(function (r) { return r.json(); })
+                        .then(function (d) {
+                            if (!d || !d.ok) return;
+                            var linked = d.templates || [];
+                            var linkedIds = linked.map(function (t) { return String(t.id); });
+                            // Update data-linked attributes and ★ prefixes on all options
+                            if (tplSel) {
+                                for (var i = 0; i < tplSel.options.length; i++) {
+                                    var opt = tplSel.options[i];
+                                    if (!opt.value) continue;
+                                    var wasLinked = opt.getAttribute('data-linked') === '1';
+                                    var isLinked  = linkedIds.indexOf(opt.value) !== -1;
+                                    opt.setAttribute('data-linked', isLinked ? '1' : '0');
+                                    if (isLinked && !wasLinked) {
+                                        opt.text = '★ ' + opt.text;
+                                    } else if (!isLinked && wasLinked) {
+                                        opt.text = opt.text.replace(/^★\s*/, '');
+                                    }
+                                }
+                                // Auto-select the one linked template
+                                if (linkedIds.length === 1) {
+                                    tplSel.value = linkedIds[0];
+                                }
+                                applyTplFilter();
+                            }
+                        });
+                }
                 return;
             }
             if (!e.target.closest('.entity-picker')) dropdown.hidden = true;
@@ -3961,7 +4087,68 @@ if ($action === 'execute') {
         redirect(url('/inspection.php?action=view&id=' . $id));
     }
 
-    // Results are loaded inside the grid render below via ir_results_grid().
+    // Seed checklist items from the linked template when they are missing.
+    // Case 1: inspection has no template yet but the entity has one linked
+    //         (common for auto-created QC inspections).
+    // Case 2: inspection has a template but results were never seeded
+    //         (legacy auto-create path that predates the seeding fix).
+    $sampleCountForSeed = max(1, (int)($row['sample_count'] ?? 1));
+    if (empty($row['template_id'])) {
+        $seedEntityId   = null;
+        $seedEntityType = null;
+        if ($row['entity_type'] === 'inv_item') {
+            $seedEntityId   = (int)$row['entity_id'];
+            $seedEntityType = 'inv_item';
+        } elseif ($row['entity_type'] === 'inv_txn' && $row['entity_id']) {
+            $txnForSeed = db_one('SELECT item_id FROM inv_txns WHERE id = ?', [(int)$row['entity_id']]);
+            if ($txnForSeed && $txnForSeed['item_id']) {
+                $seedEntityId   = (int)$txnForSeed['item_id'];
+                $seedEntityType = 'inv_item';
+            }
+        } elseif ($row['entity_type'] === 'asset') {
+            $seedEntityId   = (int)$row['entity_id'];
+            $seedEntityType = 'asset';
+        }
+        if ($seedEntityId && $seedEntityType) {
+            $linkedTplRow = db_one(
+                "SELECT t.id FROM inspection_template_targets tt
+                   JOIN inspection_templates t ON t.id = tt.template_id AND t.is_active = 1
+                  WHERE tt.entity_type = ? AND tt.entity_id = ?
+                  ORDER BY t.id LIMIT 1",
+                [$seedEntityType, $seedEntityId]
+            );
+            if ($linkedTplRow) {
+                $autoTplId = (int)$linkedTplRow['id'];
+                db_exec('UPDATE inspections SET template_id = ? WHERE id = ?', [$autoTplId, $id]);
+                $row['template_id'] = $autoTplId;
+                ir_seed_results_with_samples($id, $autoTplId, $sampleCountForSeed);
+            }
+        }
+    } elseif (!(int)db_val('SELECT COUNT(*) FROM inspection_results WHERE inspection_id = ?', [$id], 0)) {
+        ir_seed_results_with_samples($id, (int)$row['template_id'], $sampleCountForSeed);
+    }
+
+    // ---- Data for the "start inspection" modal ----------------------
+    $started = (string)input('started', '') === '1';
+    // GET params passed back from execute_start so the form can relay them.
+    $execInspDate  = trim((string)input('insp_date', ''));
+    if (!$execInspDate || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $execInspDate)) {
+        $execInspDate = date('Y-m-d');
+    }
+    $execInspectorId = (int)input('inspector', 0) ?: (int)current_user_id();
+    // All active users for the inspector picker
+    $execUsers = db_all(
+        'SELECT id, full_name, username FROM users WHERE is_active = 1 ORDER BY full_name'
+    );
+    // Max samples = txn qty (NULL when not txn-linked)
+    $execMaxSamples = null;
+    if ($row['entity_type'] === 'inv_txn' && $row['entity_id']) {
+        $execTxnRow = db_one('SELECT qty_delta FROM inv_txns WHERE id = ?', [(int)$row['entity_id']]);
+        if ($execTxnRow && (float)$execTxnRow['qty_delta'] > 0) {
+            $execMaxSamples = (int)ceil((float)$execTxnRow['qty_delta']);
+        }
+    }
+    $execCurrentSamples = max(1, (int)($row['sample_count'] ?? 1));
 
     $page_title  = 'Execute ' . $row['code'];
     $page_module = 'inspection';
@@ -3985,6 +4172,10 @@ if ($action === 'execute') {
             <?= csrf_field() ?>
             <input type="hidden" name="op" value="execute">
             <input type="hidden" name="id" value="<?= $id ?>">
+            <?php if ($started): ?>
+            <input type="hidden" name="inspection_date" value="<?= h($execInspDate) ?>">
+            <input type="hidden" name="inspector_id"    value="<?= (int)$execInspectorId ?>">
+            <?php endif; ?>
 
             <?php
             // ---------------------------------------------------------
@@ -4255,6 +4446,63 @@ if ($action === 'execute') {
             </div>
         </form>
     </div>
+
+    <!-- ============================================================
+         Start-inspection modal — shown immediately on page load
+         unless ?started=1 (i.e. execute_start already ran).
+         Captures: inspection date, inspector, sample count.
+    ============================================================ -->
+    <div id="exec-start-modal" class="att-preview-modal" <?= $started ? 'hidden' : '' ?>>
+        <div class="att-preview-backdrop"></div>
+        <div class="att-preview-dialog" role="dialog" aria-label="Start inspection"
+             style="max-width: 480px; margin: auto; height: auto;">
+            <div class="att-preview-head">
+                <span class="att-preview-name">Start Inspection — <?= h($row['code']) ?></span>
+            </div>
+            <form method="post" action="<?= h(url('/inspection.php?action=save')) ?>"
+                  style="padding: 20px;">
+                <?= csrf_field() ?>
+                <input type="hidden" name="op" value="execute_start">
+                <input type="hidden" name="id" value="<?= $id ?>">
+                <div class="form-grid">
+                    <div class="field span-2">
+                        <label for="esm_date">Date of inspection *</label>
+                        <input id="esm_date" name="inspection_date" type="date" required
+                               value="<?= h(date('Y-m-d')) ?>">
+                    </div>
+                    <div class="field span-2">
+                        <label for="esm_inspector">Inspected by *</label>
+                        <select id="esm_inspector" name="inspector_id" required class="no-combobox">
+                            <option value="">— Select inspector —</option>
+                            <?php foreach ($execUsers as $u): ?>
+                                <option value="<?= (int)$u['id'] ?>"
+                                        <?= (int)$u['id'] === (int)current_user_id() ? 'selected' : '' ?>>
+                                    <?= h($u['full_name'] ?: $u['username']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="field span-4">
+                        <label for="esm_samples">
+                            Samples taken *
+                            <?php if ($execMaxSamples !== null): ?>
+                                <span class="muted small">(max <?= (int)$execMaxSamples ?> — txn qty)</span>
+                            <?php endif; ?>
+                        </label>
+                        <input id="esm_samples" name="samples_taken" type="number" required
+                               min="1"
+                               <?= $execMaxSamples !== null ? 'max="' . (int)$execMaxSamples . '"' : '' ?>
+                               value="<?= (int)$execCurrentSamples ?>">
+                    </div>
+                </div>
+                <div style="margin-top: 20px; display:flex; gap:8px; justify-content:flex-end;">
+                    <a class="btn btn-ghost"
+                       href="<?= h(url('/inspection.php?action=view&id=' . $id)) ?>">Cancel</a>
+                    <button type="submit" class="btn btn-primary">Begin Inspection</button>
+                </div>
+            </form>
+        </div>
+    </div>
     <?php require __DIR__ . '/includes/footer.php'; exit;
 }
 
@@ -4278,6 +4526,15 @@ $dtCfg = [
         "SELECT i.id, i.code, i.ir_no, i.inspection_type, i.entity_type, i.entity_id,
                 i.status, i.due_date, i.planned_at, i.inspected_at, i.approved_at,
                 t.name AS template_name,
+                -- Template linked to the entity itself via inspection_template_targets
+                -- (shown in the list when the inspection has no explicitly assigned template)
+                (SELECT t2.name
+                   FROM inspection_template_targets tt2
+                   JOIN inspection_templates t2 ON t2.id = tt2.template_id AND t2.is_active = 1
+                  WHERE (i.entity_type = 'inv_item' AND tt2.entity_type = 'inv_item' AND tt2.entity_id = i.entity_id)
+                     OR (i.entity_type = 'inv_txn'  AND tt2.entity_type = 'inv_item' AND tt2.entity_id = et.item_id)
+                     OR (i.entity_type = 'asset'    AND tt2.entity_type = 'asset'    AND tt2.entity_id = i.entity_id)
+                  ORDER BY t2.id LIMIT 1) AS entity_linked_tpl_name,
                 -- The linked txn (only set when entity_type='inv_txn')
                 et.id         AS txn_id,
                 et.item_id    AS txn_item_id,
@@ -4472,7 +4729,11 @@ $rowRenderer = function ($r) use ($canCreate) {
         'part_name'         => $partCell,
         'txn_at'            => $dateCell,
         'txn_qty'           => $qtyCell,
-        'template_name'     => $r['template_name'] ? h($r['template_name']) : '<span class="muted small">free-form</span>',
+        'template_name'     => $r['template_name']
+            ? h($r['template_name'])
+            : ($r['entity_linked_tpl_name']
+                ? '<span title="Template linked to this item">★ ' . h($r['entity_linked_tpl_name']) . '</span>'
+                : '<span class="muted small">free-form</span>'),
         'status'            => inspection_status_pill($r['status']),
         '_actions'          => dt_actions_wrap($actions),
     ];
