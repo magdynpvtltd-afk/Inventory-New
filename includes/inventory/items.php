@@ -1297,7 +1297,9 @@ if ($action === 'item_new' || $action === 'item_edit') {
     // current push state, the manual "Push to billing" button (gated by
     // inventory_view_items.push_to_billing), and the last 10 push
     // history rows for diagnosis.
-    if ($isEdit && $editing && billing_products_is_finished_category($editing['category_id'])):
+    if ($isEdit && $editing
+        && ((int)($editing['is_product'] ?? 0) === 1
+            || billing_products_is_finished_category($editing['category_id']))):
         $billingReady = billing_products_config() !== null;
         $canPush      = function_exists('permission_check') && permission_check('inventory_view_items', 'push_to_billing');
         $history      = billing_product_history((int)$editing['id'], 10);

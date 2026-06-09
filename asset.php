@@ -2769,8 +2769,10 @@ if ($action === 'list') {
                          LEFT JOIN vendors v       ON v.id  = a.current_vendor_id
                          LEFT JOIN users u         ON u.id  = a.current_user_id',
         'columns'  => [
-            ['key'=>'asset_tag',       'label'=>'Asset ID',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.asset_tag'],
+            ['key'=>'asset_tag',       'label'=>'Asset ID',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.asset_tag',
+             'sort_sql'=>'CAST(SUBSTRING_INDEX(a.asset_tag, \'-\', -1) AS UNSIGNED)'],
             ['key'=>'model_name',      'label'=>'Model',             'sortable'=>true, 'searchable'=>true, 'sql_col'=>'am.name'],
+            ['key'=>'asset_name',      'label'=>'Asset Name',        'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.asset_name'],
             ['key'=>'category',        'label'=>'Category',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'am.category'],
             ['key'=>'holder',          'label'=>'Location / holder', 'sortable'=>false,'searchable'=>true, 'sql_col'=>'CONCAT_WS(" ", l.name, v.name, u.full_name)'],
             // Issued / Due back — set when the asset is checked out; only
@@ -2807,12 +2809,23 @@ if ($action === 'list') {
         if ($due && $due < $today)                                   $dueCls = 'text-danger';
         elseif ($due && $due <= date('Y-m-d', strtotime('+30 days'))) $dueCls = 'text-warn';
 
-        $holder = $a['location_name'] ?: ($a['vendor_name'] ?: ($a['user_name'] ?: '—'));
+        // When checked out, show who has the asset (vendor / user).
+        // When in stock, show the physical location.
+        if ($a['status'] === 'with_vendor') {
+            $holder = $a['vendor_name'] ?: '—';
+        } elseif ($a['status'] === 'with_user') {
+            $holder = $a['user_name'] ?: '—';
+        } else {
+            $holder = $a['location_name'] ?: '—';
+        }
 
         // Issued / Due-back dates: only meaningful while checked out.
         $isOut    = ($a['status'] === 'with_vendor' || $a['status'] === 'with_user');
         $coIssued = $isOut && !empty($a['checkout_issued_at']) ? substr((string)$a['checkout_issued_at'], 0, 10) : '';
-        $coDue    = $isOut ? ($a['checkout_due_on'] ?? '') : '';
+        // Always show checkout_due_on when a value is stored, regardless of
+        // status. Imported assets from old inventory arrive as 'active' but
+        // may still carry a due-back date from when they were last checked out.
+        $coDue    = $a['checkout_due_on'] ?? '';
         $coDueCls = '';
         if ($coDue && $coDue < $today)                                    $coDueCls = 'text-danger';
         elseif ($coDue && $coDue <= date('Y-m-d', strtotime('+7 days')))  $coDueCls = 'text-warn';
@@ -2878,6 +2891,7 @@ if ($action === 'list') {
         return [
             'asset_tag'       => '<strong><a href="' . h(url('/asset.php?action=view&id=' . (int)$a['id'])) . '">' . h($a['asset_tag']) . '</a></strong>',
             'model_name'      => h($a['model_name'] ?: '—'),
+            'asset_name'      => $a['asset_name'] !== null && $a['asset_name'] !== '' ? h($a['asset_name']) : '<span class="muted">—</span>',
             'category'        => h($a['category'] ?: '—'),
             'holder'             => h($holder),
             'checkout_issued_on' => $coIssued !== '' ? h($coIssued) : '<span class="muted small">—</span>',

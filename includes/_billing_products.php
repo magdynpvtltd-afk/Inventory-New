@@ -70,14 +70,20 @@ function billing_products_is_finished_category($categoryId)
 {
     $categoryId = (int)$categoryId;
     if ($categoryId <= 0) return false;
+    // Accept type='inventory' OR type='all' — some deployments seed the
+    // Finished Goods category with type='all'.
     $row = db_one(
-        "SELECT code FROM categories
-          WHERE id = ? AND type = 'inventory' AND is_active = 1",
+        "SELECT code, name FROM categories
+          WHERE id = ? AND type IN ('inventory','all') AND is_active = 1",
         [$categoryId]
     );
     if (!$row) return false;
     $code = strtolower(trim((string)$row['code']));
-    return $code === 'finshd' || $code === 'finished';
+    $name = strtolower(trim((string)$row['name']));
+    // Match known code variants and name prefix so this survives
+    // any future category-code drift.
+    return in_array($code, ['finshd', 'finished', 'finished_goo'], true)
+        || strpos($name, 'finished good') === 0;
 }
 
 

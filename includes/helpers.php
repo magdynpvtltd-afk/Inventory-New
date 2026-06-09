@@ -673,3 +673,32 @@ function clone_row($table, $sourceId, array $overrides = [], array $exclude = []
     return (int)db_val('SELECT LAST_INSERT_ID()', [], 0);
 }
 
+
+/**
+ * Read a value from magdyn_settings, with a fallback default.
+ *
+ * Generic key/value config reader used across the app: SMTP creds,
+ * vendor empanelment reminder windows, PO defaults, etc. Lives here
+ * (in helpers.php, loaded by bootstrap) so every page can call it
+ * without remembering to include a module-specific helper file.
+ *
+ * Cached statically per request — settings rarely change within a
+ * single page load, and reloading from DB on every getter would
+ * thrash the magdyn_settings table.
+ */
+function magdyn_setting($key, $default = '')
+{
+    static $cache = null;
+    if ($cache === null) {
+        try {
+            $rows = db_all("SELECT setting_key, setting_value FROM magdyn_settings");
+            $cache = [];
+            foreach ($rows as $r) $cache[$r['setting_key']] = $r['setting_value'];
+        } catch (\Throwable $e) {
+            // Table may not exist yet on installs that pre-date
+            // migration_20260531_182000_IST. Treat as "all defaults".
+            $cache = [];
+        }
+    }
+    return $cache[$key] ?? $default;
+}

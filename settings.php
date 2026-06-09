@@ -10,7 +10,6 @@
  */
 
 require_once __DIR__ . '/includes/bootstrap.php';
-require_once __DIR__ . '/includes/_purchase_orders.php';   // for magdyn_setting()
 require_once __DIR__ . '/includes/_email.php';
 
 require_permission('settings', 'view');

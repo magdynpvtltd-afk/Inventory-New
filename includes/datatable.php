@@ -170,7 +170,8 @@ function data_table_query(array $cfg)
     $orderSql = '';
     foreach ($cfg['columns'] as $c) {
         if ($c['key'] === $state['sort'] && !empty($c['sortable']) && !empty($c['sql_col'])) {
-            $orderSql = ' ORDER BY ' . $c['sql_col'] . ' ' . strtoupper($state['dir']);
+            $sortExpr = !empty($c['sort_sql']) ? $c['sort_sql'] : $c['sql_col'];
+            $orderSql = ' ORDER BY ' . $sortExpr . ' ' . strtoupper($state['dir']);
             break;
         }
     }

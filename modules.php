@@ -200,9 +200,45 @@ if ($action === 'reorder') {
                 [$c['parent_id'], $c['sort_order'], $c['id']]
             );
         }
+
+        // Symmetric to the auto-promote above: any module that is now
+        // is_group=1 but has zero children left should drop back to
+        // is_group=0. Without this, dragging the only child OUT of a
+        // previously auto-promoted leaf leaves it stranded as an empty
+        // "group" — the toggle/folder rendering sticks and the module's
+        // original link semantics (sidebar URL) stay severed.
+        //
+        // Two layers of derived table because MariaDB rejects a self-
+        // referencing subquery in an UPDATE target.
+        $emptyGroupIds = [];
+        foreach (db_all("
+            SELECT m.id FROM modules m
+             WHERE m.is_group = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM modules c WHERE c.parent_id = m.id
+               )
+        ") as $r) {
+            $emptyGroupIds[] = (int)$r['id'];
+        }
+        $autoDemotedIds = [];
+        if ($emptyGroupIds) {
+            // Demote them. We only touch is_group — parent_id and other
+            // fields stay untouched so the row reverts to its original
+            // sidebar-link behaviour.
+            $placeholders = implode(',', array_fill(0, count($emptyGroupIds), '?'));
+            db_exec(
+                "UPDATE modules SET is_group = 0 WHERE id IN ($placeholders)",
+                $emptyGroupIds
+            );
+            $autoDemotedIds = $emptyGroupIds;
+        }
+
         $auditNote = count($changes) . ' module position(s) updated';
         if ($autoGroupedIds) {
             $auditNote .= ' (' . count($autoGroupedIds) . ' parent(s) auto-promoted to group)';
+        }
+        if ($autoDemotedIds) {
+            $auditNote .= ' (' . count($autoDemotedIds) . ' empty group(s) demoted to leaf)';
         }
         db_exec(
             "INSERT INTO audit_log (actor_id, action, details) VALUES (?, 'module.reorder', ?)",
@@ -220,6 +256,7 @@ if ($action === 'reorder') {
         'ok'              => true,
         'count'           => count($changes),
         'auto_grouped'    => array_keys($autoGroupedIds),
+        'auto_demoted'    => $autoDemotedIds,
     ]);
     exit;
 }

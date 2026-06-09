@@ -285,6 +285,28 @@
             if (res.status >= 400 || !data.ok) {
                 throw new Error(data && data.error ? data.error : 'Save failed');
             }
+
+            // If the server auto-promoted a leaf into a group (drag-in)
+            // or auto-demoted an empty group back to a leaf (drag-out
+            // of the last child), the DOM no longer matches reality —
+            // toggle widget, group pill, mod-group class, data-is-group
+            // attribute all need to flip on the affected nodes.
+            // Doing those flips correctly client-side requires recreating
+            // toggle <button> ↔ leaf <span>, which is fiddly. Reloading
+            // is cheap, idempotent, and guarantees consistency. Skipped
+            // when only sort orders changed (the common case) so simple
+            // intra-parent reorders stay snappy.
+            var grouped  = (data.auto_grouped  || []).length;
+            var demoted  = (data.auto_demoted  || []).length;
+            if (grouped || demoted) {
+                var bits = [];
+                if (grouped) bits.push(grouped + ' promoted to group');
+                if (demoted) bits.push(demoted + ' demoted to leaf');
+                setStatus('ok', 'Saved (' + data.count + ' updated; ' + bits.join(', ') + '). Refreshing…');
+                setTimeout(function () { window.location.reload(); }, 600);
+                return;
+            }
+
             applyNewSorts(items);
             setStatus('ok', 'Saved (' + data.count + ' updated). ');
             setTimeout(function () { setStatus('', ''); }, 2500);
