@@ -322,6 +322,100 @@ if ($action === 'assets') {
     exit;
 }
 
+// ── TXN_COUNT ────────────────────────────────────────────────────────────────
+if ($action === 'txn_count') {
+    $stmt = $pdo->query(
+        "SELECT COUNT(*)
+         FROM `transaction` t
+         LEFT JOIN `asset_transaction` att ON att.`transaction_id` = t.`transaction_id`
+         WHERE t.`entity_qtype_id` = 1 AND att.`asset_id` IS NOT NULL"
+    );
+    echo json_encode(array('count' => (int) $stmt->fetchColumn()));
+    exit;
+}
+
+// ── TRANSACTIONS (paginated) ──────────────────────────────────────────────────
+// Mirrors the query in asset_transaction_ssp.php on the old server.
+// Each row exposes every field needed to reconstruct the transaction in MagDyn:
+//   transaction_id      — old PK (embedded in notes for dedup on re-import)
+//   transaction_type_id — 1=Move 2=CheckIn 3=CheckOut 10=Archive 11=Unarchive
+//   asset_id            — old asset PK (matched to assets.asset_tag in MagDyn)
+//   source_location     — locS.short_description
+//   dest_location       — locD.short_description
+//   company_name        — set when the checkout was to a company/vendor
+//   checked_out_user    — set when the checkout was to a user
+//   due_date            — from asset_transaction_checkout (checkout rows only)
+//   at                  — COALESCE(modified_date, creation_date)
+//   notes               — transaction note text
+//   created_by_username — user who created the transaction
+// ─────────────────────────────────────────────────────────────────────────────
+if ($action === 'transactions') {
+    $offset = isset($_GET['offset']) ? (int) $_GET['offset'] : 0;
+    $limit  = isset($_GET['limit'])  ? min((int) $_GET['limit'], 200) : 100;
+
+    $sql = "
+        SELECT
+            t.transaction_id,
+            t.transaction_type_id,
+            att.asset_id,
+            locS.short_description  AS source_location,
+            locD.short_description  AS dest_location,
+            com.short_description   AS company_name,
+            ua1.username            AS checked_out_user,
+            atc.due_date,
+            COALESCE(t.modified_date, t.creation_date) AS at,
+            t.note                  AS notes,
+            ua.username             AS created_by_username
+        FROM `transaction` t
+        LEFT JOIN `asset_transaction` att
+               ON att.`transaction_id`       = t.`transaction_id`
+        LEFT JOIN `asset_transaction_checkout` atc
+               ON atc.`asset_transaction_id` = att.`asset_transaction_id`
+        LEFT JOIN `contact` c
+               ON c.`contact_id`             = atc.`to_contact_id`
+        LEFT JOIN `company` com
+               ON com.`company_id`           = c.`company_id`
+        LEFT JOIN `user_account` ua1
+               ON ua1.`user_account_id`      = atc.`to_user_id`
+        LEFT JOIN `location` locS
+               ON locS.`location_id`         = att.`source_location_id`
+        LEFT JOIN `location` locD
+               ON locD.`location_id`         = att.`destination_location_id`
+        LEFT JOIN `user_account` ua
+               ON ua.`user_account_id`       = t.`created_by`
+        WHERE t.`entity_qtype_id` = 1
+          AND att.`asset_id` IS NOT NULL
+        ORDER BY t.transaction_id ASC
+        LIMIT :lim OFFSET :off
+    ";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $rows = $stmt->fetchAll();
+
+    $output = array();
+    foreach ($rows as $t) {
+        $output[] = array(
+            'transaction_id'      => (int) $t['transaction_id'],
+            'transaction_type_id' => (int) $t['transaction_type_id'],
+            'asset_id'            => (int) $t['asset_id'],
+            'source_location'     => $t['source_location'],
+            'dest_location'       => $t['dest_location'],
+            'company_name'        => $t['company_name'],
+            'checked_out_user'    => $t['checked_out_user'],
+            'due_date'            => $t['due_date'] ? substr($t['due_date'], 0, 10) : null,
+            'at'                  => $t['at']       ? substr($t['at'], 0, 19)       : null,
+            'notes'               => $t['notes'],
+            'created_by_username' => $t['created_by_username'],
+        );
+    }
+
+    echo json_encode(array('transactions' => $output));
+    exit;
+}
+
 // ── Unknown action ────────────────────────────────────────────────────────────
 http_response_code(400);
-echo json_encode(array('error' => 'Unknown action. Supported: count, assets'));
+echo json_encode(array('error' => 'Unknown action. Supported: count, assets, txn_count, transactions'));

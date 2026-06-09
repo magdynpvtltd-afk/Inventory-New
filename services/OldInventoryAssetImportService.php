@@ -59,13 +59,17 @@ class OldInventoryAssetImportService
     /** @var array  Accumulated log entries */
     private array $errors = [];
 
-    /** @var array{total:int,imported:int,updated:int,failed:int,skipped:int} */
+    /** @var array{total:int,imported:int,updated:int,failed:int,skipped:int,txn_total:int,txn_imported:int,txn_failed:int,txn_skipped:int} */
     private array $counts = [
-        'total'    => 0,
-        'imported' => 0,
-        'updated'  => 0,
-        'failed'   => 0,
-        'skipped'  => 0,
+        'total'        => 0,
+        'imported'     => 0,
+        'updated'      => 0,
+        'failed'       => 0,
+        'skipped'      => 0,
+        'txn_total'    => 0,
+        'txn_imported' => 0,
+        'txn_failed'   => 0,
+        'txn_skipped'  => 0,
     ];
 
     public function __construct(int $actorUserId)
@@ -78,15 +82,16 @@ class OldInventoryAssetImportService
     // ----------------------------------------------------------------
 
     /**
-     * Run the full import.
+     * Run the full import — assets first, then transaction history.
      *
-     * @return array{total:int,imported:int,updated:int,failed:int,skipped:int,errors:array}
+     * @return array{total:int,imported:int,updated:int,failed:int,skipped:int,txn_total:int,txn_imported:int,txn_failed:int,txn_skipped:int,errors:array}
      */
     public function run(): array
     {
+        // ── Phase 1: Assets ──────────────────────────────────────────────────
         $countData = old_inventory_api('count');
         $this->counts['total'] = (int) ($countData['count'] ?? 0);
-        $this->log("Starting import — {$this->counts['total']} active assets found in source.");
+        $this->log("Phase 1 — assets: {$this->counts['total']} found in source.");
 
         $offset = 0;
 
@@ -107,12 +112,19 @@ class OldInventoryAssetImportService
         }
 
         $this->log(
-            "Import complete. " .
+            "Assets done — " .
             "Imported: {$this->counts['imported']}, " .
             "Updated: {$this->counts['updated']}, " .
             "Failed: {$this->counts['failed']}, " .
             "Skipped: {$this->counts['skipped']}."
         );
+
+        // ── Phase 2: Transaction history ─────────────────────────────────────
+        try {
+            $this->importTransactions();
+        } catch (\Throwable $e) {
+            $this->log('Transaction import aborted: ' . $e->getMessage(), 'error');
+        }
 
         return array_merge($this->counts, ['errors' => $this->errors]);
     }
@@ -688,6 +700,225 @@ class OldInventoryAssetImportService
              VALUES ('asset', ?, NULL, ?, ?)",
             [$assetId, $bodyHtml, $this->actorId]
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Transaction history import
+    // ----------------------------------------------------------------
+
+    /**
+     * Import the full asset transaction history from the old inventory.
+     *
+     * Type mapping (old transaction_type_id → new txn_type):
+     *   1  Move              → move
+     *   2  Check In + vendor → receive_vendor
+     *   2  Check In + user   → receive_user
+     *   2  Check In (plain)  → move
+     *   3  Check Out + vendor→ send_vendor
+     *   3  Check Out + user  → send_user
+     *   10 Archive           → archive
+     *   11 Unarchive         → restore
+     *
+     * Each imported row is tagged with "[old-txn:<id>]" in the notes
+     * column so re-imports can wipe and re-insert cleanly without
+     * touching transactions created natively in MagDyn.
+     *
+     * The per-asset "old-inventory-import" placeholder checkout
+     * transaction (written by upsertCheckoutTransaction) is also
+     * removed here — the real checkout row from history replaces it.
+     */
+    private function importTransactions(): void
+    {
+        // Remove placeholder checkout transactions created during
+        // Phase 1 (upsertCheckoutTransaction) and any rows left over
+        // from a previous full transaction import.
+        db_exec(
+            "DELETE FROM asset_transactions
+              WHERE notes = 'old-inventory-import'
+                 OR notes LIKE '[old-txn:%'"
+        );
+
+        $countData = old_inventory_api('txn_count');
+        $this->counts['txn_total'] = (int) ($countData['count'] ?? 0);
+        $this->log("Phase 2 — transactions: {$this->counts['txn_total']} found in source.");
+
+        $offset = 0;
+
+        while (true) {
+            $data  = old_inventory_api('transactions', ['offset' => $offset, 'limit' => self::BATCH_SIZE]);
+            $batch = $data['transactions'] ?? [];
+
+            if (empty($batch)) {
+                break;
+            }
+
+            foreach ($batch as $row) {
+                try {
+                    $outcome = $this->importOneTransaction($row);
+                    if ($outcome === 'skipped') {
+                        $this->counts['txn_skipped']++;
+                    } else {
+                        $this->counts['txn_imported']++;
+                    }
+                } catch (\Throwable $e) {
+                    $this->counts['txn_failed']++;
+                    $this->log(
+                        "Txn {$row['transaction_id']} failed: " . $e->getMessage(),
+                        'error'
+                    );
+                }
+            }
+
+            $offset += self::BATCH_SIZE;
+
+            if (count($batch) < self::BATCH_SIZE) {
+                break;
+            }
+        }
+
+        $this->log(
+            "Transactions done — " .
+            "Imported: {$this->counts['txn_imported']}, " .
+            "Failed: {$this->counts['txn_failed']}, " .
+            "Skipped: {$this->counts['txn_skipped']}."
+        );
+    }
+
+    /**
+     * Import a single transaction row from the old inventory into
+     * asset_transactions.  Returns 'imported' or 'skipped'.
+     */
+    private function importOneTransaction(array $row): string
+    {
+        $oldTxnId   = (int) $row['transaction_id'];
+        $oldAssetId = (string) $row['asset_id'];
+        $typeId     = (int) $row['transaction_type_id'];
+        $company    = trim((string) ($row['company_name']     ?? ''));
+        $user       = trim((string) ($row['checked_out_user'] ?? ''));
+
+        // Resolve new asset ID (old asset_id stored as asset_tag)
+        $asset = db_one(
+            'SELECT id FROM assets WHERE asset_tag = ? LIMIT 1',
+            [$oldAssetId]
+        );
+        if (!$asset) {
+            $this->log(
+                "Skipped txn {$oldTxnId}: asset_id={$oldAssetId} not in MagDyn.",
+                'warn'
+            );
+            return 'skipped';
+        }
+        $newAssetId = (int) $asset['id'];
+
+        // Map transaction type
+        switch ($typeId) {
+            case 1:   // Move
+                $txnType = 'move';
+                break;
+            case 2:   // Check In
+                if ($company !== '')    $txnType = 'receive_vendor';
+                elseif ($user !== '')   $txnType = 'receive_user';
+                else                    $txnType = 'move';
+                break;
+            case 3:   // Check Out
+                if ($company !== '')    $txnType = 'send_vendor';
+                elseif ($user !== '')   $txnType = 'send_user';
+                else                    $txnType = 'send_vendor'; // fallback
+                break;
+            case 10:  // Archive
+                $txnType = 'archive';
+                break;
+            case 11:  // Unarchive
+                $txnType = 'restore';
+                break;
+            default:
+                $this->log("Skipped txn {$oldTxnId}: unknown type_id={$typeId}.", 'warn');
+                return 'skipped';
+        }
+
+        // Resolve locations — 'Checked Out' is a virtual old-system
+        // location; it has no MagDyn equivalent so we leave it NULL.
+        $fromLocId = $this->resolveLocationOrNull((string) ($row['source_location'] ?? ''));
+        $toLocId   = $this->resolveLocationOrNull((string) ($row['dest_location']   ?? ''));
+
+        // Resolve vendor / user for the four checkout/receive types
+        $toVendorId   = null;
+        $toUserId     = null;
+        $fromVendorId = null;
+        $fromUserId   = null;
+
+        if ($txnType === 'send_vendor'    && $company !== '') $toVendorId   = $this->resolveVendor($company);
+        if ($txnType === 'send_user'      && $user   !== '') $toUserId     = $this->resolveUser($user);
+        if ($txnType === 'receive_vendor' && $company !== '') $fromVendorId = $this->resolveVendor($company);
+        if ($txnType === 'receive_user'   && $user   !== '') $fromUserId   = $this->resolveUser($user);
+
+        // Actor: match old username to MagDyn user; fall back to import actor
+        $actorId = $this->resolveActorUser((string) ($row['created_by_username'] ?? ''));
+
+        // Timestamp
+        $at = !empty($row['at']) ? (string) $row['at'] : date('Y-m-d H:i:s');
+
+        // Notes — embed old transaction_id as dedup marker; preserve original text
+        $origNote = trim((string) ($row['notes'] ?? ''));
+        $note     = "[old-txn:{$oldTxnId}]" . ($origNote !== '' ? ' ' . $origNote : '');
+        $note     = substr($note, 0, 500);
+
+        // Due date (only meaningful for checkout rows)
+        $dueDate = !empty($row['due_date']) ? (string) $row['due_date'] : null;
+
+        db_exec(
+            "INSERT INTO asset_transactions
+                (asset_id, txn_type,
+                 from_location_id, to_location_id,
+                 from_vendor_id,   to_vendor_id,
+                 from_user_id,     to_user_id,
+                 due_date, actor_id, at, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                $newAssetId, $txnType,
+                $fromLocId,    $toLocId,
+                $fromVendorId, $toVendorId,
+                $fromUserId,   $toUserId,
+                $dueDate, $actorId, $at, $note,
+            ]
+        );
+
+        return 'imported';
+    }
+
+    /**
+     * Resolve a location name for use in transaction history.
+     * Returns null (not the Magdyn fallback) for unmatched or virtual
+     * names like "Checked Out" — those carry no physical meaning in MagDyn.
+     */
+    private function resolveLocationOrNull(string $oldName): ?int
+    {
+        $name = trim($oldName);
+
+        // Virtual old-system location — no MagDyn equivalent
+        if ($name === '' || strtolower($name) === 'checked out') {
+            return null;
+        }
+
+        $row = db_one(
+            'SELECT id FROM locations
+              WHERE is_active = 1
+                AND (LOWER(name) = LOWER(?) OR LOWER(code) = LOWER(?))
+              LIMIT 1',
+            [$name, $name]
+        );
+
+        return $row ? (int) $row['id'] : null;
+    }
+
+    /**
+     * Resolve an old-system username to a MagDyn user ID.
+     * Falls back to the import actor if no match (never returns null).
+     */
+    private function resolveActorUser(string $username): int
+    {
+        $uid = $this->resolveUser(trim($username));
+        return $uid ?? $this->actorId;
     }
 
     // ----------------------------------------------------------------

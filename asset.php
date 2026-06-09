@@ -3382,16 +3382,35 @@ if ($action === 'import_old_run'):
     <?php else: ?>
 
         <!-- Summary cards -->
-        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+        <h3 style="margin:0 0 8px;">Assets</h3>
+        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px;">
             <?php
-            $cards = [
+            $assetCards = [
                 ['Total Found',        $result['total'],    '#f3f4f6', '#374151'],
                 ['Imported (new)',      $result['imported'], '#d1fae5', '#065f46'],
                 ['Updated (existing)', $result['updated'],  '#dbeafe', '#1e40af'],
                 ['Failed',             $result['failed'],   '#fee2e2', '#991b1b'],
                 ['Skipped',            $result['skipped'],  '#fef9c3', '#854d0e'],
             ];
-            foreach ($cards as [$label, $val, $bg, $color]): ?>
+            foreach ($assetCards as [$label, $val, $bg, $color]): ?>
+            <div style="background:<?= $bg ?>; color:<?= $color ?>; border-radius:8px;
+                        padding:12px 20px; min-width:120px; text-align:center;">
+                <div style="font-size:28px; font-weight:700;"><?= number_format((int)$val) ?></div>
+                <div style="font-size:12px;"><?= h($label) ?></div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <h3 style="margin:0 0 8px;">Transaction History</h3>
+        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+            <?php
+            $txnCards = [
+                ['Txn Found',    $result['txn_total'],    '#f3f4f6', '#374151'],
+                ['Txn Imported', $result['txn_imported'], '#d1fae5', '#065f46'],
+                ['Txn Failed',   $result['txn_failed'],   '#fee2e2', '#991b1b'],
+                ['Txn Skipped',  $result['txn_skipped'],  '#fef9c3', '#854d0e'],
+            ];
+            foreach ($txnCards as [$label, $val, $bg, $color]): ?>
             <div style="background:<?= $bg ?>; color:<?= $color ?>; border-radius:8px;
                         padding:12px 20px; min-width:120px; text-align:center;">
                 <div style="font-size:28px; font-weight:700;"><?= number_format((int)$val) ?></div>
