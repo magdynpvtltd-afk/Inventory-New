@@ -59,17 +59,19 @@ class OldInventoryAssetImportService
     /** @var array  Accumulated log entries */
     private array $errors = [];
 
-    /** @var array{total:int,imported:int,updated:int,failed:int,skipped:int,txn_total:int,txn_imported:int,txn_failed:int,txn_skipped:int} */
+    /** @var array */
     private array $counts = [
-        'total'        => 0,
-        'imported'     => 0,
-        'updated'      => 0,
-        'failed'       => 0,
-        'skipped'      => 0,
-        'txn_total'    => 0,
-        'txn_imported' => 0,
-        'txn_failed'   => 0,
-        'txn_skipped'  => 0,
+        'model_total'   => 0,
+        'model_created' => 0,
+        'total'         => 0,
+        'imported'      => 0,
+        'updated'       => 0,
+        'failed'        => 0,
+        'skipped'       => 0,
+        'txn_total'     => 0,
+        'txn_imported'  => 0,
+        'txn_failed'    => 0,
+        'txn_skipped'   => 0,
     ];
 
     public function __construct(int $actorUserId)
@@ -88,6 +90,15 @@ class OldInventoryAssetImportService
      */
     public function run(): array
     {
+        // ── Phase 0: Models ──────────────────────────────────────────────────
+        // Import ALL models first so every asset (even those whose model
+        // would otherwise be missing) resolves correctly in Phase 1.
+        try {
+            $this->importModels();
+        } catch (\Throwable $e) {
+            $this->log('Model import aborted: ' . $e->getMessage(), 'error');
+        }
+
         // ── Phase 1: Assets ──────────────────────────────────────────────────
         $countData = old_inventory_api('count');
         $this->counts['total'] = (int) ($countData['count'] ?? 0);
@@ -699,6 +710,62 @@ class OldInventoryAssetImportService
                 (entity_type, entity_id, note_type_id, body_html, author_id)
              VALUES ('asset', ?, NULL, ?, ?)",
             [$assetId, $bodyHtml, $this->actorId]
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Model import (Phase 0)
+    // ----------------------------------------------------------------
+
+    /**
+     * Import every model from the old inventory independently of assets.
+     * This guarantees all 511 (or however many) models exist in MagDyn
+     * before Phase 1 runs, so no asset is silently skipped due to a
+     * missing model.
+     *
+     * Uses the existing resolveModel() cache so Phase 1 never re-creates
+     * models that were just imported here.
+     */
+    private function importModels(): void
+    {
+        $countData = old_inventory_api('model_count');
+        $this->counts['model_total'] = (int) ($countData['count'] ?? 0);
+        $this->log("Phase 0 — models: {$this->counts['model_total']} found in source.");
+
+        // Snapshot the current model count so we can report net-new creates
+        $beforeCount = (int) db_val('SELECT COUNT(*) FROM asset_models', [], 0);
+
+        $offset = 0;
+
+        while (true) {
+            $data  = old_inventory_api('models', ['offset' => $offset, 'limit' => self::BATCH_SIZE]);
+            $batch = $data['models'] ?? [];
+
+            if (empty($batch)) {
+                break;
+            }
+
+            foreach ($batch as $row) {
+                try {
+                    $this->resolveModel($row);
+                } catch (\Throwable $e) {
+                    $code = $row['asset_model_code'] ?? '?';
+                    $this->log("Model '{$code}' failed: " . $e->getMessage(), 'error');
+                }
+            }
+
+            $offset += self::BATCH_SIZE;
+
+            if (count($batch) < self::BATCH_SIZE) {
+                break;
+            }
+        }
+
+        $afterCount = (int) db_val('SELECT COUNT(*) FROM asset_models', [], 0);
+        $this->counts['model_created'] = max(0, $afterCount - $beforeCount);
+        $this->log(
+            "Models done — {$this->counts['model_created']} created, " .
+            ($this->counts['model_total'] - $this->counts['model_created']) . " already existed."
         );
     }
 

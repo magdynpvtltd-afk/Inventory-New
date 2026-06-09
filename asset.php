@@ -3382,6 +3382,23 @@ if ($action === 'import_old_run'):
     <?php else: ?>
 
         <!-- Summary cards -->
+        <h3 style="margin:0 0 8px;">Models</h3>
+        <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px;">
+            <?php
+            $modelCards = [
+                ['Models Found',   $result['model_total'],   '#f3f4f6', '#374151'],
+                ['Models Created', $result['model_created'], '#d1fae5', '#065f46'],
+                ['Already Existed', max(0, (int)$result['model_total'] - (int)$result['model_created']), '#dbeafe', '#1e40af'],
+            ];
+            foreach ($modelCards as [$label, $val, $bg, $color]): ?>
+            <div style="background:<?= $bg ?>; color:<?= $color ?>; border-radius:8px;
+                        padding:12px 20px; min-width:120px; text-align:center;">
+                <div style="font-size:28px; font-weight:700;"><?= number_format((int)$val) ?></div>
+                <div style="font-size:12px;"><?= h($label) ?></div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
         <h3 style="margin:0 0 8px;">Assets</h3>
         <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px;">
             <?php

@@ -93,6 +93,7 @@ if ($action === 'assets') {
         LEFT JOIN asset_custom_field_helper acfh
                ON acfh.asset_id     = a.asset_id
         WHERE a.asset_id IS NOT NULL AND TRIM(a.asset_id) != ''
+        GROUP BY a.asset_id
         ORDER BY a.asset_id
         LIMIT :lim OFFSET :off
     ";
@@ -322,6 +323,58 @@ if ($action === 'assets') {
     exit;
 }
 
+// ── MODEL_COUNT ───────────────────────────────────────────────────────────────
+if ($action === 'model_count') {
+    $stmt = $pdo->query(
+        "SELECT COUNT(*) FROM asset_model
+          WHERE asset_model_code IS NOT NULL
+            AND TRIM(asset_model_code) != ''"
+    );
+    echo json_encode(array('count' => (int) $stmt->fetchColumn()));
+    exit;
+}
+
+// ── MODELS (paginated) ────────────────────────────────────────────────────────
+// Exports every model record so MagDyn can import models independently of
+// whether any asset references them.  Field names match what resolveModel()
+// expects: asset_model_code, model_name, category_name.
+if ($action === 'models') {
+    $offset = isset($_GET['offset']) ? (int) $_GET['offset'] : 0;
+    $limit  = isset($_GET['limit'])  ? min((int) $_GET['limit'], 200) : 100;
+
+    $sql = "
+        SELECT
+            am.asset_model_id,
+            am.asset_model_code,
+            am.short_description  AS model_name,
+            cat.short_description AS category_name
+        FROM asset_model am
+        LEFT JOIN category cat ON cat.category_id = am.category_id
+        WHERE am.asset_model_code IS NOT NULL
+          AND TRIM(am.asset_model_code) != ''
+        ORDER BY am.asset_model_id ASC
+        LIMIT :lim OFFSET :off
+    ";
+    $stmt = $pdo->prepare($sql);
+    $stmt->bindValue(':lim', $limit,  PDO::PARAM_INT);
+    $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $rows = $stmt->fetchAll();
+
+    $output = array();
+    foreach ($rows as $m) {
+        $output[] = array(
+            'asset_model_id'   => (int) $m['asset_model_id'],
+            'asset_model_code' => $m['asset_model_code'],
+            'model_name'       => $m['model_name'],
+            'category_name'    => $m['category_name'],
+        );
+    }
+
+    echo json_encode(array('models' => $output));
+    exit;
+}
+
 // ── TXN_COUNT ────────────────────────────────────────────────────────────────
 if ($action === 'txn_count') {
     $stmt = $pdo->query(
@@ -418,4 +471,4 @@ if ($action === 'transactions') {
 
 // ── Unknown action ────────────────────────────────────────────────────────────
 http_response_code(400);
-echo json_encode(array('error' => 'Unknown action. Supported: count, assets, txn_count, transactions'));
+echo json_encode(array('error' => 'Unknown action. Supported: count, assets, model_count, models, txn_count, transactions'));
