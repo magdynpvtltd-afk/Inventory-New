@@ -324,12 +324,11 @@ if ($action === 'assets') {
 }
 
 // ── MODEL_COUNT ───────────────────────────────────────────────────────────────
+// Count ALL asset_model rows — no code filter.  Models with NULL/empty
+// asset_model_code are handled in resolveModel() (falls back to name, then
+// 'MODEL-<id>'), so they must be counted and exported too.
 if ($action === 'model_count') {
-    $stmt = $pdo->query(
-        "SELECT COUNT(*) FROM asset_model
-          WHERE asset_model_code IS NOT NULL
-            AND TRIM(asset_model_code) != ''"
-    );
+    $stmt = $pdo->query("SELECT COUNT(*) FROM asset_model");
     echo json_encode(array('count' => (int) $stmt->fetchColumn()));
     exit;
 }
@@ -338,6 +337,7 @@ if ($action === 'model_count') {
 // Exports every model record so MagDyn can import models independently of
 // whether any asset references them.  Field names match what resolveModel()
 // expects: asset_model_code, model_name, category_name.
+// No WHERE filter — models with blank/null codes are imported too.
 if ($action === 'models') {
     $offset = isset($_GET['offset']) ? (int) $_GET['offset'] : 0;
     $limit  = isset($_GET['limit'])  ? min((int) $_GET['limit'], 200) : 100;
@@ -350,8 +350,6 @@ if ($action === 'models') {
             cat.short_description AS category_name
         FROM asset_model am
         LEFT JOIN category cat ON cat.category_id = am.category_id
-        WHERE am.asset_model_code IS NOT NULL
-          AND TRIM(am.asset_model_code) != ''
         ORDER BY am.asset_model_id ASC
         LIMIT :lim OFFSET :off
     ";
@@ -376,9 +374,14 @@ if ($action === 'models') {
 }
 
 // ── TXN_COUNT ────────────────────────────────────────────────────────────────
+// Count is done over DISTINCT asset_transaction_id values so it matches
+// the paginated list query which uses GROUP BY att.asset_transaction_id
+// to collapse duplicate rows created when asset_transaction_checkout has
+// more than one row for the same asset_transaction (same duplication root
+// cause as the asset list's asset_custom_field_helper issue).
 if ($action === 'txn_count') {
     $stmt = $pdo->query(
-        "SELECT COUNT(*)
+        "SELECT COUNT(DISTINCT att.asset_transaction_id)
          FROM `transaction` t
          LEFT JOIN `asset_transaction` att ON att.`transaction_id` = t.`transaction_id`
          WHERE t.`entity_qtype_id` = 1 AND att.`asset_id` IS NOT NULL"
@@ -409,6 +412,7 @@ if ($action === 'transactions') {
     $sql = "
         SELECT
             t.transaction_id,
+            att.asset_transaction_id,
             t.transaction_type_id,
             att.asset_id,
             locS.short_description  AS source_location,
@@ -438,7 +442,8 @@ if ($action === 'transactions') {
                ON ua.`user_account_id`       = t.`created_by`
         WHERE t.`entity_qtype_id` = 1
           AND att.`asset_id` IS NOT NULL
-        ORDER BY t.transaction_id ASC
+        GROUP BY att.`asset_transaction_id`
+        ORDER BY t.transaction_id ASC, att.`asset_transaction_id` ASC
         LIMIT :lim OFFSET :off
     ";
 
@@ -451,9 +456,10 @@ if ($action === 'transactions') {
     $output = array();
     foreach ($rows as $t) {
         $output[] = array(
-            'transaction_id'      => (int) $t['transaction_id'],
-            'transaction_type_id' => (int) $t['transaction_type_id'],
-            'asset_id'            => (int) $t['asset_id'],
+            'transaction_id'        => (int) $t['transaction_id'],
+            'asset_transaction_id'  => (int) $t['asset_transaction_id'],
+            'transaction_type_id'   => (int) $t['transaction_type_id'],
+            'asset_id'              => (int) $t['asset_id'],
             'source_location'     => $t['source_location'],
             'dest_location'       => $t['dest_location'],
             'company_name'        => $t['company_name'],

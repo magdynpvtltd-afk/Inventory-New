@@ -53,6 +53,9 @@ class OldInventoryAssetImportService
     /** @var array<string,int|null>  username → users.id cache (null = no match) */
     private array $userCache = [];
 
+    /** @var array<int,bool>  old asset_transaction_id values imported this run (dedup guard) */
+    private array $importedAtxnIds = [];
+
     /** @var int  Magdyn location ID — fallback when old-system name has no match */
     private int $defaultLocationId = 0;
 
@@ -298,9 +301,17 @@ class OldInventoryAssetImportService
         $name     = trim((string) ($row['model_name']       ?? ''));
         $category = trim((string) ($row['category_name']    ?? ''));
 
-        // Use model name as fallback code when code is blank
+        // Use model name as fallback code when code is blank.
+        // If both are blank, use 'MODEL-<old_id>' so each null-code model
+        // gets a unique, stable identifier instead of all collapsing to
+        // the same 'UNKNOWN' entry.
         if ($code === '') {
-            $code = $name !== '' ? $name : 'UNKNOWN';
+            if ($name !== '') {
+                $code = $name;
+            } else {
+                $oldId = isset($row['asset_model_id']) ? (int) $row['asset_model_id'] : 0;
+                $code  = $oldId > 0 ? 'MODEL-' . $oldId : 'UNKNOWN';
+            }
         }
         if ($name === '') {
             $name = $code;
@@ -858,7 +869,19 @@ class OldInventoryAssetImportService
     private function importOneTransaction(array $row): string
     {
         $oldTxnId   = (int) $row['transaction_id'];
+        $oldAtxnId  = (int) ($row['asset_transaction_id'] ?? 0);
         $oldAssetId = (string) $row['asset_id'];
+
+        // Dedup guard: GROUP BY in the API prevents duplicates at source,
+        // but defensively skip if the same asset_transaction_id has already
+        // been imported this run (e.g. if an older API version is deployed).
+        if ($oldAtxnId > 0) {
+            if (isset($this->importedAtxnIds[$oldAtxnId])) {
+                $this->log("Skipped duplicate asset_transaction_id={$oldAtxnId} (txn {$oldTxnId}).", 'warn');
+                return 'skipped';
+            }
+            $this->importedAtxnIds[$oldAtxnId] = true;
+        }
         $typeId     = (int) $row['transaction_type_id'];
         $company    = trim((string) ($row['company_name']     ?? ''));
         $user       = trim((string) ($row['checked_out_user'] ?? ''));
