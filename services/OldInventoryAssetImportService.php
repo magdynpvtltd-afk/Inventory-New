@@ -9,9 +9,11 @@
  * Field mapping (old → new):
  *   asset.asset_id               → assets.asset_tag       (upsert key)
  *   asset.asset_code             → assets.asset_name      (individual asset name)
- *   asset_model.asset_model_code → asset_models.code      (created if missing)
+ *   asset_model.asset_model_code → asset_models.code         (created if missing)
+ *   asset_model.asset_model_code → asset_models.model_number (raw model number from old system)
  *   asset_model.short_description→ asset_models.name
  *   category.short_description   → asset_models.category
+ *   manufacturer.short_description→asset_models.manufacturer
  *   location.short_description   → locations.name         (matched by name)
  *   checkout_due  (API field)    → assets.checkout_due_on (most recent)
  *   checked_out_flag (API field) → status: 0=active, 1+company=with_vendor, 1+no company=with_user
@@ -190,7 +192,6 @@ class OldInventoryAssetImportService
             // would create spurious location records in MagDyn.
             $locationId  = $this->resolveLocation((string) ($row['internal_location'] ?? ''));
             $nextCalDue  = $this->parseOldDate((string) ($row['next_cal_due'] ?? ''));
-            $dueBack     = $this->parseOldDate((string) ($row['due_back']     ?? ''));
             $assetName      = trim((string) ($row['asset_code'] ?? '')) ?: null;
             $companyName    = $row['company_name']   ?? null;
             $checkedOutFlag = (int) ($row['checked_out_flag'] ?? 0); // 1 = currently checked out
@@ -274,9 +275,6 @@ class OldInventoryAssetImportService
                 );
             }
 
-            // Notes come pre-fetched from API
-            $this->migrateNotes($row['notes'] ?? [], $newAssetId, $dueBack);
-
         } catch (Throwable $e) {
             $this->counts['failed']++;
             $this->log(
@@ -297,9 +295,12 @@ class OldInventoryAssetImportService
      */
     private function resolveModel(array $row): int
     {
-        $code     = trim((string) ($row['asset_model_code'] ?? ''));
-        $name     = trim((string) ($row['model_name']       ?? ''));
-        $category = trim((string) ($row['category_name']    ?? ''));
+        $code         = trim((string) ($row['asset_model_code']  ?? ''));
+        $name         = trim((string) ($row['model_name']        ?? ''));
+        $category     = trim((string) ($row['category_name']     ?? ''));
+        $manufacturer = trim((string) ($row['manufacturer_name'] ?? ''));
+        // model_number maps directly to asset_model_code from the old system
+        $modelNumber  = trim((string) ($row['asset_model_code']  ?? ''));
 
         // Use model name as fallback code when code is blank.
         // If both are blank, use 'MODEL-<old_id>' so each null-code model
@@ -331,6 +332,20 @@ class OldInventoryAssetImportService
             [substr($code, 0, 40)]
         );
         if ($existing) {
+            // Update manufacturer / model_number if they are now available
+            // (Phase 0 may have created the record without these when the
+            //  API did not yet return them)
+            db_exec(
+                'UPDATE asset_models
+                 SET manufacturer = COALESCE(NULLIF(?, \'\'), manufacturer),
+                     model_number  = COALESCE(NULLIF(?, \'\'), model_number)
+                 WHERE id = ?',
+                [
+                    $manufacturer ?: null,
+                    $modelNumber  ?: null,
+                    (int) $existing['id'],
+                ]
+            );
             return $this->modelCache[$cacheKey] = (int) $existing['id'];
         }
 
@@ -341,6 +356,17 @@ class OldInventoryAssetImportService
             [$name]
         );
         if ($existing) {
+            db_exec(
+                'UPDATE asset_models
+                 SET manufacturer = COALESCE(NULLIF(?, \'\'), manufacturer),
+                     model_number  = COALESCE(NULLIF(?, \'\'), model_number)
+                 WHERE id = ?',
+                [
+                    $manufacturer ?: null,
+                    $modelNumber  ?: null,
+                    (int) $existing['id'],
+                ]
+            );
             return $this->modelCache[$cacheKey] = (int) $existing['id'];
         }
 
@@ -355,9 +381,15 @@ class OldInventoryAssetImportService
         }
 
         db_exec(
-            'INSERT INTO asset_models (code, name, category, is_active)
-             VALUES (?, ?, ?, 1)',
-            [$dbCode, $name, $category ?: null]
+            'INSERT INTO asset_models (code, name, category, manufacturer, model_number, is_active)
+             VALUES (?, ?, ?, ?, ?, 1)',
+            [
+                $dbCode,
+                $name,
+                $category     ?: null,
+                $manufacturer ?: null,
+                $modelNumber  ?: null,
+            ]
         );
 
         $id = (int) db_val('SELECT LAST_INSERT_ID()', [], 0);

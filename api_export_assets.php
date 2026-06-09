@@ -333,10 +333,28 @@ if ($action === 'model_count') {
     exit;
 }
 
+// ── SCHEMA_CHECK (debug — remove after confirming manufacturer join) ──────────
+if ($action === 'schema_check') {
+    $cols = array();
+    foreach ($pdo->query("SHOW COLUMNS FROM asset_model")->fetchAll() as $c) {
+        $cols[] = $c['Field'];
+    }
+    $mfr = array();
+    try {
+        foreach ($pdo->query("SHOW COLUMNS FROM manufacturer")->fetchAll() as $c) {
+            $mfr[] = $c['Field'];
+        }
+    } catch (Exception $e) {
+        $mfr = array('error' => $e->getMessage());
+    }
+    echo json_encode(array('asset_model_cols' => $cols, 'manufacturer_cols' => $mfr));
+    exit;
+}
+
 // ── MODELS (paginated) ────────────────────────────────────────────────────────
 // Exports every model record so MagDyn can import models independently of
 // whether any asset references them.  Field names match what resolveModel()
-// expects: asset_model_code, model_name, category_name.
+// expects: asset_model_code, model_name, category_name, manufacturer, model_number.
 // No WHERE filter — models with blank/null codes are imported too.
 if ($action === 'models') {
     $offset = isset($_GET['offset']) ? (int) $_GET['offset'] : 0;
@@ -347,9 +365,11 @@ if ($action === 'models') {
             am.asset_model_id,
             am.asset_model_code,
             am.short_description  AS model_name,
-            cat.short_description AS category_name
+            cat.short_description AS category_name,
+            mfr.short_description AS manufacturer_name
         FROM asset_model am
-        LEFT JOIN category cat ON cat.category_id = am.category_id
+        LEFT JOIN category cat         ON cat.category_id     = am.category_id
+        LEFT JOIN manufacturer mfr     ON mfr.manufacturer_id = am.manufacturer_id
         ORDER BY am.asset_model_id ASC
         LIMIT :lim OFFSET :off
     ";
@@ -366,6 +386,7 @@ if ($action === 'models') {
             'asset_model_code' => $m['asset_model_code'],
             'model_name'       => $m['model_name'],
             'category_name'    => $m['category_name'],
+            'manufacturer_name'=> $m['manufacturer_name'],
         );
     }
 
