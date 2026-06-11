@@ -729,6 +729,8 @@ body.spa-loading::after {
     align-items: center;
     gap: 6px;
     padding: 8px 14px 0;
+    height: fit-content;
+    max-height: 8vh;
     background: var(--surface);
     /* Single row — scroll horizontally if there are more tabs than fit,
        rather than wrapping onto a second line. */

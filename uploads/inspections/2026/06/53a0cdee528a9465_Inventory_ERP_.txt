@@ -1,0 +1,83 @@
+Inventory(View Inventory):
+=========================
+change the name view inventory into full inventory.
+
+Add inventory code column in the view inventory.
+
+remove the stock column.
+
+Add the  division and qty column and options . 
+
+Set this as a dropdown menu. When the user clicks or hovers over it, the following options should be displayed: Process, Ship, Receive, Product Hierarchy, and Notes." 
+
+Add The CSV , Copy , Clear button.
+
+
+view inventory/+New item: (create inventory)
+============================================
+Add the following text fields
+Long Description, I_Tree Child ,Priority.
+
+change the name newitem into the create inventory.
+
+Inventory/view BOMs:
+===================
+
+The names in the header section are not visible properly. Please align them correctly.
+
+"When clicking the Options menu in BOMs, the following sections should be available in the dropdown:"
+
+Ship
+Receive
+Move
+Take Out
+Product Hierarchy
+MIR
+Part Report
+IBOM
+DWG
+Inspection Report
+Master Data
+Ship Receipt Report
+Notes
+Empty Report
+
+Inventory/ Shipment list(ship and receipt):
+===========================================
+
+Add the Trans ID column , and  ship/DueDt(CrtDT) , company/ vendor, product , PONO, qty , LOcation , and option column. 
+
+Add an Options column. When the user clicks or hovers over the Options button, the following actions should be displayed in a dropdown menu:
+Edit Receipt
+Delete Receipt
+Invoice
+No Invoice
+Notes
+Attachments
+
+Add a csv , copy , and clear button. 
+
+Inventory/ship list/+ New Shipment (create ship and receipt):
+=============================================================
+
+Inventory to Ship , Inventory to Receive text field and  Table as per the old inventory.
+
+
+
+Inventory/ Transaction history ( inventory transaction report):
+===============================================================
+
+Add a Type column , ID, PONO , Product , and Notes column.
+Add a csv , copy, clear, buttons.
+
+
+
+
+Inventory dropdown:
+===================
+The following options are missing from the Inventory dropdown menu:
+
+Finished Goods Inventory, Finished goods operation, 
+daily jobs , restock inventory custom , pre Transaction pending , pre Transaction, report .
+
+ 

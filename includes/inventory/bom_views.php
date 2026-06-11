@@ -1383,6 +1383,8 @@ if ($action === 'bom_grid') {
             <h2 class="dt-toolbar-title bom-actions-title">BOM tree</h2>
             <div class="dt-toolbar-right">
                 <?php if ($canCreateBoms || $canManageBoms): ?>
+                    <a class="btn btn-sm btn-ghost" href="<?= h(url('/bom_old_import.php')) ?>"
+                       title="Auto-fetch all BOM trees from old inventory server and import">⬇ Import from Old System</a>
                     <button type="button" class="btn btn-sm btn-ghost"
                             data-open-import="bom-import-modal"
                             title="Import BOM lines from CSV">⤒ Import BOM CSV</button>

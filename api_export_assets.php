@@ -12,9 +12,12 @@
  *
  *   ?action=assets&offset=0&limit=100&token=SECRET
  *       Returns: {"assets": [...]}
- *       Each asset includes: asset_id, asset_code, asset_model_code,
- *       model_name, category_name, location_name, due_back (cfv_22),
- *       next_cal_due (cfv_23), checkout_due, notes[] with attachments[].
+ *       Each asset includes: asset_id, parent_asset_id, asset_model_id,
+ *       asset_code, archived_flag, asset_model_code,
+ *       model_name, category_name, manufacturer_name, location_name, asset_notes (cfv_2),
+ *       a_price (cfv_3), cal_done_on (cfv_22), next_cal_due (cfv_23),
+ *       cal_frequency (cfv_51), engraved (cfv_54), calibration (cfv_55),
+ *       checked_ok (cfv_56), checkout_due, notes[] with attachments[].
  *
  * PHP 5.6 compatible — no null coalescing, no return types, no scalar hints.
  */
@@ -75,19 +78,31 @@ if ($action === 'assets') {
     $sql = "
         SELECT
             a.asset_id,
+            a.parent_asset_id,
+            a.asset_model_id,
             a.asset_code,
             a.checked_out_flag,
+            (a.archived_flag + 0) AS archived_flag,
             am.asset_model_code,
             am.short_description  AS model_name,
             cat.short_description AS category_name,
+            mfr.short_description AS manufacturer_name,
             loc.short_description AS internal_location,
-            acfh.cfv_22           AS due_back,
-            acfh.cfv_23           AS next_cal_due
+            acfh.cfv_2            AS asset_notes,    -- custom_field 2  = Notes
+            acfh.cfv_3            AS a_price,         -- custom_field 3  = A_Price
+            acfh.cfv_22           AS cal_done_on,     -- custom_field 22 = Calibration Done On
+            acfh.cfv_23           AS next_cal_due,    -- custom_field 23 = Next Cal Due on
+            acfh.cfv_51           AS cal_frequency,   -- custom_field 51 = Calibration Frequency
+            acfh.cfv_54           AS engraved,        -- custom_field 54 = Engraved
+            acfh.cfv_55           AS calibration,     -- custom_field 55 = Calibration (Calib/AMC)
+            acfh.cfv_56           AS checked_ok       -- custom_field 56 = Checked OK
         FROM asset a
         LEFT JOIN asset_model am
                ON am.asset_model_id = a.asset_model_id
         LEFT JOIN category cat
                ON cat.category_id   = am.category_id
+        LEFT JOIN manufacturer mfr
+               ON mfr.manufacturer_id = am.manufacturer_id
         LEFT JOIN location loc
                ON loc.location_id   = a.location_id
         LEFT JOIN asset_custom_field_helper acfh
@@ -302,17 +317,35 @@ if ($action === 'assets') {
 
         $output[] = array(
             'asset_id'           => $aid,
+            // Old asset.parent_asset_id — points to another asset_id in the old
+            // system. Resolved to the new assets.parent_asset_id during import.
+            'parent_asset_id'    => ($a['parent_asset_id'] !== null) ? (int) $a['parent_asset_id'] : null,
+            // Old asset_model_id — used as the new model Code (stable join key).
+            'asset_model_id'     => ($a['asset_model_id'] !== null) ? (int) $a['asset_model_id'] : null,
             'asset_code'         => $a['asset_code'],
             'checked_out_flag'   => (int) $a['checked_out_flag'],  // 1 = currently checked out
+            'archived_flag'      => (int) $a['archived_flag'],     // 1 = archived in old system
             'asset_model_code'   => $a['asset_model_code'],
             'model_name'         => $a['model_name'],
             'category_name'      => $a['category_name'],
+            'manufacturer_name'  => $a['manufacturer_name'],
             'location_name'      => $effectiveLocation,    // vendor/user name or internal location
             'internal_location'  => $a['internal_location'], // always the physical base location
             'company_name'       => $companyName,           // set only when checked out to a company
             'checked_out_user'   => $checkedOutUser,        // username when checked out to a user
-            'due_back'           => $a['due_back'],
+            // Custom-field values (asset_custom_field_helper). Select-type
+            // fields (cal_frequency / engraved / calibration / checked_ok)
+            // store their option text directly in the helper, so no join to
+            // custom_field_value is needed — the cfv_N column already holds
+            // the human-readable value.
+            'asset_notes'        => $a['asset_notes'],
+            'a_price'            => $a['a_price'],
+            'cal_done_on'        => $a['cal_done_on'],
             'next_cal_due'       => $a['next_cal_due'],
+            'cal_frequency'      => $a['cal_frequency'],
+            'engraved'           => $a['engraved'],
+            'calibration'        => $a['calibration'],
+            'checked_ok'         => $a['checked_ok'],
             'checkout_due'       => isset($checkouts[$aid])   ? $checkouts[$aid]   : null,
             'issued_date'        => isset($issuedDates[$aid]) ? $issuedDates[$aid] : null,
             'notes'              => $notes,

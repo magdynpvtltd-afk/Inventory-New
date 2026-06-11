@@ -2978,7 +2978,7 @@ if ($action === 'view') {
     $shipper  = $sh['shipped_by']  ? db_one('SELECT full_name FROM users WHERE id = ?', [(int)$sh['shipped_by']])  : null;
     $lines = db_all(
         'SELECT sl.*, i.code AS item_code,
-                COALESCE(NULLIF(i.short_description, ""), i.name) AS item_label,
+                COALESCE(NULLIF(i.short_description, ""), i.name, sl.pending_name) AS item_label,
                 i.uom AS item_uom,
                 l.name AS src_location_name
            FROM inv_shipment_lines sl
@@ -2990,7 +2990,7 @@ if ($action === 'view') {
     );
     $receipts = db_all(
         'SELECT r.*, sl.item_id, i.code AS item_code,
-                COALESCE(NULLIF(i.short_description, ""), i.name) AS item_label,
+                COALESCE(NULLIF(i.short_description, ""), i.name, sl.pending_name) AS item_label,
                 l.name AS loc_name, u.full_name AS rcvd_by
            FROM inv_receipts r
       LEFT JOIN inv_shipment_lines sl ON sl.id = r.shipment_line_id
@@ -3440,7 +3440,7 @@ $baseUnion = "
           v.name                               AS vendor_name,
           i.id                                 AS item_id,
           i.code                               AS item_code,
-          COALESCE(NULLIF(i.short_description, ''), i.name) AS item_name,
+          COALESCE(NULLIF(i.short_description, ''), i.name, sl.pending_name) AS item_name,
           r.qty_received                       AS qty,
           sl.qty_planned                       AS line_qty_planned,
           l.name                               AS location_name,
@@ -3482,7 +3482,7 @@ $baseUnion = "
           v.name                               AS vendor_name,
           i.id                                 AS item_id,
           i.code                               AS item_code,
-          COALESCE(NULLIF(i.short_description, ''), i.name) AS item_name,
+          COALESCE(NULLIF(i.short_description, ''), i.name, sl.pending_name) AS item_name,
           sl.qty_shipped                       AS qty,
           sl.qty_planned                       AS line_qty_planned,
           l.name                               AS location_name,
@@ -3555,6 +3555,54 @@ $baseUnion = "
                 OR
                 (sl.line_kind = 'ship' AND sl.qty_shipped = 0)
              )
+
+      UNION ALL
+
+      -- Branch 4: imported received receipts (status = 'received').
+      -- The old-inventory import marks a fully-received receipt directly on
+      -- the shipment line (qty_received) and sets status='received' WITHOUT
+      -- creating granular inv_receipts rows (those need a stock-affecting
+      -- inv_txns row, which the audit-only import avoids). Surface them here
+      -- as receive events dated by the imported event date (sh.updated_at).
+      -- NOT EXISTS guards against double-counting native receipts (Branch 1,
+      -- which always have inv_receipts rows and never use status='received').
+      SELECT
+          CONCAT('IR', sl.id)                  AS event_uid,
+          'receive'                            AS direction,
+          COALESCE(sh.actual_ship_date, DATE(sh.updated_at)) AS event_date,
+          sh.updated_at                        AS event_at,
+          NULL                                 AS receipt_id,
+          NULL                                 AS ship_line_id,
+          sh.id                                AS shipment_id,
+          sh.ship_no                           AS ship_no,
+          sh.status                            AS sh_status,
+          sh.mode                              AS sh_mode,
+          sh.is_rework                         AS sh_is_rework,
+          v.code                               AS vendor_code,
+          v.name                               AS vendor_name,
+          i.id                                 AS item_id,
+          i.code                               AS item_code,
+          COALESCE(NULLIF(i.short_description, ''), i.name, sl.pending_name) AS item_name,
+          sl.qty_received                      AS qty,
+          sl.qty_planned                       AS line_qty_planned,
+          NULL                                 AS location_name,
+          NULL                                 AS location_code,
+          uc.full_name                         AS actor_name,
+          sl.notes                             AS notes,
+          0                                    AS inv_linked_qty,
+          (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
+          (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
+          (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
+        FROM inv_shipment_lines sl
+        JOIN inv_shipments sh        ON sh.id = sl.shipment_id
+   LEFT JOIN inv_items i             ON i.id  = sl.item_id
+   LEFT JOIN vendors v               ON v.id  = sh.vendor_id
+   LEFT JOIN users uc                ON uc.id = sh.created_by
+       WHERE sl.line_kind  = 'receive'
+         AND sl.qty_received > 0
+         AND sh.status      = 'received'
+         AND NOT EXISTS (SELECT 1 FROM inv_receipts r3 WHERE r3.shipment_line_id = sl.id)
     ) AS e";
 
 $dtCfg = [
@@ -3574,6 +3622,7 @@ $dtCfg = [
              ['value'=>'draft',     'label'=>'Draft'],
              ['value'=>'approved',  'label'=>'Approved'],
              ['value'=>'shipped',   'label'=>'Shipped'],
+             ['value'=>'received',  'label'=>'Received'],
              ['value'=>'closed',    'label'=>'Closed'],
              ['value'=>'cancelled', 'label'=>'Cancelled'],
          ]]],
@@ -3624,7 +3673,7 @@ $rowRenderer = function ($r) use ($canManage) {
 
     // Shipment status pill (header context).
     $sStatus = (string)($r['sh_status'] ?? '');
-    $statusCls = ($sStatus === 'closed' ? 'active'
+    $statusCls = ($sStatus === 'closed' || $sStatus === 'received' ? 'active'
         : ($sStatus === 'cancelled' ? 'danger'
             : ($sStatus === 'shipped' ? 'info'
                 : ($sStatus === 'approved' ? 'info' : 'muted'))));

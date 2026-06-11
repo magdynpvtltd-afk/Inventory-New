@@ -387,6 +387,7 @@ if ($action === 'save') {
 
     $data = [
         'asset_tag'        => $assetTag,
+        'asset_name'       => trim((string)input('asset_name')) ?: null,
         'model_id'         => (int)input('model_id', 0),
         'location_id'      => (int)input('location_id', 0) ?: null,
         'parent_asset_id'  => (int)input('parent_asset_id', 0) ?: null,
@@ -418,11 +419,11 @@ if ($action === 'save') {
         require_permission('asset', 'manage');
         db_exec(
             "UPDATE assets SET
-                asset_tag=?, model_id=?, location_id=?, parent_asset_id=?, lock_to_parent=?,
+                asset_tag=?, asset_name=?, model_id=?, location_id=?, parent_asset_id=?, lock_to_parent=?,
                 notes=?, a_price=?, pid_used_in=?, cal_done_on=?, next_cal_due_on=?,
                 alias_id=?, cal_frequency_id=?, engraved_id=?, calibration_id=?, checked_ok_id=?
              WHERE id=?",
-            [$data['asset_tag'], $data['model_id'], $data['location_id'], $data['parent_asset_id'],
+            [$data['asset_tag'], $data['asset_name'], $data['model_id'], $data['location_id'], $data['parent_asset_id'],
              $data['lock_to_parent'], $data['notes'], $data['a_price'], $data['pid_used_in'],
              $data['cal_done_on'], $data['next_cal_due_on'],
              $data['alias_id'], $data['cal_frequency_id'], $data['engraved_id'],
@@ -433,12 +434,12 @@ if ($action === 'save') {
         require_permission('asset', 'create');
         db_exec(
             "INSERT INTO assets
-              (asset_tag, model_id, location_id, parent_asset_id, lock_to_parent,
+              (asset_tag, asset_name, model_id, location_id, parent_asset_id, lock_to_parent,
                notes, a_price, pid_used_in, cal_done_on, next_cal_due_on,
                alias_id, cal_frequency_id, engraved_id, calibration_id, checked_ok_id,
                status, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-            [$data['asset_tag'], $data['model_id'], $data['location_id'], $data['parent_asset_id'],
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            [$data['asset_tag'], $data['asset_name'], $data['model_id'], $data['location_id'], $data['parent_asset_id'],
              $data['lock_to_parent'], $data['notes'], $data['a_price'], $data['pid_used_in'],
              $data['cal_done_on'], $data['next_cal_due_on'],
              $data['alias_id'], $data['cal_frequency_id'], $data['engraved_id'],
@@ -1688,6 +1689,13 @@ if ($action === 'new' || $action === 'edit') {
                 </span>
             </div>
 
+            <div class="field span-2">
+                <label for="f_asset_name">Asset Name</label>
+                <input id="f_asset_name" name="asset_name" type="text" tabindex="2"
+                       value="<?= h($editing['asset_name'] ?? '') ?>">
+                <span class="muted small">Optional individual name/code for this specific asset.</span>
+            </div>
+
             <!-- Derived fields (read-only, JS populates from model selection) -->
             <div class="field">
                 <label>Category</label>
@@ -2096,6 +2104,7 @@ if ($action === 'view') {
         <div class="card-body">
             <div class="form-grid">
                 <div class="field"><label>Asset ID</label><div><strong><?= h($a['asset_tag']) ?></strong></div></div>
+                <div class="field"><label>Asset Name</label><div><?= ($a['asset_name'] ?? '') !== '' ? h($a['asset_name']) : '—' ?></div></div>
                 <div class="field"><label>Model</label><div><?= h($a['model_name'] ?: '—') ?></div></div>
                 <div class="field"><label>Category</label><div><?= h($a['category'] ?: '—') ?></div></div>
                 <div class="field"><label>Manufacturer</label><div><?= h($a['manufacturer'] ?: '—') ?></div></div>
@@ -2757,6 +2766,8 @@ if ($action === 'list') {
         'id'       => 'assets',
         'base_sql' => 'SELECT a.*, am.name AS model_name, am.category, am.manufacturer,
                               l.name AS location_name, v.name AS vendor_name, u.full_name AS user_name,
+                              cf.label AS cal_freq_label, eg.label AS engraved_label,
+                              co.label AS calibration_label, ck.label AS checked_label,
                               (SELECT t.at FROM asset_transactions t
                                 WHERE t.asset_id = a.id AND t.txn_type IN ("send_vendor","send_user")
                                 ORDER BY t.at DESC, t.id DESC LIMIT 1) AS checkout_issued_at,
@@ -2767,7 +2778,11 @@ if ($action === 'list') {
                          LEFT JOIN asset_models am ON am.id = a.model_id
                          LEFT JOIN locations l     ON l.id  = a.location_id
                          LEFT JOIN vendors v       ON v.id  = a.current_vendor_id
-                         LEFT JOIN users u         ON u.id  = a.current_user_id',
+                         LEFT JOIN users u         ON u.id  = a.current_user_id
+                         LEFT JOIN asset_cal_frequencies cf     ON cf.id = a.cal_frequency_id
+                         LEFT JOIN asset_engraved_options eg    ON eg.id = a.engraved_id
+                         LEFT JOIN asset_calibration_options co ON co.id = a.calibration_id
+                         LEFT JOIN asset_checked_ok_options ck  ON ck.id = a.checked_ok_id',
         'columns'  => [
             ['key'=>'asset_tag',       'label'=>'Asset ID',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.asset_tag',
              'sort_sql'=>'CAST(SUBSTRING_INDEX(a.asset_tag, \'-\', -1) AS UNSIGNED)'],
@@ -2782,6 +2797,14 @@ if ($action === 'list') {
             // Next cal due is now text-filterable. The column stores
             // YYYY-MM-DD so typing '2026-03' or '03-14' both work via LIKE.
             ['key'=>'next_cal_due_on', 'label'=>'Next cal due',      'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.next_cal_due_on'],
+            // Calibration / custom-field columns imported from old inventory.
+            ['key'=>'cal_done_on',     'label'=>'Cal done on',       'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.cal_done_on'],
+            ['key'=>'cal_freq_label',  'label'=>'Cal frequency',     'sortable'=>true, 'searchable'=>true, 'sql_col'=>'cf.label'],
+            ['key'=>'calibration_label','label'=>'Calib/AMC',        'sortable'=>true, 'searchable'=>true, 'sql_col'=>'co.label'],
+            ['key'=>'engraved_label',  'label'=>'Engraved',          'sortable'=>true, 'searchable'=>true, 'sql_col'=>'eg.label'],
+            ['key'=>'checked_label',   'label'=>'Checked OK',        'sortable'=>true, 'searchable'=>true, 'sql_col'=>'ck.label'],
+            ['key'=>'a_price',         'label'=>'A_Price',           'sortable'=>true, 'searchable'=>true, 'sql_col'=>'a.a_price', 'th_class'=>'r', 'td_class'=>'r'],
+            ['key'=>'notes',           'label'=>'Notes',             'sortable'=>false,'searchable'=>true, 'sql_col'=>'a.notes'],
             // Status uses a select dropdown in the filter row (exact match).
             ['key'=>'status',          'label'=>'Status',            'sortable'=>true, 'sql_col'=>'a.status',
              'filter' => [
@@ -2898,6 +2921,13 @@ if ($action === 'list') {
             'checkout_due_on'    => '<span class="' . $coDueCls . '">' . h($coDue ?: '—') . '</span>',
             'att_count'          => $attHtml,
             'next_cal_due_on' => '<span class="' . $dueCls . '">' . h($due ?: '—') . '</span>',
+            'cal_done_on'     => h($a['cal_done_on'] ?: '—'),
+            'cal_freq_label'  => h($a['cal_freq_label'] ?: '—'),
+            'calibration_label' => h($a['calibration_label'] ?: '—'),
+            'engraved_label'  => h($a['engraved_label'] ?: '—'),
+            'checked_label'   => h($a['checked_label'] ?: '—'),
+            'a_price'         => $a['a_price'] !== null && $a['a_price'] !== '' ? '₹ ' . number_format((float)$a['a_price'], 2) : '<span class="muted">—</span>',
+            'notes'           => $a['notes'] !== null && $a['notes'] !== '' ? h($a['notes']) : '<span class="muted">—</span>',
             'status'          => '<span class="pill pill-' . $statusPill . '">' . h(str_replace('_', ' ', $a['status'])) . '</span>',
             '_actions'        => dt_actions_wrap($actions),
         ];

@@ -82,6 +82,7 @@ $txnActions = [
 $bomLineActions = [
     'bom_line_add', 'bom_line_update', 'bom_line_delete',
     'bom_import_preview', 'bom_import_commit',
+    'bom_old_import', 'bom_old_import_commit', 'bom_old_import_commit_batch',
     'bom_delete_preview', 'bom_delete_commit',
 ];
 $bomViewActions = [

@@ -241,11 +241,34 @@ function bom_import_hierarchical_parse(array $parsedRows) {
         $code  = $parsed['code'];
         $depth = $parsed['depth'];
 
-        // Duplicate code in this CSV?
+        // Shared component — same code already seen earlier in the CSV.
+        // Don't create the item again; just record the extra parent→child
+        // edge and keep the depth path live so any children of this
+        // re-used component still resolve correctly.
         if (isset($items[$code])) {
-            $rowErrors[] = ['line'   => $lineNo,
-                            'reason' => 'Duplicate code "' . $code
-                                      . '" (also on line ' . $items[$code]['line'] . ')'];
+            // Update depth path so children nest under this occurrence.
+            $depthPath[$depth] = $code;
+            foreach (array_keys($depthPath) as $d) {
+                if ($d > $depth) unset($depthPath[$d]);
+            }
+            // Resolve parent from depth path BEFORE the update above.
+            if ($depth > 0 && isset($depthPath[$depth - 1])) {
+                $sharedParent = $depthPath[$depth - 1];
+                $parentChildren = isset($items[$sharedParent]['tree_child_field'])
+                    ? bom_import_parse_tree_child_field($items[$sharedParent]['tree_child_field'])
+                    : [];
+                $qty = isset($parentChildren[$code]) ? $parentChildren[$code] : $parsed['qty_row'];
+                if ($qty <= 0) $qty = 1.0;
+                if (!isset($childCounter[$sharedParent])) $childCounter[$sharedParent] = 0;
+                $childCounter[$sharedParent] += 10;
+                $edges[] = [
+                    'parent_code' => $sharedParent,
+                    'child_code'  => $code,
+                    'qty'         => $qty,
+                    'sort_order'  => $childCounter[$sharedParent],
+                    'line'        => $lineNo,
+                ];
+            }
             continue;
         }
 
@@ -313,7 +336,20 @@ function bom_import_hierarchical_parse(array $parsedRows) {
         }
     }
 
-    return ['items' => $items, 'edges' => $edges, 'row_errors' => $rowErrors];
+    // Deduplicate edges: keep the first occurrence of each (parent, child) pair.
+    // This handles shared components whose subtrees are traversed multiple times
+    // in the CSV (e.g. a component used by two different parent assemblies).
+    $uniqueEdges = [];
+    $edgeSeen    = [];
+    foreach ($edges as $edge) {
+        $key = $edge['parent_code'] . "\x00" . $edge['child_code'];
+        if (!isset($edgeSeen[$key])) {
+            $edgeSeen[$key] = true;
+            $uniqueEdges[]  = $edge;
+        }
+    }
+
+    return ['items' => $items, 'edges' => $uniqueEdges, 'row_errors' => $rowErrors];
 }
 
 // ------------------------------------------------------------
@@ -448,6 +484,58 @@ function bom_import_check_cross_row_cycles_hier(array $items, array &$edgeResult
 }
 
 // ------------------------------------------------------------
+// Insert ONE new inv_items row from a parsed item. Returns the new id.
+// Shared by the single-shot (bom_import_commit_hierarchical) and the
+// batched (bom_batch_commit_items) commit paths so the column list lives
+// in exactly one place.
+// ------------------------------------------------------------
+function bom_import_insert_one_item($code, array $it, $fks, array &$divCache, array &$divCreatedNow) {
+    $minStock = is_numeric($it['min_stock_level']) ? (float)$it['min_stock_level'] : null;
+    $minOrder = is_numeric($it['min_order_qty'])  ? (float)$it['min_order_qty']  : null;
+    // Resolve (or auto-create) the division for this row. Empty I_Division
+    // resolves to a fallback '__unknown' division so the FK stays valid.
+    $divId = bom_import_resolve_division($it['division_name'], $divCache, $divCreatedNow);
+    db_exec(
+        "INSERT INTO inv_items
+            (code, name, short_description, long_description,
+             category_id, division_id, manufacturer_type,
+             uom_id, dwg_no, dwg_rev_no, part_no, part_rev_no,
+             process_spec, process_step_id, step_no,
+             step_time_min, step_cost,
+             min_stock_level, min_order_qty,
+             min_sample_qty, min_sample_pct,
+             material_spec, remarks, notes,
+             is_active, is_product, created_at, updated_at)
+         VALUES (?, ?, ?, ?,
+                 ?, ?, 'internal',
+                 ?, ?, ?, ?, NULL,
+                 ?, NULL, NULL,
+                 NULL, NULL,
+                 ?, ?,
+                 0, 0,
+                 ?, NULL, NULL,
+                 1, ?, NOW(), NOW())",
+        [
+            $code,
+            $it['name'],
+            $it['name'],
+            $it['long_description'] !== '' ? $it['long_description'] : null,
+            $fks['cat_id_by_code'][$it['category_code']],
+            $divId,
+            $fks['uom_id'],
+            $it['dwg_no']     !== '' ? $it['dwg_no']     : null,
+            $it['dwg_rev_no'] !== '' ? $it['dwg_rev_no'] : null,
+            $it['part_no']    !== '' ? $it['part_no']    : null,
+            $it['process_spec'] !== '' ? $it['process_spec'] : null,
+            $minStock, $minOrder,
+            $it['material_spec'] !== '' ? $it['material_spec'] : null,
+            $it['is_root'] ? 1 : 0,
+        ]
+    );
+    return (int)db_val('SELECT LAST_INSERT_ID()');
+}
+
+// ------------------------------------------------------------
 // Commit: in one transaction, create missing items then write edges.
 // ------------------------------------------------------------
 function bom_import_commit_hierarchical(array $items, array $edgeResult, $fks, array &$stats) {
@@ -463,50 +551,7 @@ function bom_import_commit_hierarchical(array $items, array $edgeResult, $fks, a
                 $stats['items_reused']++;
                 continue;
             }
-            $minStock = is_numeric($it['min_stock_level']) ? (float)$it['min_stock_level'] : null;
-            $minOrder = is_numeric($it['min_order_qty'])  ? (float)$it['min_order_qty']  : null;
-            // Resolve (or auto-create) the division for this row. Empty
-            // I_Division resolves to a fallback '__unknown' division so
-            // the FK constraint stays valid.
-            $divId = bom_import_resolve_division($it['division_name'], $divCache, $divCreatedNow);
-            db_exec(
-                "INSERT INTO inv_items
-                    (code, name, short_description, long_description,
-                     category_id, division_id, manufacturer_type,
-                     uom_id, dwg_no, dwg_rev_no, part_no, part_rev_no,
-                     process_spec, process_step_id, step_no,
-                     step_time_min, step_cost,
-                     min_stock_level, min_order_qty,
-                     min_sample_qty, min_sample_pct,
-                     material_spec, remarks, notes,
-                     is_active, is_product, created_at, updated_at)
-                 VALUES (?, ?, ?, ?,
-                         ?, ?, 'internal',
-                         ?, ?, ?, ?, NULL,
-                         ?, NULL, NULL,
-                         NULL, NULL,
-                         ?, ?,
-                         0, 0,
-                         ?, NULL, NULL,
-                         1, ?, NOW(), NOW())",
-                [
-                    $code,
-                    $it['name'],
-                    $it['name'],
-                    $it['long_description'] !== '' ? $it['long_description'] : null,
-                    $fks['cat_id_by_code'][$it['category_code']],
-                    $divId,
-                    $fks['uom_id'],
-                    $it['dwg_no']     !== '' ? $it['dwg_no']     : null,
-                    $it['dwg_rev_no'] !== '' ? $it['dwg_rev_no'] : null,
-                    $it['part_no']    !== '' ? $it['part_no']    : null,
-                    $it['process_spec'] !== '' ? $it['process_spec'] : null,
-                    $minStock, $minOrder,
-                    $it['material_spec'] !== '' ? $it['material_spec'] : null,
-                    $it['is_root'] ? 1 : 0,
-                ]
-            );
-            $codeToId[$code] = (int)db_val('SELECT LAST_INSERT_ID()');
+            $codeToId[$code] = bom_import_insert_one_item($code, $it, $fks, $divCache, $divCreatedNow);
             $stats['items_created']++;
         }
         $stats['divisions_created'] = count($divCreatedNow);
@@ -553,7 +598,7 @@ function bom_import_commit_hierarchical(array $items, array $edgeResult, $fks, a
 // ------------------------------------------------------------
 // Preview renderer — two cards (items + edges) with pills and counts.
 // ------------------------------------------------------------
-function bom_import_render_preview_hier($title, $token, $upsert, array $items, array $edgeResult, $commitUrl, $cancelUrl, array $divisionExists = []) {
+function bom_import_render_preview_hier($title, $token, $upsert, array $items, array $edgeResult, $commitUrl, $cancelUrl, array $divisionExists = [], $batched = false) {
     $itemsCreate = array_filter($items, function ($i) { return $i['action'] === 'create'; });
     $itemsReuse  = array_filter($items, function ($i) { return $i['action'] === 'reuse'; });
     $totalEdges  = $edgeResult['counts']['insert'] + $edgeResult['counts']['update'];
@@ -578,6 +623,158 @@ function bom_import_render_preview_hier($title, $token, $upsert, array $items, a
         <span class="pill pill-danger">✗ Edges error: <?= (int)$edgeResult['counts']['error'] ?></span>
     </div>
 
+    <?php if ($batched):
+        // Enable if there is anything to do: new items, edges, OR stock to post
+        // (a re-import may have all items "reuse" but still carry stock).
+        $hasStockData = false;
+        foreach ($items as $___it) {
+            if (!empty($___it['stock_locations'])) { $hasStockData = true; break; }
+        }
+        $disabled = (($totalEdges + count($itemsCreate)) === 0) && !$hasStockData;
+    ?>
+    <div class="import-actions" id="bomBatchActions" style="margin-bottom: 18px;"
+         data-commit-url="<?= h($commitUrl) ?>"
+         data-cancel-url="<?= h($cancelUrl) ?>"
+         data-token="<?= h($token) ?>"
+         data-upsert="<?= $upsert ? '1' : '0' ?>"
+         data-csrf-field="<?= h($GLOBALS['APP']['csrf_field']) ?>"
+         data-csrf="<?= h(csrf_token()) ?>">
+        <button type="button" class="btn btn-primary" id="bomBatchStart" <?= $disabled ? 'disabled' : '' ?>>
+            Start import — <?= count($itemsCreate) ?> new item<?= count($itemsCreate) === 1 ? '' : 's' ?>
+            + <?= $totalEdges ?> edge<?= $totalEdges === 1 ? '' : 's' ?>
+        </button>
+        <a class="btn btn-ghost" id="bomBatchCancel" href="<?= h($cancelUrl) ?>">Cancel</a>
+        <?php if ($hasErrors): ?>
+            <span class="muted small" style="margin-left: 12px;">Red edges will be skipped on commit.</span>
+        <?php endif; ?>
+    </div>
+
+    <div id="bomBatchProgress" class="card" style="display:none; margin-bottom:18px;">
+        <div class="card-body">
+            <?php
+            $bars = ['items' => 'Items', 'edges' => 'BOM edges', 'stock' => 'Stock quantities'];
+            foreach ($bars as $pk => $plabel): ?>
+            <div class="bom-prog-row" data-phase="<?= $pk ?>" style="margin-bottom:12px;">
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
+                    <strong><?= h($plabel) ?></strong>
+                    <span class="bom-prog-count" style="font-variant-numeric:tabular-nums;color:#555;">– / –</span>
+                </div>
+                <div style="height:14px;background:#eee;border-radius:7px;overflow:hidden;">
+                    <div class="bom-prog-fill" style="height:100%;width:0%;background:#2e7d32;transition:width .2s ease;"></div>
+                </div>
+            </div>
+            <?php endforeach; ?>
+            <div id="bomBatchStatus" class="small" style="margin-top:10px;color:#555;"></div>
+            <div id="bomBatchLiveStats" class="small muted" style="margin-top:4px;"></div>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        var box = document.getElementById('bomBatchActions');
+        if (!box) return;
+        var startBtn = document.getElementById('bomBatchStart');
+        var cancelLink = document.getElementById('bomBatchCancel');
+        var prog = document.getElementById('bomBatchProgress');
+        var statusEl = document.getElementById('bomBatchStatus');
+        var liveEl = document.getElementById('bomBatchLiveStats');
+
+        var url       = box.getAttribute('data-commit-url');
+        var token     = box.getAttribute('data-token');
+        var upsert    = box.getAttribute('data-upsert');
+        var csrfField = box.getAttribute('data-csrf-field');
+        var csrf      = box.getAttribute('data-csrf');
+
+        var phases = ['items', 'edges', 'stock'];
+
+        function setBar(phase, done, total) {
+            var row = prog.querySelector('.bom-prog-row[data-phase="' + phase + '"]');
+            if (!row) return;
+            var pct = total > 0 ? Math.round((done / total) * 100) : 100;
+            row.querySelector('.bom-prog-fill').style.width = pct + '%';
+            row.querySelector('.bom-prog-count').textContent = done + ' / ' + total + ' (' + pct + '%)';
+        }
+        function setStatus(msg, isErr) {
+            statusEl.textContent = msg;
+            statusEl.style.color = isErr ? '#b3261e' : '#555';
+        }
+        function showStats(s) {
+            if (!s) return;
+            liveEl.textContent =
+                'items: ' + s.items_created + ' created / ' + s.items_reused + ' reused · ' +
+                'edges: ' + s.edges_inserted + ' inserted / ' + s.edges_updated + ' updated · ' +
+                'stock: ' + s.stocks_imported + ' set';
+        }
+
+        function runBatch(phase, offset) {
+            var body = new URLSearchParams();
+            body.set('token', token);
+            body.set('upsert', upsert);
+            body.set('phase', phase);
+            body.set('offset', offset);
+            body.set(csrfField, csrf);
+            return fetch(url, {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                body: body
+            }).then(function (res) {
+                return res.text().then(function (text) {
+                    var data;
+                    try { data = JSON.parse(text); }
+                    catch (e) { throw new Error('Server returned non-JSON (HTTP ' + res.status + '): ' + text.slice(0, 200)); }
+                    if (!data.ok) throw new Error(data.error || 'Unknown server error');
+                    return data;
+                });
+            });
+        }
+
+        function drivePhase(pi) {
+            var phase = phases[pi];
+            function loop(offset) {
+                return runBatch(phase, offset).then(function (d) {
+                    setBar(d.phase, d.done, d.total);
+                    showStats(d.stats);
+                    if (d.all_done) { finish(d); return 'DONE'; }
+                    if (d.phase_done) return 'PHASE';
+                    return loop(d.next_offset);
+                });
+            }
+            setStatus('Importing ' + phase + '…');
+            return loop(0);
+        }
+
+        function driveAll() {
+            function next(pi) {
+                if (pi >= phases.length) return;
+                return drivePhase(pi).then(function (r) {
+                    if (r === 'DONE') return;
+                    return next(pi + 1);
+                });
+            }
+            return next(0);
+        }
+
+        function finish(d) {
+            // All three phase bars are already filled by the loop's setBar calls.
+            setStatus('✓ ' + (d.summary || 'Import complete.') + ' Redirecting…');
+            if (d.redirect) setTimeout(function () { window.location.href = d.redirect; }, 1200);
+        }
+
+        startBtn.addEventListener('click', function () {
+            startBtn.disabled = true;
+            startBtn.textContent = 'Importing…';
+            cancelLink.style.display = 'none';
+            prog.style.display = '';
+            driveAll().catch(function (e) {
+                setStatus('Error: ' + e.message + ' — fix and retry.', true);
+                startBtn.disabled = false;
+                startBtn.textContent = 'Retry import';
+                cancelLink.style.display = '';
+            });
+        });
+    })();
+    </script>
+    <?php else: ?>
     <div class="import-actions" style="margin-bottom: 18px;">
         <form method="post" action="<?= h($commitUrl) ?>" style="display:inline"
               onsubmit="return confirm('Commit this BOM import? Items and edges will be created.');">
@@ -597,6 +794,7 @@ function bom_import_render_preview_hier($title, $token, $upsert, array $items, a
             </span>
         <?php endif; ?>
     </div>
+    <?php endif; ?>
 
     <div class="card" style="margin-bottom:18px;">
         <div class="card-head"><h3 style="margin:0;font-size:15px;">Items (<?= count($items) ?>)</h3></div>
@@ -820,6 +1018,921 @@ if ($action === 'bom_import_commit') {
         redirect(url('/inventory.php?action=bom_view&id=' . $rootDbId));
     }
     redirect(url('/inventory.php?action=bom_grid'));
+}
+
+// ============================================================
+// BOM auto-import from old inventory server (tree7-5.php)
+// JSON-based: fetches structured items+edges, no CSV pipeline.
+// ============================================================
+
+// ------------------------------------------------------------
+// Convert the JSON response from tree7-5.php into the same
+// $parsedH structure that bom_import_resolve_edges / commit
+// functions expect.  No CSV parsing needed.
+// ------------------------------------------------------------
+function bom_import_parse_json_response(array $jsonData) {
+    $items     = [];
+    $edges     = [];
+    $rowErrors = [];
+
+    $itemList = isset($jsonData['items']) && is_array($jsonData['items'])
+        ? $jsonData['items'] : [];
+    $edgeList = isset($jsonData['edges']) && is_array($jsonData['edges'])
+        ? $jsonData['edges'] : [];
+
+    // ── items ────────────────────────────────────────────────
+    foreach ($itemList as $idx => $jItem) {
+        $code = trim((string)(isset($jItem['code']) ? $jItem['code'] : ''));
+        if ($code === '') {
+            $rowErrors[] = ['line' => $idx + 2, 'reason' => 'Item missing code field'];
+            continue;
+        }
+        $legacyCatId = trim((string)(isset($jItem['category_id']) ? $jItem['category_id'] : ''));
+        $catCode     = bom_import_category_code_for_legacy_id($legacyCatId);
+        $existing    = db_one('SELECT id FROM inv_items WHERE code = ?', [$code]);
+        $isRoot      = !empty($jItem['is_root']);
+
+        $items[$code] = [
+            'action'           => $existing ? 'reuse' : 'create',
+            'line'             => $idx + 2,
+            'existing_id'      => $existing ? (int)$existing['id'] : null,
+            'code'             => $code,
+            'name'             => trim((string)(isset($jItem['name'])
+                                    ? $jItem['name'] : '')) ?: $code,
+            'long_description' => trim((string)(isset($jItem['long_description'])
+                                    ? $jItem['long_description'] : '')),
+            'dwg_no'           => trim((string)(isset($jItem['dwg_no'])
+                                    ? $jItem['dwg_no'] : '')),
+            'dwg_rev_no'       => trim((string)(isset($jItem['rev_no'])
+                                    ? $jItem['rev_no'] : '')),
+            'part_no'          => trim((string)(isset($jItem['part_no'])
+                                    ? $jItem['part_no'] : '')),
+            'process_spec'     => trim((string)(isset($jItem['process_spec'])
+                                    ? $jItem['process_spec'] : '')),
+            'material_spec'    => trim((string)(isset($jItem['material_spec'])
+                                    ? $jItem['material_spec'] : '')),
+            'min_stock_level'  => trim((string)(isset($jItem['min_stock_level'])
+                                    ? $jItem['min_stock_level'] : '')),
+            'min_order_qty'    => trim((string)(isset($jItem['min_order_qty'])
+                                    ? $jItem['min_order_qty'] : '')),
+            'category_code'    => $catCode,
+            'division_name'    => trim((string)(isset($jItem['i_division'])
+                                    ? $jItem['i_division'] : '')),
+            'depth'            => 0,   // not depth-encoded in JSON; 0 is display-only
+            'is_root'          => $isRoot,
+            'tree_child_field' => '',  // not needed — edges are explicit in JSON
+            // stock_locations: [{location: "Magdyn", qty: 43.27}, ...]
+            // Populated when old server returns inventory_location data.
+            // Only used on commit for newly-created items (reused items keep
+            // their existing MagDyn stock history untouched).
+            'stock_locations'  => (isset($jItem['stock_locations']) && is_array($jItem['stock_locations']))
+                                  ? $jItem['stock_locations'] : [],
+        ];
+    }
+
+    // ── edges ────────────────────────────────────────────────
+    $edgeSeen = [];
+    foreach ($edgeList as $idx => $jEdge) {
+        $pCode = trim((string)(isset($jEdge['parent_code']) ? $jEdge['parent_code'] : ''));
+        $cCode = trim((string)(isset($jEdge['child_code'])  ? $jEdge['child_code']  : ''));
+        if ($pCode === '' || $cCode === '') continue;
+
+        $key = $pCode . "\x00" . $cCode;
+        if (isset($edgeSeen[$key])) continue;
+        $edgeSeen[$key] = true;
+
+        $qty  = max(0.001, (float)(isset($jEdge['qty']) ? $jEdge['qty'] : 1.0));
+        $sort = (int)(isset($jEdge['sort_order']) ? $jEdge['sort_order'] : (($idx + 1) * 10));
+
+        $edges[] = [
+            'parent_code' => $pCode,
+            'child_code'  => $cCode,
+            'qty'         => $qty,
+            'sort_order'  => $sort,
+            'line'        => $idx + 2,
+        ];
+    }
+
+    return ['items' => $items, 'edges' => $edges, 'row_errors' => $rowErrors];
+}
+
+// ── shared helper: derive a MagDyn location code from an old-system name ─────
+// "Magdyn" → "MAGDYN"   "To Be Received" → "TO_BE_RECEIVED"
+// Uppercase, spaces → underscores, non-alphanumeric stripped, max 40 chars.
+function bom_import_location_code($name) {
+    $code = strtoupper(str_replace(' ', '_', trim((string)$name)));
+    $code = preg_replace('/[^A-Z0-9_]/', '', $code);
+    return substr($code, 0, 40);
+}
+
+// ── shared helper: apply old-system → MagDyn location name aliases ───────────
+// Maps known old-system location names to their canonical MagDyn equivalents.
+// Normalises spaces/hyphens to underscores before comparing so "Rejection Return"
+// and "Rejection_Return" both hit the same alias entry.
+// Returns the mapped MagDyn name, or the original name if no alias matches.
+function bom_import_resolve_location_alias($name) {
+    static $aliases = [
+        'rejection_return' => 'Rej',
+        'to_be_received'   => 'TBR',
+    ];
+    $key = strtolower(str_replace([' ', '-'], '_', trim((string)$name)));
+    return isset($aliases[$key]) ? $aliases[$key] : $name;
+}
+
+// ── shared helper: is this old-system location eligible for stock import? ─────
+// Only stock held in the "Magdyn" (In-Hand) location is brought into MagDyn.
+// Other old-system locations such as "Rejection Return" and "To Be Received"
+// are intentionally ignored.  Used by both the preview and the commit so the
+// two never diverge.  Add more names here to widen the whitelist.
+function bom_import_stock_location_allowed($name) {
+    static $allowed = ['magdyn'];
+    $key = strtolower(trim((string)$name));
+    return in_array($key, $allowed, true);
+}
+
+// ── shared helper: find or auto-create a MagDyn location by name ─────────────
+// Matching priority (most-to-least specific):
+//   1. Derived code exact match  (e.g. "MAGDYN" in locations.code)
+//   2. Name exact match          (e.g. "Magdyn" in locations.name)
+//   3. Name case-insensitive     (e.g. "magdyn" = "Magdyn")
+//   4. Auto-create with derived code + original name
+//
+// Old-system name aliases (e.g. "Rejection_Return" → "Rej") are applied first
+// via bom_import_resolve_location_alias() so they resolve to the correct
+// existing MagDyn location rather than creating a duplicate.
+//
+// Returns the location id, or null if $name is empty.
+// $cache is passed by reference so repeated calls within one import
+// don't hit the DB for every row.
+function bom_import_find_or_create_location($name, &$cache) {
+    $name = trim((string)$name);
+    if ($name === '') return null;
+
+    $name = bom_import_resolve_location_alias($name);
+
+    $code = bom_import_location_code($name);
+    if ($code === '') return null;
+
+    if (isset($cache[$code])) return $cache[$code];
+
+    // 1. Derived code exact
+    $row = db_one('SELECT id FROM locations WHERE code = ?', [$code]);
+    // 2. Name exact
+    if (!$row) $row = db_one('SELECT id FROM locations WHERE name = ?', [$name]);
+    // 3. Name case-insensitive (LOWER comparison)
+    if (!$row) $row = db_one('SELECT id FROM locations WHERE LOWER(name) = LOWER(?)', [$name]);
+
+    if ($row) {
+        $cache[$code] = (int)$row['id'];
+        return $cache[$code];
+    }
+
+    // 4. Auto-create — derived code, original name, sort_order=200, active
+    db_exec(
+        'INSERT INTO locations (code, name, sort_order, is_active, created_at)
+         VALUES (?, ?, 200, 1, NOW())',
+        [$code, $name]
+    );
+    $id = (int)db_val('SELECT LAST_INSERT_ID()');
+    $cache[$code] = $id;
+    return $id;
+}
+
+// ── shared helper: resolve all distinct location names from stock data ─────────
+// Returns a map keyed by location name:
+//   [
+//     'Magdyn' => [
+//         'code'       => 'MAGDYN',
+//         'id'         => 3,          // or null if not found
+//         'status'     => 'exists',   // 'exists' | 'will_create'
+//         'item_count' => 14,
+//         'entry_count'=> 14,
+//     ],
+//     'To Be Received' => [...],
+//   ]
+// Does NOT modify the database — read-only lookup for preview.
+function bom_import_preview_locations(array $items) {
+    $map = []; // name => [code, item_count, entry_count]
+    foreach ($items as $it) {
+        if (empty($it['stock_locations'])) continue;
+        $counted = [];
+        foreach ($it['stock_locations'] as $sl) {
+            $locName = trim((string)(isset($sl['location']) ? $sl['location'] : ''));
+            if ($locName === '') continue;
+            // Only preview locations that will actually be imported (Magdyn).
+            // "Rejection Return", "To Be Received", etc. are skipped at commit
+            // time, so they must not appear in the preview either.
+            if (!bom_import_stock_location_allowed($locName)) continue;
+            $locName = bom_import_resolve_location_alias($locName);
+            if (!isset($map[$locName])) {
+                $map[$locName] = [
+                    'code'        => bom_import_location_code($locName),
+                    'item_count'  => 0,
+                    'entry_count' => 0,
+                ];
+            }
+            if (!isset($counted[$locName])) {
+                $counted[$locName] = true;
+                $map[$locName]['item_count']++;
+            }
+            $map[$locName]['entry_count']++;
+        }
+    }
+
+    // Now resolve each against the DB (read-only)
+    foreach ($map as $locName => &$info) {
+        $code = $info['code'];
+        $row  = null;
+        if ($code !== '') $row = db_one('SELECT id FROM locations WHERE code = ?', [$code]);
+        if (!$row)        $row = db_one('SELECT id FROM locations WHERE name = ?', [$locName]);
+        if (!$row)        $row = db_one('SELECT id FROM locations WHERE LOWER(name) = LOWER(?)', [$locName]);
+
+        $info['id']     = $row ? (int)$row['id'] : null;
+        $info['status'] = $row ? 'exists' : 'will_create';
+    }
+    unset($info);
+
+    // Sort: existing first, then will_create; alpha within each group
+    $names = array_keys($map);
+    usort($names, function ($a, $b) use ($map) {
+        $sa = $map[$a]['status'];
+        $sb = $map[$b]['status'];
+        if ($sa !== $sb) return $sa === 'exists' ? -1 : 1;
+        return strcasecmp($a, $b);
+    });
+    $sorted = [];
+    foreach ($names as $n) $sorted[$n] = $map[$n];
+
+    return $sorted;
+}
+
+// ── shared helper: make sure the stock-related stat keys exist ───────────────
+function bom_old_import_stock_init_stats(array &$stats) {
+    foreach ([
+        'stocks_imported', 'stocks_items_with_data', 'stocks_zero_skip',
+        'stocks_has_stock_skip', 'stocks_location_skip',
+    ] as $k) {
+        if (!isset($stats[$k])) $stats[$k] = 0;
+    }
+    if (!isset($stats['stock_errors']) || !is_array($stats['stock_errors'])) {
+        $stats['stock_errors'] = [];
+    }
+}
+
+// ── shared helper: post old-system stock for a SUBSET of item codes ──────────
+// This is the unit of work for the batched importer.  Stats are ACCUMULATED
+// (+=) so the function can be called repeatedly over successive slices.
+//
+// Per-location guard:
+//   • current stock = 0  → post 'receive' to set the old-system qty
+//   • current stock > 0  → skip (item already has live MagDyn stock)
+//
+// LOCATION FILTER: only stock held in the "Magdyn" (In-Hand) location is
+// imported.  Other old-system locations ("Rejection Return", "To Be Received",
+// …) are intentionally ignored — see bom_import_stock_location_allowed().
+//
+// $items   — full code => item map (carries stock_locations)
+// $codes   — the slice of item codes to process this call
+// $locCache, $txnDate — passed in so they persist across slices
+function bom_old_import_commit_stock_slice(array $items, array $codes, array &$stats, array &$locCache, $txnDate) {
+    bom_old_import_stock_init_stats($stats);
+
+    // Stock update removed from the BOM import.
+    //
+    // The BOM import used to post an opening-balance 'receive' txn per item
+    // (inv_post_txn → inv_item_location_stock + an inv_txns row tagged
+    // 'old-system-import'). That collided with the inventory-transaction
+    // import, which now owns the inv_txns ledger and writes rows with their
+    // original old-system IDs. To keep stock a single source of truth and
+    // free the inv_txns ID space, the BOM import no longer touches stock.
+    //
+    // Kept as a no-op (rather than deleted) so the batched / single-shot
+    // callers and the progress UI keep their phase structure unchanged.
+    $stats['stocks_disabled'] = true;
+}
+
+// ── shared helper: post initial stock from old-system data (single-shot) ─────
+// Called AFTER bom_import_commit_hierarchical() succeeds in the non-batched
+// path. Delegates to the slice function over EVERY item code at once.
+function bom_old_import_commit_stock(array $items, array &$stats) {
+    require_once dirname(__DIR__, 2) . '/includes/_inventory_txn.php';
+    bom_old_import_stock_init_stats($stats);
+    $locCache = [];
+    $txnDate  = date('Y-m-d H:i:s');
+    bom_old_import_commit_stock_slice($items, array_keys($items), $stats, $locCache, $txnDate);
+}
+
+// ============================================================
+// BATCHED OLD-SYSTEM IMPORT
+//   The single-shot commit (bom_old_import_commit) does everything in one
+//   request, which times out on large trees. The batched path splits the work
+//   into small slices driven by JS so each HTTP request stays short, and feeds
+//   a progress bar.
+//
+//   Work is processed in three phases, in order: items → edges → stock.
+//   A "plan" (parsed items, resolved edges, FKs, running stats) is built once
+//   and parked in the session, keyed by the same stash token. Every batch is
+//   its own DB transaction and is retry-safe (existence checks), so a partial
+//   import can be safely resumed / retried.
+// ============================================================
+
+// Batch sizes per phase — DB ops per HTTP request. Tuned to stay well under
+// PHP's max_execution_time even on slow hardware.
+if (!defined('BOM_BATCH_ITEMS')) define('BOM_BATCH_ITEMS', 200);
+if (!defined('BOM_BATCH_EDGES')) define('BOM_BATCH_EDGES', 200);
+if (!defined('BOM_BATCH_STOCK')) define('BOM_BATCH_STOCK', 80);
+
+// ── plan storage (session-backed, keyed by the stash token) ──────────────────
+function bom_batch_plan_load($token) {
+    if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+    $k = '__bom_import_plan_' . $token;
+    if (empty($_SESSION[$k]) || !is_array($_SESSION[$k])) return null;
+    if (time() - (int)$_SESSION[$k]['stamped'] > 3600) { unset($_SESSION[$k]); return null; }
+    return $_SESSION[$k];
+}
+function bom_batch_plan_save($token, array $plan) {
+    if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+    $plan['stamped'] = time();
+    $_SESSION['__bom_import_plan_' . $token] = $plan;
+}
+function bom_batch_plan_clear($token) {
+    if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+    unset($_SESSION['__bom_import_plan_' . $token]);
+}
+
+// ── resolve an item code → id with a per-call cache ──────────────────────────
+function bom_batch_item_id($code, array &$cache) {
+    if ($code === null || $code === '') return null;
+    if (array_key_exists($code, $cache)) return $cache[$code];
+    $id = (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$code], 0);
+    $cache[$code] = $id > 0 ? $id : null;
+    return $cache[$code];
+}
+
+// ── phase worker: create items for one slice. Returns # of codes consumed. ───
+function bom_batch_commit_items(array $plan, $offset, array &$stats) {
+    $codes = array_slice($plan['item_codes'], $offset, BOM_BATCH_ITEMS);
+    if (empty($codes)) return 0;
+    $fks = $plan['fks'];
+
+    db_exec('START TRANSACTION');
+    try {
+        $divCache      = [];
+        $divCreatedNow = [];
+        $createdIds    = [];
+        foreach ($codes as $code) {
+            $it = isset($plan['items'][$code]) ? $plan['items'][$code] : null;
+            if ($it === null) continue;
+            if ($it['action'] === 'reuse') { $stats['items_reused']++; continue; }
+            // Retry-safe: if a prior (partial) run already created it, reuse.
+            $existing = (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$code], 0);
+            if ($existing > 0) { $stats['items_reused']++; continue; }
+            $createdIds[] = bom_import_insert_one_item($code, $it, $fks, $divCache, $divCreatedNow);
+            $stats['items_created']++;
+        }
+        $stats['divisions_created'] += count($divCreatedNow);
+        $stats['divisions_created_names'] = array_values(array_unique(array_merge(
+            isset($stats['divisions_created_names']) ? $stats['divisions_created_names'] : [],
+            array_keys($divCreatedNow)
+        )));
+        db_exec('COMMIT');
+    } catch (Exception $e) {
+        db_exec('ROLLBACK');
+        throw $e;
+    }
+
+    // Mirror newly-created finished goods to billing (best-effort, post-commit).
+    if (function_exists('billing_product_push_if_needed')) {
+        foreach ($createdIds as $iid) {
+            try {
+                billing_product_push_if_needed((int)$iid, function_exists('current_user_id') ? current_user_id() : null);
+            } catch (Exception $e) { /* never let billing break the import */ }
+        }
+    }
+    return count($codes);
+}
+
+// ── phase worker: write edges for one slice. Returns # of rows consumed. ─────
+function bom_batch_commit_edges(array $plan, $offset, array &$stats) {
+    $slice = array_slice($plan['edges'], $offset, BOM_BATCH_EDGES);
+    if (empty($slice)) return 0;
+
+    db_exec('START TRANSACTION');
+    try {
+        $idCache = [];
+        foreach ($slice as $er) {
+            if (!in_array($er['status'], ['insert', 'update'], true)) continue;
+            $d   = $er['data'];
+            $pId = $d['parent_id'] !== null ? (int)$d['parent_id'] : bom_batch_item_id($d['parent_code'], $idCache);
+            $cId = $d['child_id']  !== null ? (int)$d['child_id']  : bom_batch_item_id($d['child_code'], $idCache);
+            if (!$pId || !$cId) {
+                $stats['edge_errors'][] = 'Edge ' . $d['parent_code'] . ' → ' . $d['child_code'] . ': item id not found';
+                continue;
+            }
+            if ($er['status'] === 'update') {
+                db_exec(
+                    'UPDATE inv_bom_lines SET qty=?, sort_order=?, ref_designator=NULL, notes=NULL WHERE id=?',
+                    [$d['qty'], $d['sort_order'], (int)$er['existing_id']]
+                );
+                $stats['edges_updated']++;
+            } else {
+                // Retry-safe: skip if this edge already exists.
+                $exists = (int)db_val(
+                    'SELECT id FROM inv_bom_lines WHERE parent_item_id = ? AND child_item_id = ?',
+                    [$pId, $cId], 0
+                );
+                if ($exists > 0) continue;
+                db_exec(
+                    'INSERT INTO inv_bom_lines (parent_item_id, child_item_id, qty, sort_order, ref_designator, notes)
+                     VALUES (?, ?, ?, ?, NULL, NULL)',
+                    [$pId, $cId, $d['qty'], $d['sort_order']]
+                );
+                $stats['edges_inserted']++;
+            }
+        }
+        db_exec('COMMIT');
+    } catch (Exception $e) {
+        db_exec('ROLLBACK');
+        throw $e;
+    }
+    return count($slice);
+}
+
+// ── phase worker: post stock for one slice. Returns # of codes consumed. ─────
+function bom_batch_commit_stock(array $plan, $offset, array &$stats) {
+    require_once dirname(__DIR__, 2) . '/includes/_inventory_txn.php';
+    $codes = array_slice($plan['item_codes'], $offset, BOM_BATCH_STOCK);
+    if (empty($codes)) return 0;
+    $locCache = [];
+    $txnDate  = isset($plan['txn_date']) ? $plan['txn_date'] : date('Y-m-d H:i:s');
+    bom_old_import_commit_stock_slice($plan['items'], $codes, $stats, $locCache, $txnDate);
+    return count($codes);
+}
+
+// ── build the human-readable completion message from accumulated stats ───────
+function bom_old_import_build_summary(array $stats) {
+    $msg = sprintf(
+        'BOM import complete · items: %d created / %d reused · edges: %d inserted / %d updated',
+        (int)$stats['items_created'], (int)$stats['items_reused'],
+        (int)$stats['edges_inserted'], (int)$stats['edges_updated']
+    );
+    if (!empty($stats['divisions_created'])) {
+        $names = !empty($stats['divisions_created_names'])
+            ? ' (' . implode(', ', $stats['divisions_created_names']) . ')'
+            : '';
+        $msg .= sprintf(' · divisions: %d created%s', (int)$stats['divisions_created'], $names);
+    }
+    $stockItemsWithData = isset($stats['stocks_items_with_data']) ? (int)$stats['stocks_items_with_data'] : 0;
+    if (!empty($stats['stocks_disabled'])) {
+        $msg .= ' · stock: import disabled (stock is managed via inventory transactions)';
+    } elseif ($stockItemsWithData === 0) {
+        $msg .= ' · stock: 0 entries (old server returned no stock_locations — re-deploy tree7-5.php to old server)';
+    } else {
+        $msg .= sprintf(
+            ' · stock: %d entries set (from %d items with stock data)',
+            (int)$stats['stocks_imported'], $stockItemsWithData
+        );
+        if (!empty($stats['stocks_has_stock_skip'])) $msg .= sprintf(', %d skipped (already had stock)', (int)$stats['stocks_has_stock_skip']);
+        if (!empty($stats['stocks_zero_skip']))      $msg .= sprintf(', %d skipped (qty=0)', (int)$stats['stocks_zero_skip']);
+        if (!empty($stats['stocks_location_skip']))  $msg .= sprintf(', %d skipped (other location)', (int)$stats['stocks_location_skip']);
+    }
+    if (!empty($stats['stock_errors'])) $msg .= ' · ' . count($stats['stock_errors']) . ' stock error(s) — BOM itself committed OK';
+    if (!empty($stats['edge_errors']))  $msg .= ' · ' . count($stats['edge_errors']) . ' edge error(s)';
+    return $msg;
+}
+
+// ── compact stats for the live progress display ──────────────────────────────
+function bom_old_import_stats_brief(array $stats) {
+    return [
+        'items_created'   => (int)$stats['items_created'],
+        'items_reused'    => (int)$stats['items_reused'],
+        'edges_inserted'  => (int)$stats['edges_inserted'],
+        'edges_updated'   => (int)$stats['edges_updated'],
+        'stocks_imported' => isset($stats['stocks_imported']) ? (int)$stats['stocks_imported'] : 0,
+    ];
+}
+
+// ── shared helper: load config + fetch JSON from old server ──────────────────
+function bom_old_import_fetch_json(&$errMsg) {
+    $cfg     = require dirname(__DIR__, 2) . '/config/old_inventory_api.php';
+    $treeUrl = rtrim(isset($cfg['tree_url']) ? $cfg['tree_url'] : '', '/');
+    $token   = isset($cfg['token'])   ? $cfg['token']   : '';
+    $timeout = (int)(isset($cfg['timeout']) ? $cfg['timeout'] : 30);
+
+    if (empty($treeUrl)) {
+        $errMsg = 'tree_url not set in config/old_inventory_api.php.';
+        return null;
+    }
+
+    $fetchUrl = $treeUrl . '?action=all_trees_json&token=' . urlencode($token);
+    $configuredRootIds = isset($cfg['root_ids'])
+        ? array_filter(array_map('intval', (array)$cfg['root_ids'])) : [];
+    if (!empty($configuredRootIds)) {
+        $fetchUrl .= '&root_ids=' . implode(',', $configuredRootIds);
+    }
+
+    $ctx = stream_context_create([
+        'http' => [
+            'method'        => 'GET',
+            'timeout'       => $timeout,
+            'ignore_errors' => true,
+        ],
+    ]);
+    $raw = @file_get_contents($fetchUrl, false, $ctx);
+
+    if ($raw === false || trim($raw) === '') {
+        $errMsg = 'Could not reach old inventory server at ' . $treeUrl
+                . '. Make sure tree7-5.php is deployed and accessible.';
+        return null;
+    }
+
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        $errMsg = 'Old server returned invalid JSON. Response starts with: '
+                . substr($raw, 0, 120);
+        return null;
+    }
+    if (isset($data['error'])) {
+        $errMsg = 'Old server error: ' . $data['error'];
+        return null;
+    }
+
+    return $data; // ['items' => [...], 'edges' => [...]]
+}
+
+// ── GET inventory.php?action=bom_old_import ───────────────────────────────────
+//   Fetches JSON from old server → shows preview → commit goes to
+//   bom_old_import_commit (below).
+if ($action === 'bom_old_import') {
+    if (!$canCreateBoms && !$canManageBoms) {
+        require_permission('inventory_view_boms', 'create');
+    }
+    if (!$canCreateItems && !$canManageItems) {
+        flash_set('error',
+            'This importer auto-creates missing items — you need '
+          . 'inventory_view_items.create. Ask an administrator to grant it.');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    $upsert = !empty($_GET['upsert']) || !empty($_POST['upsert']);
+
+    // ── Step 1: fetch JSON ────────────────────────────────────
+    $fetchErr = '';
+    $jsonData = bom_old_import_fetch_json($fetchErr);
+    if ($jsonData === null) {
+        flash_set('error', $fetchErr);
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    // ── Step 2: FK check ─────────────────────────────────────
+    $fks = bom_import_load_fks();
+    if (!$fks['ok']) {
+        flash_set('error', $fks['reason']);
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    // ── Step 3: parse JSON → items / edges ───────────────────
+    $parsedH = bom_import_parse_json_response($jsonData);
+    $edges   = bom_import_resolve_edges($parsedH['items'], $parsedH['edges'], $upsert);
+    bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
+
+    // ── Step 4: stash raw JSON for commit step ────────────────
+    $token_session = import_stash(json_encode($jsonData), 'inv_bom_json');
+
+    // ── Step 5: build division-exists map for preview ─────────
+    $divisionsInData = [];
+    foreach ($parsedH['items'] as $it) {
+        $name = trim((string)$it['division_name']);
+        if ($name === '') $name = '__unknown';
+        $divisionsInData[$name] = true;
+    }
+    $divisionExists = [];
+    foreach (array_keys($divisionsInData) as $name) {
+        $divRow = db_one("SELECT id FROM categories WHERE type='division' AND code = ?", [$name]);
+        $divisionExists[$name] = $divRow !== null;
+    }
+
+    // ── Step 6: render preview ────────────────────────────────
+    $page_title  = 'Import BOM from Old System · preview';
+    $page_module = 'inventory_view_boms';
+    require dirname(__DIR__, 2) . '/includes/header.php';
+
+    if (!empty($parsedH['row_errors'])) {
+        echo '<div class="card" style="margin-bottom:14px; border-left: 3px solid #b3261e;">';
+        echo '<div class="card-head"><h3 style="margin:0;font-size:15px;color:#b3261e;">JSON parse notices ('
+           . count($parsedH['row_errors']) . ')</h3></div>';
+        echo '<div class="card-body"><ul style="margin:0;padding-left:20px;">';
+        foreach ($parsedH['row_errors'] as $err) {
+            echo '<li>item ' . (int)$err['line'] . ': ' . h($err['reason']) . '</li>';
+        }
+        echo '</ul></div></div>';
+    }
+
+    bom_import_render_preview_hier(
+        'Import BOM from Old Inventory · preview',
+        $token_session,
+        $upsert,
+        $parsedH['items'],
+        $edges,
+        url('/inventory.php?action=bom_old_import_commit_batch'),
+        url('/inventory.php?action=bom_grid'),
+        $divisionExists,
+        true   // batched: JS-driven commit + progress bar (avoids timeouts on large trees)
+    );
+
+    // ── Stock + locations preview card ───────────────────────────────────────
+    $locPreview     = bom_import_preview_locations($parsedH['items']);
+    $stockItemCount = 0;
+    $stockEntryCount= 0;
+    foreach ($parsedH['items'] as $it) {
+        if (!empty($it['stock_locations'])) {
+            $stockItemCount++;
+            $stockEntryCount += count($it['stock_locations']);
+        }
+    }
+    if ($stockItemCount > 0):
+        $willCreate = array_filter($locPreview, function ($l) { return $l['status'] === 'will_create'; });
+    ?>
+    <div class="card" style="margin-top:14px;">
+        <div class="card-head" style="display:flex;align-items:center;gap:10px;">
+            <h3 style="margin:0;font-size:15px;">
+                Stock quantities &amp; locations from old system
+            </h3>
+            <?php if (!empty($willCreate)): ?>
+            <span style="background:#fff3cd;color:#856404;border:1px solid #ffc107;
+                         border-radius:4px;padding:2px 8px;font-size:12px;font-weight:600;">
+                <?= count($willCreate) ?> location<?= count($willCreate) !== 1 ? 's' : '' ?> will be created
+            </span>
+            <?php endif; ?>
+        </div>
+        <div class="card-body">
+            <p style="margin:0 0 10px;font-size:13px;color:#555;">
+                <strong><?= $stockItemCount ?></strong> items ·
+                <strong><?= $stockEntryCount ?></strong> location&nbsp;×&nbsp;qty entries.
+                A <em>receive</em> transaction is posted per entry for
+                <strong>newly-created</strong> items only — reused items keep
+                their existing MagDyn stock history.
+            </p>
+
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead>
+                    <tr style="background:#f5f5f5;text-align:left;">
+                        <th style="padding:5px 10px;border-bottom:1px solid #ddd;">Old-system location</th>
+                        <th style="padding:5px 10px;border-bottom:1px solid #ddd;">MagDyn code</th>
+                        <th style="padding:5px 10px;border-bottom:1px solid #ddd;">Items</th>
+                        <th style="padding:5px 10px;border-bottom:1px solid #ddd;">Status on commit</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($locPreview as $locName => $li):
+                    $exists = ($li['status'] === 'exists');
+                ?>
+                    <tr style="border-bottom:1px solid #eee;">
+                        <td style="padding:5px 10px;"><?= h($locName) ?></td>
+                        <td style="padding:5px 10px;font-family:monospace;"><?= h($li['code']) ?></td>
+                        <td style="padding:5px 10px;"><?= (int)$li['item_count'] ?></td>
+                        <td style="padding:5px 10px;">
+                        <?php if ($exists): ?>
+                            <span style="color:#2e7d32;font-weight:600;">✓ Exists</span>
+                            <span style="color:#888;font-size:11px;">&nbsp;(id&nbsp;<?= (int)$li['id'] ?>)</span>
+                        <?php else: ?>
+                            <span style="color:#e65100;font-weight:600;">＋ Will be created</span>
+                        <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <?php endif;
+
+    require dirname(__DIR__, 2) . '/includes/footer.php';
+    exit;
+}
+
+// ── POST inventory.php?action=bom_old_import_commit ───────────────────────────
+//   Re-reads stashed JSON, re-parses, and commits.
+if ($action === 'bom_old_import_commit') {
+    if (!$canCreateBoms && !$canManageBoms) {
+        require_permission('inventory_view_boms', 'create');
+    }
+    if (!$canCreateItems && !$canManageItems) {
+        flash_set('error', 'Missing inventory_view_items.create permission.');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+    csrf_check();
+    $token  = (string)input('token', '');
+    $upsert = !empty($_POST['upsert']);
+
+    $rawJson = import_unstash($token, 'inv_bom_json');
+    if ($rawJson === null) {
+        flash_set('error', 'Import session expired. Please re-run the import.');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+    $jsonData = json_decode($rawJson, true);
+    if (!is_array($jsonData)) {
+        flash_set('error', 'Stashed import data is not valid JSON.');
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    $fks = bom_import_load_fks();
+    if (!$fks['ok']) {
+        flash_set('error', $fks['reason']);
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    $parsedH = bom_import_parse_json_response($jsonData);
+    $edges   = bom_import_resolve_edges($parsedH['items'], $parsedH['edges'], $upsert);
+    bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
+
+    $stats = ['items_created' => 0, 'items_reused' => 0,
+              'edges_inserted' => 0, 'edges_updated' => 0,
+              'divisions_created' => 0, 'divisions_created_names' => [],
+              'stocks_imported' => 0, 'stocks_zero_skip' => 0,
+              'stock_errors' => [],
+              'error' => ''];
+    $ok = bom_import_commit_hierarchical($parsedH['items'], $edges, $fks, $stats);
+    if (!$ok) {
+        flash_set('error', 'Import failed: ' . $stats['error']);
+        redirect(url('/inventory.php?action=bom_grid'));
+    }
+
+    // ── Step 4: import stock quantities from old system ───────────────────────
+    // Posts a 'receive' transaction per (new item, location) pair.
+    // Skips reused items (they already have MagDyn stock history).
+    // Auto-creates locations in MagDyn's 'locations' table if needed.
+    bom_old_import_commit_stock($parsedH['items'], $stats);
+
+    // Find first root for redirect target
+    $rootCode = null;
+    foreach ($parsedH['items'] as $code => $it) {
+        if ($it['is_root']) { $rootCode = $code; break; }
+    }
+    $rootDbId = $rootCode !== null
+        ? (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$rootCode])
+        : 0;
+
+    db_exec(
+        "INSERT INTO audit_log (actor_id, action, target_id, details)
+         VALUES (?, 'inventory.bom.old_import_json', ?, ?)",
+        [current_user_id(), $rootDbId, json_encode($stats)]
+    );
+
+    flash_set('success', bom_old_import_build_summary($stats));
+
+    if ($rootDbId > 0) {
+        redirect(url('/inventory.php?action=bom_view&id=' . $rootDbId));
+    }
+    redirect(url('/inventory.php?action=bom_grid'));
+}
+
+// ── POST inventory.php?action=bom_old_import_commit_batch (AJAX) ───────────────
+//   JS-driven batched commit. Each call processes ONE slice of ONE phase
+//   (items → edges → stock) and returns JSON progress. The plan is built once
+//   (first call) and parked in the session keyed by the stash token.
+if ($action === 'bom_old_import_commit_batch') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    $deny = null;
+    if (!$canCreateBoms && !$canManageBoms)   $deny = 'Permission denied (need BOM create).';
+    if (!$canCreateItems && !$canManageItems) $deny = 'Missing inventory_view_items.create permission.';
+    if ($deny !== null) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => $deny]);
+        exit;
+    }
+    csrf_check();
+
+    $token  = (string)input('token', '');
+    $upsert = !empty($_POST['upsert']) && (string)$_POST['upsert'] !== '0';
+    $phase  = (string)input('phase', 'items');
+    $offset = max(0, (int)input('offset', 0));
+
+    try {
+        $plan = bom_batch_plan_load($token);
+
+        // ── Build the plan once, on the very first call (items @ 0) ──────────
+        if ($plan === null) {
+            if ($phase !== 'items' || $offset !== 0) {
+                echo json_encode(['ok' => false, 'error' => 'Import session expired. Please re-run the import.']);
+                exit;
+            }
+            $rawJson = import_unstash_peek($token, 'inv_bom_json');
+            if ($rawJson === null) {
+                echo json_encode(['ok' => false, 'error' => 'Import session expired. Please re-run the import.']);
+                exit;
+            }
+            $jsonData = json_decode($rawJson, true);
+            if (!is_array($jsonData)) {
+                echo json_encode(['ok' => false, 'error' => 'Stashed import data is not valid JSON.']);
+                exit;
+            }
+            $fks = bom_import_load_fks();
+            if (!$fks['ok']) {
+                echo json_encode(['ok' => false, 'error' => $fks['reason']]);
+                exit;
+            }
+            $parsedH = bom_import_parse_json_response($jsonData);
+            $edges   = bom_import_resolve_edges($parsedH['items'], $parsedH['edges'], $upsert);
+            bom_import_check_cross_row_cycles_hier($parsedH['items'], $edges);
+
+            $stats = [
+                'items_created'  => 0, 'items_reused'   => 0,
+                'edges_inserted' => 0, 'edges_updated'  => 0, 'edge_errors' => [],
+                'divisions_created' => 0, 'divisions_created_names' => [],
+            ];
+            bom_old_import_stock_init_stats($stats);
+
+            $plan = [
+                'item_codes' => array_keys($parsedH['items']),
+                'items'      => $parsedH['items'],
+                'edges'      => $edges['rows'],
+                'fks'        => $fks,
+                'upsert'     => $upsert ? 1 : 0,
+                'txn_date'   => date('Y-m-d H:i:s'),
+                'stats'      => $stats,
+            ];
+            bom_batch_plan_save($token, $plan);
+            // The raw JSON stash is now superseded by the plan — free it.
+            import_unstash($token, 'inv_bom_json');
+        }
+
+        $stats  = $plan['stats'];
+        $totals = [
+            'items' => count($plan['item_codes']),
+            'edges' => count($plan['edges']),
+            'stock' => count($plan['item_codes']),
+        ];
+        if (!isset($totals[$phase])) {
+            echo json_encode(['ok' => false, 'error' => 'Unknown phase: ' . $phase]);
+            exit;
+        }
+
+        // ── Process one batch for the requested phase ────────────────────────
+        if ($phase === 'items') {
+            $processed = bom_batch_commit_items($plan, $offset, $stats);
+        } elseif ($phase === 'edges') {
+            $processed = bom_batch_commit_edges($plan, $offset, $stats);
+        } else {
+            $processed = bom_batch_commit_stock($plan, $offset, $stats);
+        }
+
+        $nextOffset = $offset + $processed;
+        $phaseTotal = (int)$totals[$phase];
+        $phaseDone  = ($nextOffset >= $phaseTotal) || ($processed === 0);
+
+        // Persist accumulated stats back to the plan.
+        $plan['stats'] = $stats;
+        bom_batch_plan_save($token, $plan);
+
+        $resp = [
+            'ok'          => true,
+            'phase'       => $phase,
+            'total'       => $phaseTotal,
+            'done'        => $phaseDone ? $phaseTotal : $nextOffset,
+            'next_offset' => $nextOffset,
+            'phase_done'  => $phaseDone,
+            'all_done'    => false,
+            'stats'       => bom_old_import_stats_brief($stats),
+        ];
+
+        // ── Finalize when the LAST phase (stock) completes ───────────────────
+        if ($phase === 'stock' && $phaseDone) {
+            $rootCode = null;
+            foreach ($plan['items'] as $code => $it) {
+                if (!empty($it['is_root'])) { $rootCode = $code; break; }
+            }
+            $rootDbId = $rootCode !== null
+                ? (int)db_val('SELECT id FROM inv_items WHERE code = ?', [$rootCode], 0)
+                : 0;
+
+            db_exec(
+                "INSERT INTO audit_log (actor_id, action, target_id, details)
+                 VALUES (?, 'inventory.bom.old_import_json', ?, ?)",
+                [current_user_id(), $rootDbId, json_encode($stats)]
+            );
+
+            flash_set('success', bom_old_import_build_summary($stats));
+            bom_batch_plan_clear($token);
+
+            $resp['all_done'] = true;
+            $resp['summary']  = bom_old_import_build_summary($stats);
+            $resp['redirect'] = $rootDbId > 0
+                ? url('/inventory.php?action=bom_view&id=' . $rootDbId)
+                : url('/inventory.php?action=bom_grid');
+        }
+
+        echo json_encode($resp);
+        exit;
+
+    } catch (Exception $e) {
+        echo json_encode([
+            'ok'    => false,
+            'error' => 'Batch failed (' . $phase . ' @ ' . $offset . '): ' . $e->getMessage(),
+        ]);
+        exit;
+    }
 }
 
 if ($action === 'bom_line_add') {

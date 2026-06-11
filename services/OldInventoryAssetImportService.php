@@ -8,8 +8,9 @@
  *
  * Field mapping (old → new):
  *   asset.asset_id               → assets.asset_tag       (upsert key)
+ *   asset.parent_asset_id        → assets.parent_asset_id (resolved via asset_tag, second pass)
  *   asset.asset_code             → assets.asset_name      (individual asset name)
- *   asset_model.asset_model_code → asset_models.code         (created if missing)
+ *   asset_model.asset_model_id   → asset_models.code         (stable numeric join key)
  *   asset_model.asset_model_code → asset_models.model_number (raw model number from old system)
  *   asset_model.short_description→ asset_models.name
  *   category.short_description   → asset_models.category
@@ -17,9 +18,16 @@
  *   location.short_description   → locations.name         (matched by name)
  *   checkout_due  (API field)    → assets.checkout_due_on (most recent)
  *   checked_out_flag (API field) → status: 0=active, 1+company=with_vendor, 1+no company=with_user
+ *   archived_flag (API field)    → status=archived (overrides checked_out_flag; clears holder)
  *   checkout_due_on cleared to NULL when checked_out_flag=0 (asset returned, old tx history ignored)
- *   cfv_22 / due_back (API)      → informational note
+ *   cfv_2  / asset_notes  (API)  → assets.notes
+ *   cfv_3  / a_price      (API)  → assets.a_price
+ *   cfv_22 / cal_done_on  (API)  → assets.cal_done_on
  *   cfv_23 / next_cal_due (API)  → assets.next_cal_due_on
+ *   cfv_51 / cal_frequency(API)  → assets.cal_frequency_id (asset_cal_frequencies, find/create)
+ *   cfv_54 / engraved     (API)  → assets.engraved_id      (asset_engraved_options, find/create)
+ *   cfv_55 / calibration  (API)  → assets.calibration_id   (asset_calibration_options, find/create)
+ *   cfv_56 / checked_ok   (API)  → assets.checked_ok_id    (asset_checked_ok_options, find/create)
  *   inv_notes class='A' (API)    → notes (entity_type='asset')
  *   notes_attachments filenames  → appended to note body (not physically copied)
  *
@@ -55,14 +63,23 @@ class OldInventoryAssetImportService
     /** @var array<string,int|null>  username → users.id cache (null = no match) */
     private array $userCache = [];
 
+    /** @var array<string,int>  "table|lower(label)" → lookup row id cache */
+    private array $lookupCache = [];
+
     /** @var array<int,bool>  old asset_transaction_id values imported this run (dedup guard) */
     private array $importedAtxnIds = [];
+
+    /** @var array<int,int>  new assets.id → old parent asset_id (0 = no parent); resolved post-pass */
+    private array $pendingParents = [];
 
     /** @var int  Magdyn location ID — fallback when old-system name has no match */
     private int $defaultLocationId = 0;
 
     /** @var array  Accumulated log entries */
     private array $errors = [];
+
+    /** @var callable|null  Progress reporter: fn(string $phase, int $done, int $total) */
+    private $onProgress = null;
 
     /** @var array */
     private array $counts = [
@@ -73,6 +90,7 @@ class OldInventoryAssetImportService
         'updated'       => 0,
         'failed'        => 0,
         'skipped'       => 0,
+        'parent_linked' => 0,
         'txn_total'     => 0,
         'txn_imported'  => 0,
         'txn_failed'    => 0,
@@ -82,6 +100,23 @@ class OldInventoryAssetImportService
     public function __construct(int $actorUserId)
     {
         $this->actorId = $actorUserId;
+    }
+
+    /**
+     * Register a progress reporter, invoked as fn(string $phase, int $done, int $total)
+     * after each batch / phase so callers (e.g. the streaming import page) can show
+     * a bar. Phase is one of: 'Models', 'Assets', 'Transactions'.
+     */
+    public function setProgressCallback(callable $cb): void
+    {
+        $this->onProgress = $cb;
+    }
+
+    private function emitProgress(string $phase, int $done, int $total): void
+    {
+        if ($this->onProgress) {
+            ($this->onProgress)($phase, $done, $total);
+        }
     }
 
     // ----------------------------------------------------------------
@@ -109,6 +144,10 @@ class OldInventoryAssetImportService
         $this->counts['total'] = (int) ($countData['count'] ?? 0);
         $this->log("Phase 1 — assets: {$this->counts['total']} found in source.");
 
+        $assetTotal = $this->counts['total'];
+        $processed  = 0;
+        $this->emitProgress('Assets', 0, $assetTotal);
+
         $offset = 0;
 
         while (true) {
@@ -120,12 +159,18 @@ class OldInventoryAssetImportService
             }
 
             $this->processBatch($batch);
+
+            $processed += count($batch);
+            $this->emitProgress('Assets', min($processed, $assetTotal), $assetTotal);
+
             $offset += self::BATCH_SIZE;
 
             if (count($batch) < self::BATCH_SIZE) {
                 break;  // last page
             }
         }
+
+        $this->emitProgress('Assets', $assetTotal, $assetTotal);
 
         $this->log(
             "Assets done — " .
@@ -134,6 +179,15 @@ class OldInventoryAssetImportService
             "Failed: {$this->counts['failed']}, " .
             "Skipped: {$this->counts['skipped']}."
         );
+
+        // ── Phase 1b: Parent asset links ─────────────────────────────────────
+        // Resolved only after every asset exists, since a child may be
+        // processed before its parent within the paged batches.
+        try {
+            $this->resolveParents();
+        } catch (\Throwable $e) {
+            $this->log('Parent link resolution aborted: ' . $e->getMessage(), 'error');
+        }
 
         // ── Phase 2: Transaction history ─────────────────────────────────────
         try {
@@ -165,6 +219,7 @@ class OldInventoryAssetImportService
             // actual DB state instead of using now-invalid IDs.
             $this->modelCache    = [];
             $this->locationCache = [];
+            $this->lookupCache   = [];
             $this->log("Batch transaction rolled back: " . $e->getMessage(), 'error');
             $this->counts['failed'] += count($batch);
         }
@@ -193,8 +248,28 @@ class OldInventoryAssetImportService
             $locationId  = $this->resolveLocation((string) ($row['internal_location'] ?? ''));
             $nextCalDue  = $this->parseOldDate((string) ($row['next_cal_due'] ?? ''));
             $assetName      = trim((string) ($row['asset_code'] ?? '')) ?: null;
+
+            // Custom fields (asset_custom_field_helper → custom_field):
+            //   cfv_2  Notes        cfv_3  A_Price       cfv_22 Calibration Done On
+            //   cfv_51 Cal Freq     cfv_54 Engraved      cfv_55 Calibration (Calib/AMC)
+            //   cfv_56 Checked OK
+            // Select-type fields arrive as option text and resolve to a row
+            // in the matching asset_* lookup table (created on first sight).
+            $calDoneOn   = $this->parseOldDate((string) ($row['cal_done_on'] ?? ''));
+            $aPrice      = $this->parsePrice((string) ($row['a_price'] ?? ''));
+            $assetNotes  = trim((string) ($row['asset_notes'] ?? '')) ?: null;
+            $calFreqId   = $this->resolveLookup('asset_cal_frequencies',     $this->normalizeFrequency((string) ($row['cal_frequency'] ?? '')));
+            $engravedId  = $this->resolveLookup('asset_engraved_options',    (string) ($row['engraved']      ?? ''));
+            $calibId     = $this->resolveLookup('asset_calibration_options', (string) ($row['calibration']   ?? ''));
+            $checkedId   = $this->resolveLookup('asset_checked_ok_options',  (string) ($row['checked_ok']    ?? ''));
             $companyName    = $row['company_name']   ?? null;
             $checkedOutFlag = (int) ($row['checked_out_flag'] ?? 0); // 1 = currently checked out
+            $archivedFlag   = (int) ($row['archived_flag'] ?? 0);    // 1 = archived in old system
+            // Old asset.parent_asset_id (points to another old asset_id). Stored
+            // now and resolved to a new assets.id in resolveParents() once all
+            // assets exist — a child can precede its parent across paged batches.
+            $oldParentId    = isset($row['parent_asset_id']) && $row['parent_asset_id'] !== null
+                ? (int) $row['parent_asset_id'] : 0;
 
             // Use checked_out_flag as the authoritative source.
             // The transaction history alone is unreliable — old inventory
@@ -228,6 +303,17 @@ class OldInventoryAssetImportService
                 $issuedDate   = null;
             }
 
+            // archived_flag wins over the checkout state: an archived asset in
+            // the old system becomes an inactive (archived) asset in MagDyn,
+            // with no current holder or checkout placeholder transaction.
+            if ($archivedFlag === 1) {
+                $importStatus = 'archived';
+                $vendorId     = null;
+                $userId       = null;
+                $checkoutDue  = null;
+                $issuedDate   = null;
+            }
+
             $existing = $this->findExistingAsset($assetId);
 
             if ($existing) {
@@ -236,7 +322,14 @@ class OldInventoryAssetImportService
                     'location_id'       => $locationId,
                     'checkout_due_on'   => $checkoutDue,
                     'next_cal_due_on'   => $nextCalDue,
+                    'cal_done_on'       => $calDoneOn,
                     'asset_name'        => $assetName,
+                    'notes'             => $assetNotes,
+                    'a_price'           => $aPrice,
+                    'cal_frequency_id'  => $calFreqId,
+                    'engraved_id'       => $engravedId,
+                    'calibration_id'    => $calibId,
+                    'checked_ok_id'     => $checkedId,
                     'status'            => $importStatus,
                     'current_vendor_id' => $vendorId,
                     'current_user_id'   => $userId,
@@ -251,12 +344,22 @@ class OldInventoryAssetImportService
                     'location_id'       => $locationId,
                     'checkout_due_on'   => $checkoutDue,
                     'next_cal_due_on'   => $nextCalDue,
+                    'cal_done_on'       => $calDoneOn,
+                    'notes'             => $assetNotes,
+                    'a_price'           => $aPrice,
+                    'cal_frequency_id'  => $calFreqId,
+                    'engraved_id'       => $engravedId,
+                    'calibration_id'    => $calibId,
+                    'checked_ok_id'     => $checkedId,
                     'status'            => $importStatus,
                     'current_vendor_id' => $vendorId,
                     'current_user_id'   => $userId,
                 ]);
                 $this->counts['imported']++;
             }
+
+            // Remember the old parent link for the post-pass resolver.
+            $this->pendingParents[$newAssetId] = $oldParentId;
 
             // Create / refresh the checkout transaction so checkout_issued_at
             // is populated for with_vendor / with_user assets. This lets the
@@ -295,89 +398,60 @@ class OldInventoryAssetImportService
      */
     private function resolveModel(array $row): int
     {
-        $code         = trim((string) ($row['asset_model_code']  ?? ''));
+        $oldModelId   = isset($row['asset_model_id']) ? (int) $row['asset_model_id'] : 0;
         $name         = trim((string) ($row['model_name']        ?? ''));
         $category     = trim((string) ($row['category_name']     ?? ''));
         $manufacturer = trim((string) ($row['manufacturer_name'] ?? ''));
-        // model_number maps directly to asset_model_code from the old system
+        // The old asset_model_code text is preserved as model_number; the new
+        // Code is the old asset_model_id (a stable, unique numeric join key).
         $modelNumber  = trim((string) ($row['asset_model_code']  ?? ''));
 
-        // Use model name as fallback code when code is blank.
-        // If both are blank, use 'MODEL-<old_id>' so each null-code model
-        // gets a unique, stable identifier instead of all collapsing to
-        // the same 'UNKNOWN' entry.
-        if ($code === '') {
-            if ($name !== '') {
-                $code = $name;
-            } else {
-                $oldId = isset($row['asset_model_id']) ? (int) $row['asset_model_id'] : 0;
-                $code  = $oldId > 0 ? 'MODEL-' . $oldId : 'UNKNOWN';
-            }
+        // Code = old asset_model_id. If it is somehow missing, fall back to the
+        // old code text, then the name, so the model still imports uniquely.
+        if ($oldModelId > 0) {
+            $code = (string) $oldModelId;
+        } elseif ($modelNumber !== '') {
+            $code = $modelNumber;
+        } elseif ($name !== '') {
+            $code = $name;
+        } else {
+            $code = 'UNKNOWN';
         }
         if ($name === '') {
-            $name = $code;
+            $name = $modelNumber !== '' ? $modelNumber : $code;
         }
 
-        // Cache key is the original (pre-truncation) code so re-lookups within
-        // the same batch always hit the cache even if the stored code differs.
         $cacheKey = $code;
 
         if (isset($this->modelCache[$cacheKey])) {
             return $this->modelCache[$cacheKey];
         }
 
-        // Check DB by exact truncated code first
+        $dbCode = substr($code, 0, 40);
+
+        // Match by Code (old asset_model_id). Refresh descriptive fields that
+        // may have been absent when the row was first created.
         $existing = db_one(
             'SELECT id FROM asset_models WHERE code = ? LIMIT 1',
-            [substr($code, 0, 40)]
+            [$dbCode]
         );
         if ($existing) {
-            // Update manufacturer / model_number if they are now available
-            // (Phase 0 may have created the record without these when the
-            //  API did not yet return them)
             db_exec(
                 'UPDATE asset_models
-                 SET manufacturer = COALESCE(NULLIF(?, \'\'), manufacturer),
-                     model_number  = COALESCE(NULLIF(?, \'\'), model_number)
+                 SET name         = COALESCE(NULLIF(?, \'\'), name),
+                     category     = COALESCE(NULLIF(?, \'\'), category),
+                     manufacturer = COALESCE(NULLIF(?, \'\'), manufacturer),
+                     model_number = COALESCE(NULLIF(?, \'\'), model_number)
                  WHERE id = ?',
                 [
+                    $name,
+                    $category     ?: null,
                     $manufacturer ?: null,
                     $modelNumber  ?: null,
                     (int) $existing['id'],
                 ]
             );
             return $this->modelCache[$cacheKey] = (int) $existing['id'];
-        }
-
-        // Also check by name — handles the case where a previous batch already
-        // inserted this model under a suffixed code.
-        $existing = db_one(
-            'SELECT id FROM asset_models WHERE name = ? LIMIT 1',
-            [$name]
-        );
-        if ($existing) {
-            db_exec(
-                'UPDATE asset_models
-                 SET manufacturer = COALESCE(NULLIF(?, \'\'), manufacturer),
-                     model_number  = COALESCE(NULLIF(?, \'\'), model_number)
-                 WHERE id = ?',
-                [
-                    $manufacturer ?: null,
-                    $modelNumber  ?: null,
-                    (int) $existing['id'],
-                ]
-            );
-            return $this->modelCache[$cacheKey] = (int) $existing['id'];
-        }
-
-        // Generate a unique code (max 40 chars). Long names are truncated; if
-        // the truncated value already exists, append -1, -2 … until unique.
-        $baseCode = substr($code, 0, 40);
-        $dbCode   = $baseCode;
-        $suffix   = 1;
-        while (db_one('SELECT id FROM asset_models WHERE code = ? LIMIT 1', [$dbCode])) {
-            $tag    = '-' . $suffix++;
-            $dbCode = substr($baseCode, 0, 40 - strlen($tag)) . $tag;
         }
 
         db_exec(
@@ -509,6 +583,97 @@ class OldInventoryAssetImportService
     }
 
     // ----------------------------------------------------------------
+    // Lookup-table resolution (cal frequency / engraved / calibration / checked-ok)
+    // ----------------------------------------------------------------
+
+    /**
+     * Find or create a row in one of the asset dropdown lookup tables
+     * (asset_cal_frequencies, asset_engraved_options,
+     *  asset_calibration_options, asset_checked_ok_options) by its label.
+     *
+     * Old-system select fields store their option text directly in
+     * asset_custom_field_helper, so we match case-insensitively on label
+     * and create the option (is_active=1) the first time it's seen.
+     * Returns the row id, or null when the label is blank.
+     */
+    private function resolveLookup(string $table, string $label): ?int
+    {
+        $label = trim($label);
+        if ($label === '') {
+            return null;
+        }
+
+        $cacheKey = $table . '|' . strtolower($label);
+        if (array_key_exists($cacheKey, $this->lookupCache)) {
+            return $this->lookupCache[$cacheKey];
+        }
+
+        $row = db_one(
+            "SELECT id FROM `$table` WHERE LOWER(label) = LOWER(?) LIMIT 1",
+            [$label]
+        );
+        if ($row) {
+            return $this->lookupCache[$cacheKey] = (int) $row['id'];
+        }
+
+        db_exec(
+            "INSERT INTO `$table` (label, sort_order, is_active) VALUES (?, 100, 1)",
+            [$label]
+        );
+        $id = (int) db_val('SELECT LAST_INSERT_ID()', [], 0);
+        $this->log("Created new {$table} option: '{$label}'");
+
+        return $this->lookupCache[$cacheKey] = $id;
+    }
+
+    /**
+     * Map old-system calibration-frequency labels onto MagDyn's seeded
+     * asset_cal_frequencies labels so imports reuse the existing options
+     * (which carry the `months` value used for next-due auto-calc) instead
+     * of creating month-less duplicates. Unknown labels pass through and are
+     * created verbatim by resolveLookup().
+     */
+    private function normalizeFrequency(string $label): string
+    {
+        $map = [
+            'yearly'        => 'Annual',
+            'annually'      => 'Annual',
+            'every 2 years' => 'Bi-Annual',
+            'every 2 year'  => 'Bi-Annual',
+            'biennial'      => 'Bi-Annual',
+            'half yearly'   => 'Half-Yearly',
+            'half-yearly'   => 'Half-Yearly',
+            'monthly'       => 'Monthly',
+            'quarterly'     => 'Quarterly',
+            'on demand'     => 'On Demand',
+        ];
+        $key = strtolower(trim($label));
+        return $map[$key] ?? trim($label);
+    }
+
+    // ----------------------------------------------------------------
+    // Price parsing
+    // ----------------------------------------------------------------
+
+    /**
+     * Parse the old A_Price custom field (cfv_3) into a float.
+     * Strips currency symbols / thousands separators; returns null when
+     * blank or non-numeric.
+     */
+    private function parsePrice(string $raw): ?float
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return null;
+        }
+        $clean = preg_replace('/[^0-9.\-]/', '', $raw);
+        if ($clean === '' || $clean === '-' || $clean === '.' || !is_numeric($clean)) {
+            return null;
+        }
+        return (float) $clean;
+    }
+
+    // ----------------------------------------------------------------
     // Date parsing
     // ----------------------------------------------------------------
 
@@ -567,8 +732,9 @@ class OldInventoryAssetImportService
         db_exec(
             'INSERT INTO assets
                 (asset_tag, asset_name, model_id, location_id, checkout_due_on, next_cal_due_on,
+                 cal_done_on, notes, a_price, cal_frequency_id, engraved_id, calibration_id, checked_ok_id,
                  status, current_vendor_id, current_user_id, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
                 $d['asset_tag'],
                 $d['asset_name'],
@@ -576,6 +742,13 @@ class OldInventoryAssetImportService
                 $d['location_id'],
                 $d['checkout_due_on'],
                 $d['next_cal_due_on'],
+                $d['cal_done_on'],
+                $d['notes'],
+                $d['a_price'],
+                $d['cal_frequency_id'],
+                $d['engraved_id'],
+                $d['calibration_id'],
+                $d['checked_ok_id'],
                 $d['status'],
                 $d['current_vendor_id'] ?? null,
                 $d['current_user_id']   ?? null,
@@ -594,7 +767,14 @@ class OldInventoryAssetImportService
                  location_id       = ?,
                  checkout_due_on   = ?,
                  next_cal_due_on   = ?,
+                 cal_done_on       = ?,
                  asset_name        = ?,
+                 notes             = ?,
+                 a_price           = ?,
+                 cal_frequency_id  = ?,
+                 engraved_id       = ?,
+                 calibration_id    = ?,
+                 checked_ok_id     = ?,
                  status            = ?,
                  current_vendor_id = ?,
                  current_user_id   = ?
@@ -604,13 +784,75 @@ class OldInventoryAssetImportService
                 $d['location_id'],
                 $d['checkout_due_on'],
                 $d['next_cal_due_on'],
+                $d['cal_done_on'],
                 $d['asset_name'],
+                $d['notes'],
+                $d['a_price'],
+                $d['cal_frequency_id'],
+                $d['engraved_id'],
+                $d['calibration_id'],
+                $d['checked_ok_id'],
                 $d['status'],
                 $d['current_vendor_id'] ?? null,
                 $d['current_user_id']   ?? null,
                 $id,
             ]
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Parent asset linkage (Phase 1b)
+    // ----------------------------------------------------------------
+
+    /**
+     * Resolve old parent_asset_id values into new assets.parent_asset_id.
+     *
+     * Old asset.parent_asset_id references another old asset_id; in MagDyn the
+     * old asset_id is stored in assets.asset_tag, so the parent is found by
+     * asset_tag lookup. Runs after every asset has been imported (a child can
+     * appear before its parent across paginated batches), and re-clears the
+     * link when the old system no longer has a parent so re-imports stay in sync.
+     */
+    private function resolveParents(): void
+    {
+        if (empty($this->pendingParents)) {
+            return;
+        }
+
+        $linked = 0;
+        $missing = 0;
+
+        foreach ($this->pendingParents as $newAssetId => $oldParentId) {
+            $parentNewId = null;
+
+            if ($oldParentId > 0) {
+                $parent = db_one(
+                    'SELECT id FROM assets WHERE asset_tag = ? LIMIT 1',
+                    [(string) $oldParentId]
+                );
+                if ($parent && (int) $parent['id'] !== $newAssetId) {
+                    $parentNewId = (int) $parent['id'];
+                } elseif (!$parent) {
+                    $missing++;
+                    $this->log(
+                        "Parent asset_id={$oldParentId} for new asset id={$newAssetId} not found — link left empty.",
+                        'warn'
+                    );
+                }
+            }
+
+            db_exec(
+                'UPDATE assets SET parent_asset_id = ? WHERE id = ?',
+                [$parentNewId, $newAssetId]
+            );
+
+            if ($parentNewId !== null) {
+                $linked++;
+            }
+        }
+
+        $this->counts['parent_linked'] = $linked;
+        $this->log("Parent links resolved — {$linked} linked, {$missing} parent not found.");
     }
 
     // ----------------------------------------------------------------
@@ -778,6 +1020,10 @@ class OldInventoryAssetImportService
         // Snapshot the current model count so we can report net-new creates
         $beforeCount = (int) db_val('SELECT COUNT(*) FROM asset_models', [], 0);
 
+        $modelTotal = $this->counts['model_total'];
+        $processed  = 0;
+        $this->emitProgress('Models', 0, $modelTotal);
+
         $offset = 0;
 
         while (true) {
@@ -797,12 +1043,17 @@ class OldInventoryAssetImportService
                 }
             }
 
+            $processed += count($batch);
+            $this->emitProgress('Models', min($processed, $modelTotal), $modelTotal);
+
             $offset += self::BATCH_SIZE;
 
             if (count($batch) < self::BATCH_SIZE) {
                 break;
             }
         }
+
+        $this->emitProgress('Models', $modelTotal, $modelTotal);
 
         $afterCount = (int) db_val('SELECT COUNT(*) FROM asset_models', [], 0);
         $this->counts['model_created'] = max(0, $afterCount - $beforeCount);
@@ -852,6 +1103,10 @@ class OldInventoryAssetImportService
         $this->counts['txn_total'] = (int) ($countData['count'] ?? 0);
         $this->log("Phase 2 — transactions: {$this->counts['txn_total']} found in source.");
 
+        $txnTotal  = $this->counts['txn_total'];
+        $processed = 0;
+        $this->emitProgress('Transactions', 0, $txnTotal);
+
         $offset = 0;
 
         while (true) {
@@ -879,12 +1134,17 @@ class OldInventoryAssetImportService
                 }
             }
 
+            $processed += count($batch);
+            $this->emitProgress('Transactions', min($processed, $txnTotal), $txnTotal);
+
             $offset += self::BATCH_SIZE;
 
             if (count($batch) < self::BATCH_SIZE) {
                 break;
             }
         }
+
+        $this->emitProgress('Transactions', $txnTotal, $txnTotal);
 
         $this->log(
             "Transactions done — " .

@@ -1,0 +1,11 @@
+{
+    "require": {
+        "dompdf/dompdf": "^2.0"
+    },
+    "config": {
+        "audit": {
+            "abandoned": "ignore",
+            "ignore": ["PKSA-7ztm-rpt3-qqzk", "PKSA-4jrs-y99s-q8j6", "PKSA-hbk6-2vfz-8f8n"]
+        }
+    }
+}
