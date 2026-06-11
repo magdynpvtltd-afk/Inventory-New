@@ -142,7 +142,11 @@ if ($action === 'all_shipments_json') {
             t.modified_date                     AS txn_modified_date,
             (SELECT COALESCE(MAX(it2.modified_date), MAX(it2.creation_date))
                FROM inventory_transaction it2
-              WHERE it2.transaction_id = s.transaction_id) AS event_date
+              WHERE it2.transaction_id = s.transaction_id) AS event_date,
+            -- S_Order No = the old PO number. Stored in the shipment custom-field
+            -- helper column cfv_9, which is custom_field_id 9 ('S_Order No' in the
+            -- `custom_field` table). This becomes the system PO number on import.
+            scf.cfv_9                           AS s_order_no
         FROM shipment s
         JOIN `transaction` t
             ON t.transaction_id = s.transaction_id
@@ -152,6 +156,8 @@ if ($action === 'all_shipments_json') {
             ON fc.company_id = s.from_company_id
         LEFT JOIN company tc
             ON tc.company_id = s.to_company_id
+        LEFT JOIN shipment_custom_field_helper scf
+            ON scf.shipment_id = s.shipment_id
         ORDER BY s.shipment_id ASC
         LIMIT " . $limit . " OFFSET " . $offset . "
     ";
@@ -186,12 +192,17 @@ if ($action === 'all_receipts_json') {
             t.modified_date             AS txn_modified_date,
             (SELECT COALESCE(MAX(it2.modified_date), MAX(it2.creation_date))
                FROM inventory_transaction it2
-              WHERE it2.transaction_id = r.transaction_id) AS event_date
+              WHERE it2.transaction_id = r.transaction_id) AS event_date,
+            -- S_Order No = old PO number (receipt custom-field helper cfv_9 =
+            -- custom_field_id 9, 'S_Order No'). Becomes the system PO number.
+            rcf.cfv_9                   AS s_order_no
         FROM receipt r
         JOIN `transaction` t
             ON t.transaction_id = r.transaction_id
         LEFT JOIN company fc
             ON fc.company_id = r.from_company_id
+        LEFT JOIN receipt_custom_field_helper rcf
+            ON rcf.receipt_id = r.receipt_id
         ORDER BY r.receipt_id ASC
         LIMIT " . $limit . " OFFSET " . $offset . "
     ";
@@ -313,6 +324,10 @@ if ($action === 'all_shipments_with_lines_json') {
             (SELECT COALESCE(MAX(it2.modified_date), MAX(it2.creation_date))
                FROM inventory_transaction it2
               WHERE it2.transaction_id = s.transaction_id) AS event_date,
+            -- S_Order No = old PO number (shipment custom-field helper cfv_9 =
+            -- custom_field_id 9, 'S_Order No'). Drives the system PO number and
+            -- the combine-by-order grouping on import.
+            scf.cfv_9                           AS s_order_no,
             im.inventory_model_id               AS item_model_id,
             im.inventory_model_code             AS item_code,
             im.short_description                AS item_name,
@@ -326,6 +341,8 @@ if ($action === 'all_shipments_with_lines_json') {
             ON fc.company_id = s.from_company_id
         LEFT JOIN company tc
             ON tc.company_id = s.to_company_id
+        LEFT JOIN shipment_custom_field_helper scf
+            ON scf.shipment_id = s.shipment_id
         LEFT JOIN inventory_transaction it
             ON it.transaction_id = s.transaction_id
         LEFT JOIN inventory_location il
@@ -362,6 +379,7 @@ if ($action === 'all_shipments_with_lines_json') {
                 'txn_date'           => $row['txn_date'],
                 'txn_modified_date'  => $row['txn_modified_date'],
                 'event_date'         => $row['event_date'],
+                's_order_no'         => $row['s_order_no'],   // old PO number (cfv_9)
                 'lines'              => array(),
             );
         }
@@ -433,6 +451,10 @@ if ($action === 'all_receipts_with_lines_json') {
             (SELECT COALESCE(MAX(it2.modified_date), MAX(it2.creation_date))
                FROM inventory_transaction it2
               WHERE it2.transaction_id = r.transaction_id) AS event_date,
+            -- S_Order No = old PO number (receipt custom-field helper cfv_9 =
+            -- custom_field_id 9, 'S_Order No'). Drives the system PO number and
+            -- the combine-by-order grouping on import.
+            rcf.cfv_9                   AS s_order_no,
             im.inventory_model_id       AS item_model_id,
             im.inventory_model_code     AS item_code,
             im.short_description        AS item_name,
@@ -442,6 +464,8 @@ if ($action === 'all_receipts_with_lines_json') {
             ON t.transaction_id = r.transaction_id
         LEFT JOIN company fc
             ON fc.company_id = r.from_company_id
+        LEFT JOIN receipt_custom_field_helper rcf
+            ON rcf.receipt_id = r.receipt_id
         LEFT JOIN inventory_transaction it
             ON it.transaction_id = r.transaction_id
         LEFT JOIN inventory_location il
@@ -476,6 +500,7 @@ if ($action === 'all_receipts_with_lines_json') {
                 'txn_date'           => $row['txn_date'],
                 'txn_modified_date'  => $row['txn_modified_date'],
                 'event_date'         => $row['event_date'],
+                's_order_no'         => $row['s_order_no'],   // old PO number (cfv_9)
                 'lines'              => array(),
             );
         }

@@ -28,6 +28,95 @@ require_login();
 require_once __DIR__ . '/includes/_notes.php';
 require_once __DIR__ . '/includes/datatable.php';
 
+/**
+ * Render the "import results" page (stat cards + import log). Shown after a
+ * POST to ?action=import_old. Mirrors the layout used by the asset/vendor
+ * importers on old_inventory_import.php.
+ */
+function running_notes_render_import_result(array $result, ?string $fatalError): void
+{
+    $page_title  = 'Import Running Notes — Results';
+    $page_module = 'running_notes';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="form-page">
+        <?= form_toolbar([
+            'title'      => 'Import Running Notes — Results',
+            'back_href'  => url('/running_notes.php?action=import'),
+            'back_label' => 'Back to Import',
+        ]) ?>
+        <div class="form-page-body" style="max-width:820px;">
+        <?php if ($fatalError): ?>
+            <div class="alert alert-error">
+                <strong>Import failed with a fatal error:</strong><br>
+                <code><?= h($fatalError) ?></code>
+            </div>
+        <?php else: ?>
+            <h3 style="margin:0 0 8px;">Notes</h3>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+                <?php foreach ([
+                    ['Found in source', $result['note_total']    ?? 0, '#f3f4f6', '#374151'],
+                    ['Imported',        $result['note_imported'] ?? 0, '#d1fae5', '#065f46'],
+                    ['Skipped',         $result['note_skipped']  ?? 0, '#fef9c3', '#854d0e'],
+                    ['Failed',          $result['note_failed']   ?? 0, '#fee2e2', '#991b1b'],
+                ] as [$label, $val, $bg, $color]): ?>
+                <div style="background:<?= $bg ?>;color:<?= $color ?>;border-radius:8px;
+                            padding:14px 24px;min-width:130px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06);">
+                    <div style="font-size:30px;font-weight:700;line-height:1.1;"><?= number_format((int)$val) ?></div>
+                    <div style="font-size:12px;margin-top:4px;"><?= h($label) ?></div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+
+            <h3 style="margin:0 0 8px;">Linked to</h3>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px;">
+                <?php foreach ([
+                    ['Assets',              $result['as_asset']    ?? 0, '#dbeafe', '#1e40af'],
+                    ['Inventory items',     $result['as_inv_item'] ?? 0, '#dbeafe', '#1e40af'],
+                    ['Inventory txns',      $result['as_inv_txn']  ?? 0, '#dbeafe', '#1e40af'],
+                    ['Attachments',         $result['att_imported']?? 0, '#ede9fe', '#5b21b6'],
+                ] as [$label, $val, $bg, $color]): ?>
+                <div style="background:<?= $bg ?>;color:<?= $color ?>;border-radius:8px;
+                            padding:14px 24px;min-width:130px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06);">
+                    <div style="font-size:30px;font-weight:700;line-height:1.1;"><?= number_format((int)$val) ?></div>
+                    <div style="font-size:12px;margin-top:4px;"><?= h($label) ?></div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+
+            <?php if (!empty($result['errors'])): ?>
+            <h3 style="margin-bottom:8px;">Import Log</h3>
+            <div style="background:#f9fafb;border:1px solid var(--border);border-radius:6px;
+                        max-height:360px;overflow-y:auto;padding:12px;
+                        font-size:12px;font-family:monospace;line-height:1.6;">
+                <?php foreach ($result['errors'] as $entry): ?>
+                <?php $c = $entry['level'] === 'error' ? '#991b1b' : ($entry['level'] === 'warn' ? '#854d0e' : '#374151'); ?>
+                <div style="color:<?= $c ?>;margin-bottom:2px;">
+                    [<?= h($entry['time']) ?>]
+                    [<?= strtoupper(h($entry['level'])) ?>]
+                    <?= h(is_array($entry['message']) ? json_encode($entry['message']) : $entry['message']) ?>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+
+            <div class="alert alert-info" style="margin-top:20px;">
+                Attachment <em>metadata</em> was imported. Copy the physical files into
+                <code>uploads/notes/old_import/</code> (named by their old <code>tmp_name</code> hash)
+                so the 📎 download links resolve.
+            </div>
+        <?php endif; ?>
+
+            <div style="margin-top:24px;display:flex;gap:10px;">
+                <a class="btn btn-primary" href="<?= h(url('/running_notes.php?action=list')) ?>">View Running Notes</a>
+                <a class="btn btn-ghost"   href="<?= h(url('/running_notes.php?action=import')) ?>">Back to Import</a>
+            </div>
+        </div>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+}
+
 $action = (string)input('action', 'list');
 
 // Note actions (save, delete, redact, unredact) come from any host that
@@ -64,6 +153,178 @@ if (notes_handle_action()) {
         redirect($returnTo);
     }
     redirect(url('/running_notes.php?action=list'));
+}
+
+// =================================================================
+// OLD-INVENTORY IMPORT — run / reset / confirmation page.
+// These are gated on running_notes.manage (admin), independent of the
+// list's view gate below.
+// =================================================================
+
+// ── POST: delete ALL running notes (every module) ───────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'delete_all_notes') {
+    csrf_check();
+    require_permission('running_notes', 'manage');
+
+    try {
+        $count = (int) db_val('SELECT COUNT(*) FROM notes', [], 0);
+        $pdo = db();
+        $pdo->exec('SET FOREIGN_KEY_CHECKS=0');
+        $pdo->exec('TRUNCATE TABLE note_attachments');
+        $pdo->exec('TRUNCATE TABLE notes');
+        $pdo->exec('SET FOREIGN_KEY_CHECKS=1');
+        flash_set('success', "All running notes deleted ({$count}), including every attachment.");
+    } catch (Throwable $e) {
+        try { db()->exec('SET FOREIGN_KEY_CHECKS=1'); } catch (Throwable $_) {}
+        flash_set('error', 'Delete failed: ' . $e->getMessage());
+    }
+    redirect(url('/running_notes.php?action=import'));
+}
+
+// ── POST: run the old-inventory notes import ─────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import_old') {
+    csrf_check();
+    require_permission('running_notes', 'manage');
+    @set_time_limit(0);
+
+    require_once __DIR__ . '/services/OldInventoryNotesImportService.php';
+
+    $fatalError = null;
+    $result     = [];
+    try {
+        $svc    = new OldInventoryNotesImportService((int) current_user_id());
+        $result = $svc->run();
+    } catch (Throwable $e) {
+        $fatalError = $e->getMessage();
+    }
+    running_notes_render_import_result($result, $fatalError);
+    exit;
+}
+
+// ── GET: import confirmation / status page ───────────────────────────────────
+if ($action === 'import') {
+    require_permission('running_notes', 'manage');
+
+    // Source count (old API) — guarded so an unreachable old server still
+    // renders the page (delete-all works without it).
+    $apiError    = null;
+    $sourceCount = 0;
+    try {
+        require_once __DIR__ . '/includes/old_inventory_api.php';
+        old_inventory_notes_api('ping');
+        $sourceCount = (int) (old_inventory_notes_api('notes_count')['count'] ?? 0);
+    } catch (Throwable $e) {
+        $apiError = $e->getMessage();
+    }
+
+    $localNotes = (int) db_val('SELECT COUNT(*) FROM notes', [], 0);
+    $localAtts  = (int) db_val('SELECT COUNT(*) FROM note_attachments', [], 0);
+
+    $page_title  = 'Import Running Notes';
+    $page_module = 'running_notes';
+    require __DIR__ . '/includes/header.php';
+    ?>
+    <div class="form-page">
+        <?= form_toolbar([
+            'title'      => 'Import Running Notes from Old Inventory',
+            'subtitle'   => 'Migrate <code>inv_notes</code> + <code>notes_attachments</code> from <code>inventory_live</code> (192.168.1.249).',
+            'back_href'  => url('/running_notes.php?action=list'),
+            'back_label' => 'Back to Running Notes',
+        ]) ?>
+        <div class="form-page-body" style="max-width:720px;">
+
+            <?php if ($apiError): ?>
+            <div class="alert alert-error" style="margin-bottom:20px;">
+                <strong>Cannot reach the running-notes API.</strong><br>
+                <code style="font-size:12px;"><?= h($apiError) ?></code><br><br>
+                Deploy <code>api_export_notes.php</code> to the old server at
+                <strong>192.168.1.249/inventory/</strong> and confirm <code>notes_url</code> in
+                <code>config/old_inventory_api.php</code> points at it.
+            </div>
+            <?php else: ?>
+            <div class="alert alert-info" style="margin-bottom:20px;">
+                ✅ Running-notes API reachable — ready to import.
+            </div>
+            <?php endif; ?>
+
+            <h3 style="margin:0 0 10px;">Counts</h3>
+            <table class="info-table" style="margin-bottom:24px;width:100%;">
+                <thead>
+                    <tr>
+                        <th style="width:50%;">Type</th>
+                        <th style="text-align:right;">Old Inventory</th>
+                        <th style="text-align:right;">Already in MagDyn</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Notes (non-redacted)</td>
+                        <td style="text-align:right;font-weight:600;"><?= number_format($sourceCount) ?></td>
+                        <td style="text-align:right;"><?= number_format($localNotes) ?></td>
+                    </tr>
+                    <tr>
+                        <td>Attachments</td>
+                        <td style="text-align:right;font-weight:600;">—</td>
+                        <td style="text-align:right;"><?= number_format($localAtts) ?></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3 style="margin:0 0 10px;">What this import does</h3>
+            <table class="info-table" style="margin-bottom:24px;width:100%;">
+                <tr><th style="width:40%;">Class <code>A</code></th><td>Linked to the <strong>asset</strong> whose <em>Asset ID</em> (<code>asset_tag</code>) equals the old <code>inv_notes.id</code>.</td></tr>
+                <tr><th>Class <code>P</code></th><td>Linked to the <strong>inventory item</strong> whose <em>Inventory Code</em> (<code>code</code>) equals the old <code>inv_notes.id</code>.</td></tr>
+                <tr><th>With a <code>tid</code></th><td>Linked to the specific <strong>inventory transaction</strong> (matched via <code>OLD-ITX-&lt;tid&gt;</code>). Falls back to the class entity if the txn isn't found.</td></tr>
+                <tr><th>Attachments</th><td>Metadata only. <code>stored_path = old_import/&lt;tmp_name&gt;</code> — copy the physical files into <code>uploads/notes/old_import/</code> separately.</td></tr>
+                <tr><th>Author / date</th><td>Authored by you; original <code>created_date</code> preserved.</td></tr>
+            </table>
+
+            <!-- Reset -->
+            <h3 style="margin:0 0 10px;">Reset</h3>
+            <div style="background:#fff5f5;border:1px solid #fecaca;border-radius:8px;padding:16px 20px;margin-bottom:24px;">
+                <p style="margin:0 0 12px;font-size:14px;color:#7f1d1d;">
+                    <strong>Delete All Running Notes</strong> — permanently removes <em>every</em> note and
+                    attachment in the system (all modules, not just imported ones). Run this before a clean
+                    re-import to avoid duplicates.
+                </p>
+                <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
+                    <div style="text-align:center;min-width:80px;">
+                        <div style="font-size:22px;font-weight:700;color:#991b1b;"><?= number_format($localNotes) ?></div>
+                        <div style="font-size:11px;color:#7f1d1d;">Notes</div>
+                    </div>
+                    <div style="text-align:center;min-width:80px;">
+                        <div style="font-size:22px;font-weight:700;color:#991b1b;"><?= number_format($localAtts) ?></div>
+                        <div style="font-size:11px;color:#7f1d1d;">Attachments</div>
+                    </div>
+                </div>
+                <form method="post" action="<?= h(url('/running_notes.php')) ?>"
+                      onsubmit="return confirm('This will permanently delete ALL running notes and attachments across EVERY module.\n\nAre you sure?');">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="action" value="delete_all_notes">
+                    <button type="submit" class="btn btn-danger">🗑 Delete All Running Notes</button>
+                </form>
+            </div>
+
+            <?php if (!$apiError): ?>
+            <!-- Run import -->
+            <h3 style="margin:0 0 10px;">Run Import</h3>
+            <form method="post" action="<?= h(url('/running_notes.php')) ?>"
+                  onsubmit="return confirm('Import all running notes from the old system?\n\nRun \'Delete All Running Notes\' first if you want a clean re-import.');">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="import_old">
+                <div style="display:flex;gap:10px;align-items:center;">
+                    <button type="submit" class="btn btn-primary">▶ Import Running Notes</button>
+                    <a class="btn btn-ghost" href="<?= h(url('/running_notes.php?action=list')) ?>">Cancel</a>
+                    <span class="muted small">This may take up to a minute.</span>
+                </div>
+            </form>
+            <?php endif; ?>
+
+        </div>
+    </div>
+    <?php
+    require __DIR__ . '/includes/footer.php';
+    exit;
 }
 
 require_permission('running_notes', 'view');
@@ -823,10 +1084,16 @@ if ((string)input('dt_format', '') === 'json') {
 }
 
 $dtCfg['title']        = 'Running Notes';
-$dtCfg['actions_html'] = permission_check('running_notes', 'create')
-    ? '<a class="btn btn-primary btn-sm" href="' . h(url('/running_notes.php?action=new')) . '"'
-    . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ Add note', 'N') . '</a>'
-    : '';
+$listActions = '';
+if (permission_check('running_notes', 'create')) {
+    $listActions .= '<a class="btn btn-primary btn-sm" href="' . h(url('/running_notes.php?action=new')) . '"'
+        . ' data-shortcut="N" accesskey="n">' . shortcut_label('+ Add note', 'N') . '</a> ';
+}
+if (permission_check('running_notes', 'manage')) {
+    $listActions .= '<a class="btn btn-ghost btn-sm" href="' . h(url('/running_notes.php?action=import')) . '">'
+        . '⬇ Import from Old Inventory</a>';
+}
+$dtCfg['actions_html'] = $listActions;
 
 $page_title  = 'Running Notes';
 $page_module = 'running_notes';

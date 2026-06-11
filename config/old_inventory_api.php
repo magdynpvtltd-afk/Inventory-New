@@ -19,6 +19,10 @@ return [
     // (vendors / contacts / addresses + application users)
     'vendors_url' => 'http://192.168.1.249/inventory/api_export_vendors.php',
 
+    // Full URL to api_export_notes.php on the old server
+    // (legacy inv_notes running notes + notes_attachments metadata)
+    'notes_url' => 'http://192.168.1.249/inventory/api_export_notes.php',
+
     // Shared secret — must match API_TOKEN defined in both export files
     'token'   => 'MAGDYN_IMPORT_SECRET',
 

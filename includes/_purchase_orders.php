@@ -39,8 +39,14 @@ require_once __DIR__ . '/_codes.php';
  *
  * Triggered from inventory_shiprcpt.php's save handler after the
  * shipment header insert/update commits.
+ *
+ * $poNoOverride — when supplied (and non-empty), the PO is created with
+ * this exact po_no instead of the auto-generated code_next('po') sequence.
+ * Used by the old-inventory import so the system PO number matches the old
+ * S_Order No. po_no is unique, so callers must ensure one PO per number
+ * (the importer creates exactly one combined shipment per S_Order No).
  */
-function po_ensure_for_shipment($shipmentId, $actorId = null)
+function po_ensure_for_shipment($shipmentId, $actorId = null, $poNoOverride = null)
 {
     $shipmentId = (int)$shipmentId;
     if ($shipmentId <= 0) return null;
@@ -54,7 +60,9 @@ function po_ensure_for_shipment($shipmentId, $actorId = null)
     $sh = db_one("SELECT id, vendor_id FROM inv_shipments WHERE id = ?", [$shipmentId]);
     if (!$sh) return null;
 
-    $poNo = code_next('po');
+    $poNo = ($poNoOverride !== null && trim((string)$poNoOverride) !== '')
+        ? substr(trim((string)$poNoOverride), 0, 32)
+        : code_next('po');
     db_exec(
         "INSERT INTO purchase_orders
             (po_no, shipment_id, vendor_id, version, po_date, created_by)

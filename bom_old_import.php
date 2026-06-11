@@ -499,19 +499,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                 }
                 break;
 
-            // ── shipments → inv_shipments + inv_shipment_lines + purchase_orders ───
+            // ── shipments → combined Ship # by S_Order No + PO (po_no = S_Order No) ──
+            //
+            // Every old shipment AND receipt that shares the same S_Order No
+            // (old custom field cfv_9, custom_field_id 9) collapses into ONE
+            // inv_shipments row (mode='both'), keyed by ref_doc 'OLD-SORD-<n>'.
+            // That single Ship # carries one PO whose po_no IS the S_Order No, so
+            // the system PO number matches the old order number exactly. Rows
+            // with a blank S_Order No keep their own Ship # (ref_doc
+            // 'OLD-SHP-<id>') with an auto-generated PO number.
             case 'shipments':
                 $rows = $data['shipments'] ?? [];
                 $uid  = (int)current_user_id();
 
-                // Forced-PK reset guard: inv_shipments.id is set to the old
-                // transaction_id, so the table must be empty before a fresh
-                // import. Checked once, at the first shipments chunk. (Receipts
-                // share this table and run afterwards, so they don't re-check.)
+                // Clean-slate guard (checked once, first shipments chunk): the
+                // combine logic find-or-creates Ship # records by ref_doc and
+                // assumes an empty table, so require a reset before importing.
                 if ($offset === 0 && (int)db_val('SELECT COUNT(*) FROM inv_shipments', [], 0) > 0) {
                     throw new RuntimeException(
-                        'inv_shipments is not empty. Shipments/receipts are imported with their '
-                      . 'original transaction IDs, so run "Delete All Inventory Records" first.'
+                        'inv_shipments is not empty. Shipments/receipts are combined by '
+                      . 'S_Order No on import, so run "Delete All Inventory Records" first.'
                     );
                 }
 
@@ -520,19 +527,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                     $oldTxnId = (int)($row['old_transaction_id'] ?? 0);
                     if ($oldId <= 0 || $oldTxnId <= 0) { $result['skipped']++; continue; }
 
-                    // Idempotency: ref_doc acts as a unique import key
-                    $refDoc = 'OLD-SHP-' . $oldId;
-                    if (db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], null)) {
-                        $result['skipped']++;
-                        continue;
-                    }
+                    // S_Order No (old cfv_9) → the PO number. '-'/'' = blank.
+                    $sOrder = trim((string)($row['s_order_no'] ?? ''));
+                    if ($sOrder === '-') $sOrder = '';
 
                     // Recorded vs event date:
                     //   created_at  ← transaction.creation_date (recorded)
                     //   event date  ← joined inventory_transaction.modified_date,
-                    //                 else its creation_date (per spec). Falls back
-                    //                 to the transaction's own modified/creation date
-                    //                 if the old server returned no inv_txn rows.
+                    //                 else its creation_date; falls back to the
+                    //                 transaction's own modified/creation date.
                     $recorded = $row['txn_date'] ?: null;
                     $modified = $row['txn_modified_date'] ?? null;
                     $eventIt  = $row['event_date'] ?? null;
@@ -549,31 +552,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                     $status    = $shipped ? 'shipped' : 'approved';
                     // Event date drives the actual ship date / shipped timestamp.
                     $actualShipDate = $event ? substr($event, 0, 10) : $shipDate;
+                    $shippedAt      = $shipped ? ($event ?: ($shipDate ? $shipDate . ' 00:00:00' : null)) : null;
 
-                    // Create inv_shipments header — id forced to the old transaction_id
-                    $shipNo = code_next('shipment');
-                    db_exec(
-                        'INSERT INTO inv_shipments
-                            (id, ship_no, vendor_id, courier_id, mode, status,
-                             ref_doc, notes, actual_ship_date, shipped_at, created_by,
-                             created_at, updated_at)
-                         VALUES (?, ?, ?, ?, "ship", ?, ?, ?, ?, ?, ?, ?, ?)',
-                        [
-                            $oldTxnId,
-                            $shipNo, $vendorId, $courierId, $status,
-                            $refDoc,
-                            $row['txn_note'] ?: null,
-                            $actualShipDate,
-                            $shipped ? ($event ?: ($shipDate ? $shipDate . ' 00:00:00' : null)) : null,
-                            $uid,
-                            $recorded ?: date('Y-m-d H:i:s'),
-                            $event    ?: date('Y-m-d H:i:s'),
-                        ]
+                    if ($sOrder !== '') {
+                        // ── combined Ship # keyed by S_Order No ──
+                        $refDoc = 'OLD-SORD-' . $sOrder;
+                        $shipId = (int)db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], 0);
+                        if (!$shipId) {
+                            // First row for this order — create the combined header
+                            // (mode='both': it may carry ship and/or receive lines).
+                            $shipNo = code_next('shipment');
+                            db_exec(
+                                'INSERT INTO inv_shipments
+                                    (ship_no, vendor_id, courier_id, mode, status,
+                                     ref_doc, notes, actual_ship_date, shipped_at, created_by,
+                                     created_at, updated_at)
+                                 VALUES (?, ?, ?, "both", ?, ?, ?, ?, ?, ?, ?, ?)',
+                                [
+                                    $shipNo, $vendorId, $courierId, $status,
+                                    $refDoc, $row['txn_note'] ?: null,
+                                    $actualShipDate, $shippedAt, $uid,
+                                    $recorded ?: date('Y-m-d H:i:s'),
+                                    $event    ?: date('Y-m-d H:i:s'),
+                                ]
+                            );
+                            $shipId = (int)db()->lastInsertId();
+                            // The system PO number IS the S_Order No.
+                            po_ensure_for_shipment($shipId, $uid, $sOrder);
+                        } else {
+                            // Subsequent row for this order — fill any header gaps.
+                            db_exec(
+                                'UPDATE inv_shipments
+                                    SET vendor_id        = COALESCE(vendor_id, ?),
+                                        courier_id       = COALESCE(courier_id, ?),
+                                        actual_ship_date = COALESCE(actual_ship_date, ?),
+                                        shipped_at       = COALESCE(shipped_at, ?),
+                                        status           = IF(status IN ("received","closed"), status, ?),
+                                        updated_at       = GREATEST(updated_at, ?)
+                                  WHERE id = ?',
+                                [
+                                    $vendorId, $courierId, $actualShipDate, $shippedAt, $status,
+                                    $event ?: date('Y-m-d H:i:s'), $shipId,
+                                ]
+                            );
+                        }
+                    } else {
+                        // ── blank S_Order No: own Ship # + auto-generated PO ──
+                        $refDoc = 'OLD-SHP-' . $oldId;
+                        if (db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], null)) {
+                            $result['skipped']++;
+                            continue;
+                        }
+                        $shipNo = code_next('shipment');
+                        db_exec(
+                            'INSERT INTO inv_shipments
+                                (ship_no, vendor_id, courier_id, mode, status,
+                                 ref_doc, notes, actual_ship_date, shipped_at, created_by,
+                                 created_at, updated_at)
+                             VALUES (?, ?, ?, "ship", ?, ?, ?, ?, ?, ?, ?, ?)',
+                            [
+                                $shipNo, $vendorId, $courierId, $status,
+                                $refDoc, $row['txn_note'] ?: null,
+                                $actualShipDate, $shippedAt, $uid,
+                                $recorded ?: date('Y-m-d H:i:s'),
+                                $event    ?: date('Y-m-d H:i:s'),
+                            ]
+                        );
+                        $shipId = (int)db()->lastInsertId();
+                        po_ensure_for_shipment($shipId, $uid);   // auto PO number
+                    }
+
+                    // Append ship lines from embedded inventory_transaction rows.
+                    // sort_order continues after any lines already on this Ship #.
+                    $sortOrder = (int)db_val(
+                        'SELECT COALESCE(MAX(sort_order)+1,0) FROM inv_shipment_lines WHERE shipment_id = ?',
+                        [$shipId], 0
                     );
-                    $shipId = $oldTxnId;
-
-                    // Create inv_shipment_lines from embedded inventory_transaction rows
-                    $sortOrder = 0;
                     foreach ((array)($row['lines'] ?? []) as $line) {
                         $qty    = (float)($line['quantity'] ?? 0);
                         if ($qty == 0) continue;
@@ -582,31 +636,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                         $itemId  = old_inv_ensure_item($modelId, $code, (string)($line['item_name'] ?? ''));
                         // For a shipped shipment, record qty_shipped = qty_planned
                         // so the line surfaces as a ship-out EVENT (dated by
-                        // actual_ship_date = event date) in the shipment list,
-                        // rather than as a "planned" row with no date.
+                        // actual_ship_date = event date) in the shipment list.
                         db_exec(
                             'INSERT INTO inv_shipment_lines
                                 (shipment_id, sort_order, line_kind, entity_type,
-                                 item_id, pending_name, qty_planned, qty_shipped)
-                             VALUES (?, ?, "ship", "inv_item", ?, ?, ?, ?)',
+                                 item_id, pending_name, qty_planned, qty_shipped,
+                                 old_transaction_id)
+                             VALUES (?, ?, "ship", "inv_item", ?, ?, ?, ?, ?)',
                             [
                                 $shipId, $sortOrder++,
                                 $itemId ?: null,
                                 $itemId ? null : ($line['item_name'] ?: ($code ?: 'Unknown')),
                                 $qty,
                                 $shipped ? $qty : 0,
+                                $oldTxnId ?: null,
                             ]
                         );
                     }
-
-                    // Auto-create PO using existing logic
-                    po_ensure_for_shipment($shipId, $uid);
 
                     $result['inserted']++;
                 }
                 break;
 
-            // ── receipts → inv_shipments (mode=receive) + inv_shipment_lines + PO ──
+            // ── receipts → combined Ship # by S_Order No (receive lines) + PO ──
+            //
+            // Receipts run after the shipments pass, so a receipt that shares an
+            // S_Order No with an already-imported shipment finds that combined
+            // Ship # and appends its receive lines to it (one PO = the S_Order
+            // No). Receipts with a blank S_Order No get their own receive-only
+            // Ship # (ref_doc 'OLD-RCV-<id>') and an auto-generated PO number.
             case 'receipts':
                 $rows = $data['receipts'] ?? [];
                 $uid  = (int)current_user_id();
@@ -615,12 +673,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                     $oldTxnId = (int)($row['old_transaction_id'] ?? 0);
                     if ($oldId <= 0 || $oldTxnId <= 0) { $result['skipped']++; continue; }
 
-                    // Idempotency key
-                    $refDoc = 'OLD-RCV-' . $oldId;
-                    if (db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], null)) {
-                        $result['skipped']++;
-                        continue;
-                    }
+                    // S_Order No (old cfv_9) → the PO number. '-'/'' = blank.
+                    $sOrder = trim((string)($row['s_order_no'] ?? ''));
+                    if ($sOrder === '-') $sOrder = '';
 
                     // Recorded vs event date (same rule as shipments):
                     //   created_at  ← transaction.creation_date (recorded)
@@ -638,32 +693,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                     $vendorId = old_inv_resolve_vendor($company);
                     $received = (int)($row['received_flag'] ?? 0);
                     $rcptDate = $row['receipt_date'] ?: null;
+                    $dueDate  = $row['due_date'] ?: null;
                     // received_flag = 1 → 'received'; otherwise still 'approved'.
                     $status   = $received ? 'received' : 'approved';
 
-                    // Create inv_shipments header (mode = receive) — id forced to old transaction_id
-                    $shipNo = code_next('shipment');
-                    db_exec(
-                        'INSERT INTO inv_shipments
-                            (id, ship_no, vendor_id, mode, status,
-                             ref_doc, notes, receive_due_date, created_by,
-                             created_at, updated_at)
-                         VALUES (?, ?, ?, "receive", ?, ?, ?, ?, ?, ?, ?)',
-                        [
-                            $oldTxnId,
-                            $shipNo, $vendorId, $status,
-                            $refDoc,
-                            $row['txn_note'] ?: null,
-                            $row['due_date'] ?: null,
-                            $uid,
-                            $recorded ?: date('Y-m-d H:i:s'),
-                            $event    ?: date('Y-m-d H:i:s'),
-                        ]
-                    );
-                    $shipId = $oldTxnId;
+                    if ($sOrder !== '') {
+                        // ── combined Ship # keyed by S_Order No (find-or-create) ──
+                        $refDoc = 'OLD-SORD-' . $sOrder;
+                        $shipId = (int)db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], 0);
+                        if (!$shipId) {
+                            // No shipment carried this order — create a combined
+                            // header now (mode='both' so a later/earlier ship side
+                            // can attach too).
+                            $shipNo = code_next('shipment');
+                            db_exec(
+                                'INSERT INTO inv_shipments
+                                    (ship_no, vendor_id, mode, status,
+                                     ref_doc, notes, receive_due_date, created_by,
+                                     created_at, updated_at)
+                                 VALUES (?, ?, "both", ?, ?, ?, ?, ?, ?, ?)',
+                                [
+                                    $shipNo, $vendorId, $status,
+                                    $refDoc, $row['txn_note'] ?: null, $dueDate, $uid,
+                                    $recorded ?: date('Y-m-d H:i:s'),
+                                    $event    ?: date('Y-m-d H:i:s'),
+                                ]
+                            );
+                            $shipId = (int)db()->lastInsertId();
+                            // The system PO number IS the S_Order No.
+                            po_ensure_for_shipment($shipId, $uid, $sOrder);
+                        } else {
+                            // Append to an existing combined Ship # — fill header gaps.
+                            db_exec(
+                                'UPDATE inv_shipments
+                                    SET vendor_id        = COALESCE(vendor_id, ?),
+                                        receive_due_date = COALESCE(receive_due_date, ?),
+                                        status           = IF(status = "closed", status, ?),
+                                        updated_at       = GREATEST(updated_at, ?)
+                                  WHERE id = ?',
+                                [$vendorId, $dueDate, $status, $event ?: date('Y-m-d H:i:s'), $shipId]
+                            );
+                        }
+                    } else {
+                        // ── blank S_Order No: own receive-only Ship # + auto PO ──
+                        $refDoc = 'OLD-RCV-' . $oldId;
+                        if (db_val('SELECT id FROM inv_shipments WHERE ref_doc = ? LIMIT 1', [$refDoc], null)) {
+                            $result['skipped']++;
+                            continue;
+                        }
+                        $shipNo = code_next('shipment');
+                        db_exec(
+                            'INSERT INTO inv_shipments
+                                (ship_no, vendor_id, mode, status,
+                                 ref_doc, notes, receive_due_date, created_by,
+                                 created_at, updated_at)
+                             VALUES (?, ?, "receive", ?, ?, ?, ?, ?, ?, ?)',
+                            [
+                                $shipNo, $vendorId, $status,
+                                $refDoc, $row['txn_note'] ?: null, $dueDate, $uid,
+                                $recorded ?: date('Y-m-d H:i:s'),
+                                $event    ?: date('Y-m-d H:i:s'),
+                            ]
+                        );
+                        $shipId = (int)db()->lastInsertId();
+                        po_ensure_for_shipment($shipId, $uid);   // auto PO number
+                    }
 
-                    // Create inv_shipment_lines (line_kind = receive)
-                    $sortOrder = 0;
+                    // Append receive lines, continuing sort_order on this Ship #.
+                    $sortOrder = (int)db_val(
+                        'SELECT COALESCE(MAX(sort_order)+1,0) FROM inv_shipment_lines WHERE shipment_id = ?',
+                        [$shipId], 0
+                    );
                     foreach ((array)($row['lines'] ?? []) as $line) {
                         $qty    = (float)($line['quantity'] ?? 0);
                         if ($qty == 0) continue;
@@ -675,8 +775,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                             'INSERT INTO inv_shipment_lines
                                 (shipment_id, sort_order, line_kind, entity_type,
                                  item_id, pending_name, qty_planned, qty_received,
-                                 delivery_date)
-                             VALUES (?, ?, "receive", "inv_item", ?, ?, ?, ?, ?)',
+                                 delivery_date, old_transaction_id)
+                             VALUES (?, ?, "receive", "inv_item", ?, ?, ?, ?, ?, ?)',
                             [
                                 $shipId, $sortOrder++,
                                 $itemId ?: null,
@@ -684,12 +784,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (string)input('action') === 'import
                                 $qty,
                                 $received ? $qty : 0,
                                 $rcptDate,
+                                $oldTxnId ?: null,
                             ]
                         );
                     }
-
-                    // Auto-create PO using existing logic
-                    po_ensure_for_shipment($shipId, $uid);
 
                     $result['inserted']++;
                 }
@@ -1567,9 +1665,20 @@ require __DIR__ . '/includes/header.php';
         </div>
 
         <?php
-        // Native table counts (shipments/receipts go to inv_shipments, POs to purchase_orders)
-        $nativeShipCount = (int)db_val("SELECT COUNT(*) FROM inv_shipments WHERE ref_doc LIKE 'OLD-SHP-%'", [], 0);
-        $nativeRcvCount  = (int)db_val("SELECT COUNT(*) FROM inv_shipments WHERE ref_doc LIKE 'OLD-RCV-%'", [], 0);
+        // Native table counts. Shipments/receipts are combined by S_Order No into
+        // inv_shipments (ref_doc 'OLD-SORD-%' for combined, 'OLD-SHP-%'/'OLD-RCV-%'
+        // for blank-order rows), so count Ship # records by the kind of line they
+        // carry rather than by ref_doc prefix. POs go to purchase_orders.
+        $nativeShipCount = (int)db_val(
+            "SELECT COUNT(DISTINCT l.shipment_id)
+               FROM inv_shipment_lines l
+               JOIN inv_shipments sh ON sh.id = l.shipment_id
+              WHERE sh.ref_doc LIKE 'OLD-%' AND l.line_kind = 'ship'", [], 0);
+        $nativeRcvCount  = (int)db_val(
+            "SELECT COUNT(DISTINCT l.shipment_id)
+               FROM inv_shipment_lines l
+               JOIN inv_shipments sh ON sh.id = l.shipment_id
+              WHERE sh.ref_doc LIKE 'OLD-%' AND l.line_kind = 'receive'", [], 0);
         $nativePoCount   = (int)db_val(
             "SELECT COUNT(*) FROM purchase_orders po
              JOIN inv_shipments sh ON sh.id = po.shipment_id
@@ -1609,12 +1718,13 @@ require __DIR__ . '/includes/header.php';
         <p style="font-size:13px;color:#6b7280;margin:0 0 14px;">
             Fetches all transactions, shipments and receipts from
             <code>api_export_transactions.php</code> on the old server in chunks of 500 rows.
-            Transactions create audit-only <code>inv_txns</code> ledger rows (no stock change);
-            shipments and receipts are imported into <code>inv_shipments</code> (with line items)
-            and a purchase order is auto-created for each. Each record keeps its
-            <strong>original old-system transaction ID</strong> as its primary key, and the old
-            <code>creation_date</code> (recorded) / <code>modified_date</code> (event) timestamps.
-            Because IDs are preserved, run <strong>Delete All Inventory Records</strong> before
+            Transactions create audit-only <code>inv_txns</code> ledger rows (no stock change).
+            Shipments and receipts are <strong>combined by their old S_Order No</strong>
+            (custom field <code>cfv_9</code>): every shipment and receipt sharing an S_Order No
+            collapses into one <code>inv_shipments</code> record (one Ship #) carrying both ship
+            and receive lines, and a single purchase order whose <strong>PO number is that exact
+            S_Order No</strong>. Rows with no S_Order No get their own Ship # and an
+            auto-generated PO number. Run <strong>Delete All Inventory Records</strong> before
             re-importing — the import refuses to run if <code>inv_txns</code> / <code>inv_shipments</code>
             already contain rows. As a final step it fetches stock from
             <code>tree7-5.php</code> and writes the available quantities into MagDyn —

@@ -119,6 +119,236 @@ function shr_item_picker_options()
 }
 
 // ----------------------------------------------------------------
+// SHIPMENT ↔ RUNNING-NOTES ROLLUP
+// ----------------------------------------------------------------
+// A running note "belongs" to a shipment when it was attached (in the
+// old system) to one of the transactions behind the shipment's lines.
+// Chain:
+//   notes(entity_type='inv_txn', entity_id = inv_txns.id)
+//     → inv_txns.ref_doc = 'OLD-ITX-<old_id>'
+//     → old_inv_txns.old_id → old_inv_txns.old_transaction_id
+//     → inv_shipment_lines.old_transaction_id
+//
+// PERF: these queries drive from `notes` (the small end — only the
+// inv_txn-class rows) DOWN to inv_shipment_lines, reaching old_inv_txns
+// via its UNIQUE old_id index. We deliberately DO NOT join the other
+// direction with `t.ref_doc = CONCAT('OLD-ITX-', o.old_id)` as the driving
+// predicate: per-row that re-derives the string and (combined with the
+// event-union derived table) full-scans old_inv_txns — the ~6s hang that
+// motivated this. The `o.old_id = CAST(SUBSTRING(ref_doc,9) AS UNSIGNED)`
+// form keeps old_id sargable. (inv_txns.ref_doc is also indexed now —
+// see migration_20260611_140000_IST.sql.)
+// ----------------------------------------------------------------
+
+/** Shared FROM/WHERE for the notes→shipment rollup, driven from `notes`.
+ *  Callers append their own shipment filter + projection. */
+function _shr_txn_notes_join()
+{
+    return "FROM notes n
+            JOIN inv_txns t            ON t.id = n.entity_id
+            JOIN old_inv_txns o        ON o.old_id = CAST(SUBSTRING(t.ref_doc, 9) AS UNSIGNED)
+            JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_transaction_id
+           WHERE n.entity_type = 'inv_txn' AND n.is_deleted = 0
+             AND t.ref_doc LIKE 'OLD-ITX-%'";
+}
+
+/** Batched note counts for a set of shipments. Returns
+ *  [shipment_id => count]; shipments with no notes are absent. */
+function shr_shipment_txn_note_counts(array $shipmentIds)
+{
+    $ids = array_filter(array_unique(array_map('intval', $shipmentIds)), function ($v) { return $v > 0; });
+    if (empty($ids)) return [];
+    $in = implode(',', $ids);
+    $rows = db_all(
+        "SELECT sl.shipment_id, COUNT(DISTINCT n.id) AS c
+         " . _shr_txn_notes_join() . "
+           AND sl.shipment_id IN ($in)
+         GROUP BY sl.shipment_id"
+    );
+    $out = [];
+    foreach ($rows as $r) $out[(int)$r['shipment_id']] = (int)$r['c'];
+    return $out;
+}
+
+/** Distinct shipment ids that have at least one rolled-up running note.
+ *  Run ONCE per request to seed the list filter (a literal IN-list keeps
+ *  the per-row Available/Not-available filter a cheap indexed compare —
+ *  never a correlated subquery). Returns a flat array of ints. */
+function shr_shipment_ids_with_txn_notes()
+{
+    $rows = db_all("SELECT DISTINCT sl.shipment_id " . _shr_txn_notes_join());
+    return array_map(function ($r) { return (int)$r['shipment_id']; }, $rows);
+}
+
+/** Full list of running notes rolled up to one shipment, newest first.
+ *  Each note carries its attachments as ['id'=>.., 'filename'=>..]. */
+function shr_shipment_txn_notes($shipmentId)
+{
+    $shipmentId = (int)$shipmentId;
+    $notes = db_all(
+        "SELECT DISTINCT n.id, n.body_html, n.created_at, n.entity_id AS inv_txn_id,
+                o.old_transaction_id,
+                u.full_name AS author_name, u.email AS author_email,
+                c.name AS note_type_name
+           FROM notes n
+           JOIN inv_txns t            ON t.id = n.entity_id
+           JOIN old_inv_txns o        ON o.old_id = CAST(SUBSTRING(t.ref_doc, 9) AS UNSIGNED)
+           JOIN inv_shipment_lines sl ON sl.old_transaction_id = o.old_transaction_id
+      LEFT JOIN users u               ON u.id = n.author_id
+      LEFT JOIN categories c          ON c.id = n.note_type_id
+          WHERE n.entity_type = 'inv_txn' AND n.is_deleted = 0
+            AND t.ref_doc LIKE 'OLD-ITX-%'
+            AND sl.shipment_id = ?
+          ORDER BY n.created_at DESC, n.id DESC",
+        [$shipmentId]
+    );
+    $attByNote = [];
+    if ($notes) {
+        $in = implode(',', array_map('intval', array_column($notes, 'id')));
+        foreach (db_all("SELECT id, note_id, filename FROM note_attachments WHERE note_id IN ($in) ORDER BY note_id, id") as $a) {
+            $attByNote[(int)$a['note_id']][] = ['id' => (int)$a['id'], 'filename' => (string)$a['filename']];
+        }
+    }
+    foreach ($notes as &$n) {
+        $n['attachments'] = $attByNote[(int)$n['id']] ?? [];
+    }
+    unset($n);
+    return $notes;
+}
+
+/** Emit the clip-icon popup CSS + JS once. The popup fetches the note
+ *  list from ?action=txn_notes and renders each note (author, date,
+ *  type, body, attachment links). Click handler binds on
+ *  .shr-notes-indicator buttons rendered in the list rows. */
+function shr_txn_notes_popup_assets()
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    ?>
+    <style>
+        .shr-notes-indicator { background:none;border:none;padding:0;cursor:pointer;font:inherit;line-height:1;white-space:nowrap;color:#1d4ed8; }
+        .shr-notes-indicator:hover { text-decoration:underline; }
+        .shr-notes-badge { font-size:11px;font-weight:700; }
+        #shrnotes-backdrop { position:fixed;inset:0;z-index:99998;display:none;background:rgba(0,0,0,.35); }
+        #shrnotes-pop {
+            position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+            z-index:99999;display:none;background:#fff;color:#111827;
+            border:1px solid #d1d5db;border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.30);
+            width:min(560px,94vw);max-height:78vh;overflow:auto;
+        }
+        #shrnotes-pop .shrnotes-head {
+            display:flex;align-items:center;justify-content:space-between;
+            padding:12px 14px;border-bottom:1px solid #eef0f3;font-size:13px;font-weight:700;
+            position:sticky;top:0;background:#fff;
+        }
+        #shrnotes-pop .shrnotes-close { background:none;border:none;font-size:18px;line-height:1;cursor:pointer;color:#6b7280;padding:0 2px; }
+        #shrnotes-pop .shrnotes-body { padding:10px 12px; }
+        #shrnotes-pop .shrnote { border:1px solid #eef0f3;border-radius:8px;padding:10px 12px;margin-bottom:10px;background:#fafafa; }
+        #shrnotes-pop .shrnote-meta { font-size:12px;color:#6b7280;margin-bottom:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center; }
+        #shrnotes-pop .shrnote-author { font-weight:700;color:#111827; }
+        #shrnotes-pop .shrnote-type { background:#dbeafe;color:#1e40af;border-radius:10px;padding:1px 8px;font-size:11px; }
+        #shrnotes-pop .shrnote-body { font-size:13.5px;color:#111827;line-height:1.5; }
+        #shrnotes-pop .shrnote-atts { margin-top:8px;display:flex;flex-direction:column;gap:4px; }
+        #shrnotes-pop .shrnote-att { display:inline-flex;align-items:center;gap:6px;color:#1d4ed8;text-decoration:none;font-size:13px; }
+        #shrnotes-pop .shrnote-att:hover { text-decoration:underline; }
+        #shrnotes-pop .shrnotes-empty { padding:14px;color:#6b7280;font-size:13px; }
+    </style>
+    <script>
+    (function () {
+        if (window.__shrNotesBound) return;
+        window.__shrNotesBound = true;
+        var base = (window.MAGDYN_BASE || '');
+
+        var backdrop = document.getElementById('shrnotes-backdrop');
+        if (!backdrop) { backdrop = document.createElement('div'); backdrop.id = 'shrnotes-backdrop'; document.body.appendChild(backdrop); }
+        var pop = document.getElementById('shrnotes-pop');
+        if (!pop) { pop = document.createElement('div'); pop.id = 'shrnotes-pop'; document.body.appendChild(pop); }
+
+        function hide() { pop.style.display = 'none'; backdrop.style.display = 'none'; pop.innerHTML = ''; }
+        function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+        function render(shipNo, list) {
+            pop.innerHTML = '';
+            var head = document.createElement('div');
+            head.className = 'shrnotes-head';
+            var label = document.createElement('span');
+            label.textContent = '📎 Notes — ' + (shipNo || '') + ' (' + list.length + ')';
+            var x = document.createElement('button');
+            x.type = 'button'; x.className = 'shrnotes-close'; x.textContent = '✕';
+            x.addEventListener('click', hide);
+            head.appendChild(label); head.appendChild(x);
+            pop.appendChild(head);
+
+            var body = document.createElement('div');
+            body.className = 'shrnotes-body';
+            if (!list.length) {
+                var em = document.createElement('div');
+                em.className = 'shrnotes-empty';
+                em.textContent = 'No notes found.';
+                body.appendChild(em);
+            } else {
+                list.forEach(function (n) {
+                    var card = document.createElement('div'); card.className = 'shrnote';
+                    var meta = document.createElement('div'); meta.className = 'shrnote-meta';
+                    var html = '<span class="shrnote-author">' + esc(n.author) + '</span>'
+                             + '<span>' + esc(n.created_at) + '</span>';
+                    if (n.note_type) html += '<span class="shrnote-type">' + esc(n.note_type) + '</span>';
+                    if (n.old_txn)   html += '<span title="Legacy transaction id">Txn #' + esc(n.old_txn) + '</span>';
+                    meta.innerHTML = html;
+                    card.appendChild(meta);
+                    var b = document.createElement('div'); b.className = 'shrnote-body';
+                    b.innerHTML = n.body_html || '';   // sanitized server-side at save time
+                    card.appendChild(b);
+                    if (n.attachments && n.attachments.length) {
+                        var atts = document.createElement('div'); atts.className = 'shrnote-atts';
+                        n.attachments.forEach(function (a) {
+                            var link = document.createElement('a');
+                            link.className = 'shrnote-att';
+                            link.href = base + '/note_attach.php?id=' + a.id;
+                            link.target = '_blank'; link.rel = 'noopener';
+                            link.title = a.filename;
+                            link.textContent = '📎 ' + a.filename;
+                            atts.appendChild(link);
+                        });
+                        card.appendChild(atts);
+                    }
+                    body.appendChild(card);
+                });
+            }
+            pop.appendChild(body);
+            backdrop.style.display = 'block';
+            pop.style.display = 'block';
+        }
+
+        // Capture phase so the row's own click handlers don't swallow it.
+        document.addEventListener('click', function (e) {
+            var btn = e.target.closest && e.target.closest('.shr-notes-indicator');
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            var sid    = btn.getAttribute('data-shipment-id');
+            var shipNo = btn.getAttribute('data-ship-no') || '';
+            render(shipNo, []);
+            pop.querySelector('.shrnotes-body').innerHTML = '<div class="shrnotes-empty">Loading…</div>';
+            var url = base + '/inventory_shiprcpt.php?action=txn_notes&id=' + encodeURIComponent(sid);
+            fetch(url, { credentials: 'same-origin' })
+                .then(function (r) { return r.json(); })
+                .then(function (list) { render(shipNo, Array.isArray(list) ? list : []); })
+                .catch(function () {
+                    pop.querySelector('.shrnotes-body').innerHTML =
+                        '<div class="shrnotes-empty">Could not load notes.</div>';
+                });
+        }, true);
+
+        backdrop.addEventListener('click', hide);
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') hide(); });
+    })();
+    </script>
+    <?php
+}
+
+// ----------------------------------------------------------------
 // VENDOR DATA — JSON endpoint that returns a vendor's contacts +
 // addresses so the new/edit form can cascade-update its dropdowns
 // after the user picks a vendor. Read-only; minimal data.
@@ -143,6 +373,34 @@ if ($action === 'vendor_data') {
         [$vendorId]
     );
     echo json_encode(['contacts' => $contacts, 'addresses' => $addresses]);
+    exit;
+}
+
+// ----------------------------------------------------------------
+// TXN_NOTES — JSON list of running notes rolled up to one shipment.
+// Used by the list page's "Notes/Attachments" clip-icon popup. The
+// page-level view permission (required at the top of this file) gates
+// access. Read-only.
+// ----------------------------------------------------------------
+if ($action === 'txn_notes') {
+    header('Content-Type: application/json; charset=utf-8');
+    $id = (int)input('id', 0);
+    if ($id <= 0) { echo json_encode([]); exit; }
+    $notes = shr_shipment_txn_notes($id);
+    $out = array_map(function ($n) {
+        return [
+            'id'          => (int)$n['id'],
+            'body_html'   => (string)$n['body_html'],
+            'created_at'  => (string)$n['created_at'],
+            'author'      => (string)($n['author_name'] ?: $n['author_email'] ?: '—'),
+            'note_type'   => (string)($n['note_type_name'] ?: ''),
+            'old_txn'     => (int)$n['old_transaction_id'],
+            'attachments' => array_map(function ($a) {
+                return ['id' => (int)$a['id'], 'filename' => (string)$a['filename']];
+            }, $n['attachments']),
+        ];
+    }, $notes);
+    echo json_encode($out);
     exit;
 }
 
@@ -3003,6 +3261,37 @@ if ($action === 'view') {
     );
     $locations = db_all('SELECT id, name FROM locations WHERE is_active = 1 ORDER BY name');
 
+    // Running notes that were attached, in the old system, to the transactions
+    // behind this shipment's lines. Chain:
+    //   inv_shipment_lines.old_transaction_id  (legacy transaction header)
+    //     → old_inv_txns.old_transaction_id → old_inv_txns.old_id (inventory_transaction_id)
+    //     → inv_txns.ref_doc = 'OLD-ITX-<old_id>'
+    //     → notes(entity_type='inv_txn', entity_id = inv_txns.id)
+    // (inv_notes.tid is an inventory_transaction_id; the importer attached the
+    //  note to the matching inv_txn, so we roll those up to the shipment here.)
+    $txnNotes = db_all(
+        "SELECT DISTINCT n.id, n.body_html, n.created_at, n.entity_id AS inv_txn_id,
+                o.old_transaction_id,
+                u.full_name AS author_name, u.email AS author_email,
+                c.name AS note_type_name
+           FROM inv_shipment_lines sl
+           JOIN old_inv_txns o ON o.old_transaction_id = sl.old_transaction_id
+           JOIN inv_txns t     ON t.ref_doc = CONCAT('OLD-ITX-', o.old_id)
+           JOIN notes n        ON n.entity_type = 'inv_txn' AND n.entity_id = t.id AND n.is_deleted = 0
+      LEFT JOIN users u        ON u.id = n.author_id
+      LEFT JOIN categories c   ON c.id = n.note_type_id
+          WHERE sl.shipment_id = ? AND sl.old_transaction_id IS NOT NULL
+          ORDER BY n.created_at DESC, n.id DESC",
+        [$id]
+    );
+    $txnNoteAtts = [];
+    if ($txnNotes) {
+        $in = implode(',', array_map('intval', array_column($txnNotes, 'id')));
+        foreach (db_all("SELECT id, note_id, filename FROM note_attachments WHERE note_id IN ($in) ORDER BY note_id, id") as $a) {
+            $txnNoteAtts[(int)$a['note_id']][] = $a;
+        }
+    }
+
     $hasShipSide    = in_array($sh['mode'], shr_modes_with_ship(), true);
     $hasReceiveSide = in_array($sh['mode'], shr_modes_with_receive(), true);
 
@@ -3184,6 +3473,7 @@ if ($action === 'view') {
                         <th class="r">Shipped</th>
                         <th class="r">Received</th>
                         <th>Source</th>
+                        <th class="r">Txn ID</th>
                         <th>Notes</th>
                     </tr>
                 </thead>
@@ -3230,6 +3520,13 @@ if ($action === 'view') {
                         <td>
                             <?php if ($L['line_kind'] === 'ship'): ?>
                                 <?= h($L['src_location_name'] ?: '—') ?>
+                            <?php else: ?>
+                                <span class="muted">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="r">
+                            <?php if (!empty($L['old_transaction_id'])): ?>
+                                <code title="Legacy transaction.transaction_id this line was imported from"><?= (int)$L['old_transaction_id'] ?></code>
                             <?php else: ?>
                                 <span class="muted">—</span>
                             <?php endif; ?>
@@ -3368,6 +3665,41 @@ if ($action === 'view') {
         </div>
     <?php endif; ?>
 
+    <!-- Transaction notes imported from old inventory (read-only) -->
+    <?php if (!empty($txnNotes)): ?>
+        <div class="card" style="padding: 18px; margin-bottom: 14px;">
+            <h3 style="margin: 0 0 4px;">Transaction notes
+                <span class="muted small">(imported from old inventory)</span></h3>
+            <p class="muted small" style="margin: 0 0 12px;">
+                Running notes that were attached to the legacy transactions behind this shipment's lines.
+            </p>
+            <?php foreach ($txnNotes as $N):
+                $atts = $txnNoteAtts[(int)$N['id']] ?? [];
+            ?>
+                <div style="border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;">
+                    <div class="muted small" style="margin-bottom: 4px;">
+                        <strong>Txn <?= (int)$N['old_transaction_id'] ?></strong>
+                        · <?= h($N['author_name'] ?: $N['author_email'] ?: 'Imported') ?>
+                        · <?= h(substr((string)$N['created_at'], 0, 16)) ?>
+                        <?php if ($N['note_type_name']): ?>
+                            · <span class="pill pill-info"><?= h($N['note_type_name']) ?></span>
+                        <?php endif; ?>
+                        · <a href="<?= h(url('/running_notes.php?action=view&id=' . (int)$N['id'])) ?>">note #<?= (int)$N['id'] ?></a>
+                    </div>
+                    <div class="note-body"><?= $N['body_html'] ?></div>
+                    <?php if ($atts): ?>
+                        <div class="note-attachments" style="margin-top: 6px;">
+                            <?php foreach ($atts as $a): ?>
+                                <a class="note-att-link" href="<?= h(url('/note_attach.php?id=' . (int)$a['id'])) ?>"
+                                   title="<?= h($a['filename']) ?>">📎 <?= h($a['filename']) ?></a>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            <?php endforeach; ?>
+        </div>
+    <?php endif; ?>
+
     <?php
     if (function_exists('notes_render')) {
         notes_render('shiprcpt', $id, 'inline');
@@ -3454,7 +3786,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
-          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
+          sl.old_transaction_id                AS old_transaction_id
         FROM inv_receipts r
         JOIN inv_shipments sh        ON sh.id = r.shipment_id
         JOIN inv_shipment_lines sl   ON sl.id = r.shipment_line_id
@@ -3493,7 +3826,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
-          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
+          sl.old_transaction_id                AS old_transaction_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh        ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i             ON i.id  = sl.item_id
@@ -3542,7 +3876,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
-          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
+          sl.old_transaction_id                AS old_transaction_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh    ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i         ON i.id  = sl.item_id
@@ -3593,7 +3928,8 @@ $baseUnion = "
           (SELECT COUNT(*) FROM inv_shipment_lines sl2 WHERE sl2.shipment_id = sh.id) AS line_count,
           (SELECT COUNT(*) FROM inv_receipts r2      WHERE r2.shipment_id = sh.id) AS receipt_count,
           (SELECT po_no FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_no,
-          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id
+          (SELECT id    FROM purchase_orders WHERE shipment_id = sh.id ORDER BY id DESC LIMIT 1) AS po_id,
+          sl.old_transaction_id                AS old_transaction_id
         FROM inv_shipment_lines sl
         JOIN inv_shipments sh        ON sh.id = sl.shipment_id
    LEFT JOIN inv_items i             ON i.id  = sl.item_id
@@ -3604,6 +3940,17 @@ $baseUnion = "
          AND sh.status      = 'received'
          AND NOT EXISTS (SELECT 1 FROM inv_receipts r3 WHERE r3.shipment_line_id = sl.id)
     ) AS e";
+
+// Boolean expression (1/0): does this event's shipment have any running
+// notes rolled up from its transactions? Drives the Notes/Attachments
+// column filter (Available / Not available). The set of note-bearing
+// shipment ids is resolved ONCE here and embedded as a literal integer
+// IN-list, so the per-row filter is a cheap indexed comparison — never a
+// correlated subquery (which, with the non-sargable CONCAT join, hangs
+// the page). Empty list falls back to IN (0) (matches nothing).
+$noteShipmentIds = shr_shipment_ids_with_txn_notes();
+$noteIdList   = !empty($noteShipmentIds) ? implode(',', $noteShipmentIds) : '0';
+$hasNotesExpr = "(CASE WHEN e.shipment_id IN ($noteIdList) THEN 1 ELSE 0 END)";
 
 $dtCfg = [
     'id'       => 'shiprcpt_txn_history',
@@ -3634,6 +3981,7 @@ $dtCfg = [
          ]]],
         ['key'=>'ship_no',       'label'=>'Ship #',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.ship_no'],
         ['key'=>'po_no',         'label'=>'PO #',         'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.po_no'],
+        ['key'=>'old_txn',       'label'=>'Txn ID',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.old_transaction_id', 'th_class'=>'r','td_class'=>'r'],
         ['key'=>'vendor',        'label'=>'Vendor',       'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.vendor_name'],
         ['key'=>'item_label',    'label'=>'Item',         'sortable'=>true, 'searchable'=>true,
          // Searchable on both code and name; displayed as (CODE)-Name
@@ -3649,6 +3997,12 @@ $dtCfg = [
         ['key'=>'location_name', 'label'=>'Location',     'sortable'=>true, 'searchable'=>true,  'sql_col'=>'e.location_name'],
         ['key'=>'actor_name',    'label'=>'By',           'sortable'=>false,'searchable'=>false],
         ['key'=>'notes',         'label'=>'Notes',        'sortable'=>false,'searchable'=>true,  'sql_col'=>'e.notes', 'td_class'=>'muted small'],
+        ['key'=>'txn_notes',     'label'=>'Notes/Attachments', 'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r nowrap',
+         'sql_col'=>$hasNotesExpr,
+         'filter' => ['type'=>'select','placeholder'=>'all','options'=>[
+             ['value'=>'1', 'label'=>'Available'],
+             ['value'=>'0', 'label'=>'Not available'],
+         ]]],
         ['key'=>'_actions',      'label'=>'Actions',      'sortable'=>false,'searchable'=>false, 'th_class'=>'r','td_class'=>'r nowrap'],
     ],
     // Sort by the captured server-side timestamp (event_at) so events
@@ -3658,7 +4012,11 @@ $dtCfg = [
     'default_sort' => ['event_at', 'desc'],
 ];
 
-$rowRenderer = function ($r) use ($canManage) {
+// Per-shipment running-note counts for the rows on the current page.
+// Populated AFTER data_table_run() returns (it knows the page slice);
+// the renderer reads it by reference, so the order of assignment is fine.
+$shipmentNoteCounts = [];
+$rowRenderer = function ($r) use ($canManage, &$shipmentNoteCounts) {
     // Direction pill — three flavors now.
     //   receive  → green: material arrived
     //   ship_out → amber: material dispatched
@@ -3789,6 +4147,29 @@ $rowRenderer = function ($r) use ($canManage) {
     $lineCount    = (int)($r['line_count'] ?? 0);
     $receiptCount = (int)($r['receipt_count'] ?? 0);
 
+    // Notes/Attachments — clip icon when this shipment's transactions carry
+    // running notes. Click opens a popup listing them (handled by
+    // shr_txn_notes_popup_assets()). The count map is batch-prefilled for
+    // the initial page render; on the datatable's AJAX rows path (sort /
+    // filter / paginate) data_table_run() renders and exits BEFORE the
+    // prefill runs, so fall back to a memoized per-shipment lookup here.
+    $shipId = (int)$r['shipment_id'];
+    if (!array_key_exists($shipId, $shipmentNoteCounts)) {
+        $oneCount = shr_shipment_txn_note_counts([$shipId]);
+        $shipmentNoteCounts[$shipId] = $oneCount[$shipId] ?? 0;
+    }
+    $shNoteCount = $shipmentNoteCounts[$shipId];
+    if ($shNoteCount > 0) {
+        $txnNotesCell = '<button type="button" class="shr-notes-indicator"'
+            . ' data-shipment-id="' . (int)$r['shipment_id'] . '"'
+            . ' data-ship-no="' . h($r['ship_no']) . '"'
+            . ' title="' . $shNoteCount . ' note' . ($shNoteCount === 1 ? '' : 's')
+            . ' on this shipment&#39;s transactions">'
+            . '📎&nbsp;<span class="shr-notes-badge">' . $shNoteCount . '</span></button>';
+    } else {
+        $txnNotesCell = '<span class="muted small">—</span>';
+    }
+
     return [
         'event_at'      => h(dt_display($r['event_at'])),
         'event_date'    => h($r['event_date'] ?: '—'),
@@ -3797,6 +4178,9 @@ $rowRenderer = function ($r) use ($canManage) {
         'sh_mode'       => h($modeLabel),
         'ship_no'       => $shipLink,
         'po_no'         => $poCell,
+        'old_txn'       => !empty($r['old_transaction_id'])
+            ? '<code title="Legacy transaction.transaction_id">' . (int)$r['old_transaction_id'] . '</code>'
+            : '<span class="muted">—</span>',
         'vendor'        => $vendor,
         'item_label'    => $itemCell,
         'qty'           => $qtyCell,
@@ -3808,10 +4192,23 @@ $rowRenderer = function ($r) use ($canManage) {
         'location_name' => h($r['location_name'] ?: '—'),
         'actor_name'    => h($r['actor_name'] ?: '—'),
         'notes'         => h($r['notes'] ?: ''),
+        'txn_notes'     => $txnNotesCell,
         '_actions'      => dt_actions_wrap($actions),
     ];
 };
 $dt = data_table_run($dtCfg, $rowRenderer);
+
+// Batched note rollup for just the rows on this page (one query). The
+// renderer captured $shipmentNoteCounts by reference, so filling it here —
+// after the page slice is known but before data_table_render() iterates —
+// is what lights up the clip icons. Seed 0 for every page shipment so the
+// renderer's array_key_exists() check treats them as "known" and skips the
+// per-row fallback query on the initial render.
+$pageShipmentIds    = array_map('intval', array_column($dt['rows'], 'shipment_id'));
+$shipmentNoteCounts = shr_shipment_txn_note_counts($pageShipmentIds);
+foreach ($pageShipmentIds as $sid) {
+    if (!array_key_exists($sid, $shipmentNoteCounts)) $shipmentNoteCounts[$sid] = 0;
+}
 
 $newBtnHtml = $canManage
     ? '<a class="btn btn-primary" href="' . h(url('/inventory_shiprcpt.php?action=new')) . '"'
@@ -3825,4 +4222,5 @@ $page_title  = 'Ship & Receipt';
 $page_module = 'inventory_shiprcpt';
 require __DIR__ . '/includes/header.php';
 data_table_render($dtCfg, $dt, $rowRenderer);
+shr_txn_notes_popup_assets();   // clip-icon popup CSS + JS (emitted once)
 require __DIR__ . '/includes/footer.php';

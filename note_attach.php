@@ -66,8 +66,12 @@ if (!$realFile || !$realBase || strpos($realFile, $realBase) !== 0 || !is_file($
 // Stream the file.
 $filename = (string)$att['filename'];
 $mime     = (string)$att['mime_type'] ?: 'application/octet-stream';
+// Trust the on-disk size when the stored byte count is missing (0). Imported
+// notes record their attachments before the physical files are copied in, so
+// size_bytes is 0 — sending Content-Length: 0 would truncate the download.
+$length   = (int)$att['size_bytes'] > 0 ? (int)$att['size_bytes'] : (int)@filesize($realFile);
 header('Content-Type: ' . $mime);
-header('Content-Length: ' . (int)$att['size_bytes']);
+header('Content-Length: ' . $length);
 // Inline for images / PDFs so they render in-browser; everything else
 // downloads. The user agent decides how to render anyway, but this hint
 // helps the common cases.
